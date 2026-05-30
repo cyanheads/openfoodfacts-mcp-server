@@ -15,14 +15,17 @@ import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.to
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 const mockGetProduct = vi.fn();
+const mockGetProductFields = vi.fn();
 
 describe('off_get_product', () => {
   let ctx: Context;
 
   beforeEach(() => {
     mockGetProduct.mockReset();
+    mockGetProductFields.mockReset();
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
       getProduct: mockGetProduct,
+      getProductFields: mockGetProductFields,
     } as never);
     ctx = createMockContext({ errors: offGetProductTool.errors });
   });
@@ -94,8 +97,10 @@ describe('off_get_product', () => {
     });
   });
 
-  it('applies field selection — returns only requested fields', async () => {
-    mockGetProduct.mockResolvedValue({
+  it('applies field selection — calls getProductFields with the joined field list', async () => {
+    // Bug #1 regression: when fields= is provided, handler must call getProductFields() not getProduct().
+    // Previously the fields input was accepted but silently ignored (getProduct() was called instead).
+    mockGetProductFields.mockResolvedValue({
       product_name: 'Test Product',
       nutriscore_grade: 'b',
       nova_group: 2,
@@ -109,6 +114,10 @@ describe('off_get_product', () => {
     expect(result.found).toBe(true);
     expect(result.product?.product_name).toBe('Test Product');
     expect(result.product?.nutriscore_grade).toBe('b');
+    // getProductFields must have been called, not getProduct
+    expect(mockGetProductFields).toHaveBeenCalledOnce();
+    expect(mockGetProduct).not.toHaveBeenCalled();
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('product_name,nutriscore_grade');
   });
 
   it('handles sparse upstream payload without fabricating values', async () => {
@@ -185,10 +194,10 @@ describe('off_get_product', () => {
 
   // ── fields= selection behavior ────────────────────────────────────────────
 
-  it('passes the fields parameter to the service layer', async () => {
-    // Design: "Field selection mandatory on every request — the product object is ~200 keys;
-    // always scope fields=". Handler must forward the fields input to service.getProduct().
-    mockGetProduct.mockResolvedValue({
+  it('passes the fields parameter to getProductFields, not getProduct', async () => {
+    // Bug #1 regression: fields= input must route to getProductFields() with the field list.
+    // Before the fix, the handler always called getProduct() regardless of input.fields.
+    mockGetProductFields.mockResolvedValue({
       nutriscore_grade: 'b',
       nova_group: 2,
     });
@@ -198,9 +207,10 @@ describe('off_get_product', () => {
       ctx,
     );
 
-    // Service called once — with the barcode (fields routing is handler-side)
-    expect(mockGetProduct).toHaveBeenCalledOnce();
-    expect(mockGetProduct.mock.calls[0][0]).toBe('1234567890123');
+    expect(mockGetProductFields).toHaveBeenCalledOnce();
+    expect(mockGetProductFields.mock.calls[0]?.[0]).toBe('1234567890123');
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('nutriscore_grade,nova_group');
+    expect(mockGetProduct).not.toHaveBeenCalled();
   });
 
   it('omitting fields returns all standard fields from the service response', async () => {

@@ -10,7 +10,7 @@ import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by text and/or structured tag filters. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. Filter values must be canonical tag IDs (e.g. "en:organic", "en:gluten-free") — use off_browse_taxonomy to resolve human terms to tag IDs. At least one search parameter is required. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by text query or structured tag filters. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. Text query and tag filters are mutually exclusive routing paths: when query is provided, a text search is performed and tag filters are ignored; when only tag filters are provided (no query), structured facet filtering is applied. Tag filter values must be canonical tag IDs (e.g. "en:organic", "en:gluten-free") — use off_browse_taxonomy to resolve human terms to tag IDs. At least one search parameter is required. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -18,7 +18,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Full-text search term across product names, brands, and ingredients. Combine with tag filters for precision. Example: "dark chocolate 70%".',
+        'Full-text search term across product names, brands, and ingredients. When provided, routes to the text search engine — tag filters (categories_tag, brands_tag, etc.) are ignored in this path. Example: "dark chocolate 70%".',
       ),
     categories_tag: z
       .string()

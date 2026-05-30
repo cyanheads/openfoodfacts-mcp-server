@@ -279,7 +279,12 @@ export const offGetProductTool = tool('off_get_product', {
 
   async handler(input, ctx) {
     const svc = getOpenFoodFactsService();
-    const product = await svc.getProduct(input.barcode, ctx);
+    // When the caller requests a specific field subset, pass it to the service to scope the API
+    // request. The service has a default full-field set; using getProductFields() overrides it.
+    const product =
+      input.fields && input.fields.length > 0
+        ? await svc.getProductFields(input.barcode, input.fields.join(','), ctx)
+        : await svc.getProduct(input.barcode, ctx);
 
     if (!product) {
       throw ctx.fail('not_found', `Barcode ${input.barcode} not found in Open Food Facts`, {

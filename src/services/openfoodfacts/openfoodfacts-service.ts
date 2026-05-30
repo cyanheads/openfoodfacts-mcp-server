@@ -9,7 +9,14 @@ import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
-import type { RawProduct, RawProductResponse, RawSearchResponse, SearchParams } from './types.js';
+import type {
+  RawProduct,
+  RawProductResponse,
+  RawSearchResponse,
+  RawTextSearchHit,
+  RawTextSearchResponse,
+  SearchParams,
+} from './types.js';
 
 /**
  * Identifying User-Agent required by OFF terms — identifies the client and provides a contact email.
@@ -25,8 +32,17 @@ const PRODUCT_FIELDS =
   'nutriscore_grade,nova_group,ecoscore_grade,nutriments,categories_tags,labels_tags,' +
   'packaging_tags,origins_tags,image_url,completeness,data_quality_tags';
 
-/** Fields to request on search results — summary rows for triage. */
+/** Fields to request on /api/v2/search results — summary rows for triage. */
 const SEARCH_FIELDS = 'code,product_name,brands,nutriscore_grade,nova_group,categories_tags';
+
+/**
+ * Text search endpoint — search.openfoodfacts.org uses Elasticsearch and actually filters by the
+ * query text. The /api/v2/search endpoint silently ignores search_terms and returns all products.
+ */
+const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
+
+/** Fields to request from the text search endpoint. */
+const TEXT_SEARCH_FIELDS = 'code,product_name,brands,nutriscore_grade,nova_group,categories_tags';
 
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
 class RateLimiter {
@@ -136,7 +152,7 @@ export class OpenFoodFactsService {
     );
   }
 
-  /** Handle a product fetch response — normalizes status:0 to null, throws on 5xx. */
+  /** Handle a product fetch response — normalizes status:0 and HTTP 404 to null, throws on 5xx. */
   private async handleProductResponse(
     response: Response,
     barcode: string,
@@ -158,6 +174,12 @@ export class OpenFoodFactsService {
           barcode,
           status: response.status,
         });
+      }
+      // HTTP 404: OFF returns this for barcodes not in the database (alongside status:0 in body).
+      // Treat as not-found (null) rather than an upstream error — the JSON body confirms status:0.
+      if (response.status === 404) {
+        ctx.log.debug('Product not found (HTTP 404)', { barcode });
+        return null;
       }
       throw serviceUnavailable(`Open Food Facts returned HTTP ${response.status}`, {
         barcode,
@@ -190,6 +212,11 @@ export class OpenFoodFactsService {
   /**
    * Search products by text and/or tag filters.
    * Returns pagination envelope + product summary rows.
+   *
+   * Routing:
+   * - When `query` is present: search.openfoodfacts.org (Elasticsearch — actual text filtering).
+   *   The /api/v2/search endpoint silently ignores the `search_terms` param and returns all products.
+   * - When only tag filters (no query): /api/v2/search (structured facet filtering).
    */
   async searchProducts(
     params: SearchParams,
@@ -203,10 +230,112 @@ export class OpenFoodFactsService {
   }> {
     this.searchLimiter.check('search');
 
+    return params.query
+      ? this.searchProductsByText(params, ctx)
+      : this.searchProductsByTags(params, ctx);
+  }
+
+  /**
+   * Text search via search.openfoodfacts.org — supports full-text queries.
+   * Tag filters are not supported by this endpoint and are silently dropped when routing here.
+   */
+  private async searchProductsByText(
+    params: SearchParams,
+    ctx: Context,
+  ): Promise<{
+    count: number;
+    page: number;
+    page_count: number;
+    page_size: number;
+    products: RawProduct[];
+  }> {
+    return await withRetry(
+      async () => {
+        const url = new URL(`${TEXT_SEARCH_BASE_URL}/search`);
+        url.searchParams.set('q', params.query ?? '');
+        url.searchParams.set('fields', TEXT_SEARCH_FIELDS);
+        url.searchParams.set('page', String(params.page ?? 1));
+        url.searchParams.set('page_size', String(params.page_size ?? 20));
+
+        ctx.log.debug('Text-searching products', { query: params.query, url: url.toString() });
+
+        const response = await fetch(url.toString(), {
+          signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+          headers: {
+            'User-Agent': USER_AGENT,
+            Accept: 'application/json',
+          },
+        });
+
+        if (!response.ok) {
+          if (response.status >= 500) {
+            throw serviceUnavailable(
+              `Open Food Facts text search returned HTTP ${response.status}`,
+              { status: response.status },
+            );
+          }
+          throw serviceUnavailable(`Open Food Facts text search returned HTTP ${response.status}`, {
+            status: response.status,
+          });
+        }
+
+        const data = (await response.json()) as RawTextSearchResponse;
+        const pageSize = params.page_size ?? 20;
+
+        ctx.log.debug('Text search response received', {
+          count: data.count,
+          page: data.page,
+          returned: data.hits?.length ?? 0,
+        });
+
+        // Normalize text search hits to RawProduct shape (brands is array → join to string).
+        // Use spread of defined-only fields to satisfy exactOptionalPropertyTypes.
+        const products: RawProduct[] = (data.hits ?? []).map((hit: RawTextSearchHit) => {
+          const brands = Array.isArray(hit.brands) ? hit.brands.join(', ') : hit.brands;
+          return {
+            ...(hit.product_name !== undefined && { product_name: hit.product_name }),
+            ...(brands !== undefined && { brands }),
+            ...(hit.nutriscore_grade !== undefined && { nutriscore_grade: hit.nutriscore_grade }),
+            ...(hit.nova_group !== undefined && { nova_group: hit.nova_group }),
+            ...(hit.categories_tags !== undefined && { categories_tags: hit.categories_tags }),
+            // code is the barcode — stored as a synthetic field for the search handler to read
+            ...({ code: hit.code } as unknown as Partial<RawProduct>),
+          };
+        });
+
+        return {
+          count: data.count ?? 0,
+          page: data.page ?? 1,
+          // page_count in text search response is TOTAL PAGES; normalize to products-on-page
+          page_count: products.length,
+          page_size: pageSize,
+          products,
+        };
+      },
+      {
+        operation: 'OFF:searchProductsByText',
+        context: ctx as RequestContextLike,
+        baseDelayMs: 1_000,
+        signal: ctx.signal,
+      },
+    );
+  }
+
+  /** Tag-filter search via /api/v2/search — structured facet filtering, no text search. */
+  private async searchProductsByTags(
+    params: SearchParams,
+    ctx: Context,
+  ): Promise<{
+    count: number;
+    page: number;
+    page_count: number;
+    page_size: number;
+    products: RawProduct[];
+  }> {
     return await withRetry(
       async () => {
         const url = this.buildSearchUrl(params);
-        ctx.log.debug('Searching products', { params, url });
+        ctx.log.debug('Searching products by tags', { params, url });
 
         const response = await fetch(url, {
           signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
@@ -248,7 +377,7 @@ export class OpenFoodFactsService {
 
         const data = (await response.json()) as RawSearchResponse;
 
-        ctx.log.debug('Search response received', {
+        ctx.log.debug('Tag search response received', {
           count: data.count,
           page: data.page,
           returned: data.products?.length ?? 0,
@@ -263,7 +392,7 @@ export class OpenFoodFactsService {
         };
       },
       {
-        operation: 'OFF:searchProducts',
+        operation: 'OFF:searchProductsByTags',
         context: ctx as RequestContextLike,
         baseDelayMs: 1_000,
         signal: ctx.signal,
@@ -274,7 +403,6 @@ export class OpenFoodFactsService {
   private buildSearchUrl(params: SearchParams): string {
     const url = new URL(`${this.baseUrl}/api/v2/search`);
     url.searchParams.set('fields', SEARCH_FIELDS);
-    if (params.query) url.searchParams.set('search_terms', params.query);
     if (params.categories_tag) url.searchParams.set('categories_tags', params.categories_tag);
     if (params.brands_tag) url.searchParams.set('brands_tags', params.brands_tag);
     if (params.labels_tag) url.searchParams.set('labels_tags', params.labels_tag);

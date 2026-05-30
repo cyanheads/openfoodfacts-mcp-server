@@ -56,6 +56,32 @@ export type RawSearchResponse = {
   products?: RawProduct[];
 };
 
+/**
+ * Response envelope from GET https://search.openfoodfacts.org/search
+ * Used for text-based queries — the /api/v2/search endpoint silently ignores the `search_terms`
+ * parameter and returns all products unfiltered.
+ * Note: `page_count` here is TOTAL PAGES, not products on the page (differs from /api/v2/search).
+ */
+export type RawTextSearchResponse = {
+  count?: number;
+  page?: number;
+  page_size?: number;
+  /** Total number of pages (not products on this page — differs from /api/v2/search). */
+  page_count?: number;
+  hits?: RawTextSearchHit[];
+};
+
+/** A product hit from the search.openfoodfacts.org endpoint. */
+export type RawTextSearchHit = {
+  code?: string;
+  product_name?: string;
+  /** brands is an array here, unlike the /api/v2 string field. */
+  brands?: string | string[];
+  nutriscore_grade?: string;
+  nova_group?: number;
+  categories_tags?: string[];
+};
+
 /** Search parameters for the OFF /api/v2/search endpoint. */
 export type SearchParams = {
   query?: string;
