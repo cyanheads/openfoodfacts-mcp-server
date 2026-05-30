@@ -6,23 +6,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import type { RawNutriments, RawProduct } from '@/services/openfoodfacts/types.js';
+import type { RawProduct } from '@/services/openfoodfacts/types.js';
 
 /** Fields needed for comparison — narrower than full product fetch. */
 const COMPARE_FIELDS =
   'product_name,brands,nutriscore_grade,nova_group,ecoscore_grade,nutriments,completeness';
 
-/** Extract a numeric value from the raw nutriments map. */
-function n(raw: RawNutriments, key: string): number | undefined {
-  const v = raw[key];
-  return typeof v === 'number' ? v : undefined;
-}
-
-/** Build a comparison row from a raw product. */
-function buildCompareRow(
-  barcode: string,
-  raw: RawProduct | null,
-): {
+type CompareRow = {
   barcode: string;
   product_name?: string;
   brands?: string;
@@ -38,12 +28,19 @@ function buildCompareRow(
   proteins_100g?: number;
   fiber_100g?: number;
   completeness?: number;
-} {
-  if (!raw) {
-    return { barcode, found: false };
-  }
+};
 
-  const row: ReturnType<typeof buildCompareRow> = { barcode, found: true };
+/** Extract a numeric value from the raw nutriments map. */
+function n(raw: Record<string, number | string | undefined>, key: string): number | undefined {
+  const v = raw[key];
+  return typeof v === 'number' ? v : undefined;
+}
+
+/** Build a comparison row from a raw product. */
+function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
+  if (!raw) return { barcode, found: false };
+
+  const row: CompareRow = { barcode, found: true };
 
   if (raw.product_name) row.product_name = raw.product_name;
   if (raw.brands) row.brands = raw.brands;
@@ -184,7 +181,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       input.barcodes.map((barcode) => svc.getProductFields(barcode, COMPARE_FIELDS, ctx)),
     );
 
-    const products: ReturnType<typeof buildCompareRow>[] = [];
+    const products: CompareRow[] = [];
     const not_found: string[] = [];
     let succeeded = 0;
 

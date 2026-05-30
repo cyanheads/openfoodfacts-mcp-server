@@ -23,38 +23,30 @@ type NormalizedNutriments = {
   sugars_serving?: number;
 };
 
+/** Maps raw hyphenated nutriment keys → output schema keys. */
+const NUTRIMENT_MAP: [string, keyof NormalizedNutriments][] = [
+  ['energy-kcal_100g', 'energy_kcal_100g'],
+  ['fat_100g', 'fat_100g'],
+  ['saturated-fat_100g', 'saturated_fat_100g'],
+  ['carbohydrates_100g', 'carbohydrates_100g'],
+  ['sugars_100g', 'sugars_100g'],
+  ['fiber_100g', 'fiber_100g'],
+  ['proteins_100g', 'proteins_100g'],
+  ['salt_100g', 'salt_100g'],
+  ['sodium_100g', 'sodium_100g'],
+  ['energy-kcal_serving', 'energy_kcal_serving'],
+  ['fat_serving', 'fat_serving'],
+  ['sugars_serving', 'sugars_serving'],
+];
+
 /** Normalize the raw hyphenated nutriments map to the output schema shape. */
 function normalizeNutriments(raw: RawNutriments | undefined): NormalizedNutriments | undefined {
   if (!raw) return;
-  const num = (key: string): number | undefined => {
-    const v = raw[key];
-    return typeof v === 'number' ? v : undefined;
-  };
   const result: NormalizedNutriments = {};
-  const e = num('energy-kcal_100g');
-  if (e !== undefined) result.energy_kcal_100g = e;
-  const f = num('fat_100g');
-  if (f !== undefined) result.fat_100g = f;
-  const sf = num('saturated-fat_100g');
-  if (sf !== undefined) result.saturated_fat_100g = sf;
-  const c = num('carbohydrates_100g');
-  if (c !== undefined) result.carbohydrates_100g = c;
-  const s = num('sugars_100g');
-  if (s !== undefined) result.sugars_100g = s;
-  const fi = num('fiber_100g');
-  if (fi !== undefined) result.fiber_100g = fi;
-  const p = num('proteins_100g');
-  if (p !== undefined) result.proteins_100g = p;
-  const sa = num('salt_100g');
-  if (sa !== undefined) result.salt_100g = sa;
-  const so = num('sodium_100g');
-  if (so !== undefined) result.sodium_100g = so;
-  const es = num('energy-kcal_serving');
-  if (es !== undefined) result.energy_kcal_serving = es;
-  const fs = num('fat_serving');
-  if (fs !== undefined) result.fat_serving = fs;
-  const ss = num('sugars_serving');
-  if (ss !== undefined) result.sugars_serving = ss;
+  for (const [rawKey, outKey] of NUTRIMENT_MAP) {
+    const v = raw[rawKey];
+    if (typeof v === 'number') result[outKey] = v;
+  }
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
@@ -359,9 +351,9 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push('\n**Nutrition:** Not available');
     }
 
-    // Ingredients
+    // Ingredients — fenced to prevent crowd-sourced text from being interpreted as markdown/instructions
     if (p.ingredients_text) {
-      lines.push(`\n### Ingredients\n${p.ingredients_text}`);
+      lines.push(`\n### Ingredients\n\`\`\`\n${p.ingredients_text}\n\`\`\``);
     } else {
       lines.push('\n**Ingredients:** Not available');
     }

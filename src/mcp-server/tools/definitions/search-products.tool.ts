@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import type { SearchParams } from '@/services/openfoodfacts/types.js';
 
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
@@ -158,7 +159,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     const svc = getOpenFoodFactsService();
-    const searchParams: import('@/services/openfoodfacts/types.js').SearchParams = {
+    const searchParams: SearchParams = {
       page: input.page,
       page_size: input.page_size,
     };
@@ -196,7 +197,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     const products = response.products.map((p) => ({
-      barcode: ((p as unknown as Record<string, unknown>)['code'] as string) ?? '',
+      barcode: ((p as unknown as Record<string, unknown>).code as string) ?? '',
       ...(p.product_name && { product_name: p.product_name }),
       ...(p.brands && { brands: p.brands }),
       ...(p.nutriscore_grade && { nutriscore_grade: p.nutriscore_grade }),

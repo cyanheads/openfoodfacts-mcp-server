@@ -1,25 +1,37 @@
 {
-  "name": "openfoodfacts-mcp-server",
+  "name": "@cyanheads/openfoodfacts-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "",
-    "email": "",
-    "url": ""
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/openfoodfacts-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/openfoodfacts-mcp-server.git",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": [
+    "openfoodfacts",
+    "food",
+    "nutrition",
+    "barcode",
+    "nutriscore",
+    "nova",
+    "ingredients",
+    "allergens",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol"
+  ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "openfoodfacts-mcp-server",
-    "shortDescription": "",
+    "displayName": "@cyanheads/openfoodfacts-mcp-server",
+    "shortDescription": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
     "longDescription": "",
-    "developerName": "",
-    "category": "",
+    "developerName": "cyanheads",
+    "category": "data",
     "capabilities": ["Read"],
-    "websiteURL": "",
+    "websiteURL": "https://github.com/cyanheads/openfoodfacts-mcp-server",
     "defaultPrompt": []
   }
 }

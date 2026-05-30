@@ -32,7 +32,7 @@ const PRODUCT_FIELDS =
   'nutriscore_grade,nova_group,ecoscore_grade,nutriments,categories_tags,labels_tags,' +
   'packaging_tags,origins_tags,image_url,completeness,data_quality_tags';
 
-/** Fields to request on /api/v2/search results — summary rows for triage. */
+/** Fields to request on search results — summary rows for triage. Shared by both search paths. */
 const SEARCH_FIELDS = 'code,product_name,brands,nutriscore_grade,nova_group,categories_tags';
 
 /**
@@ -40,9 +40,6 @@ const SEARCH_FIELDS = 'code,product_name,brands,nutriscore_grade,nova_group,cate
  * query text. The /api/v2/search endpoint silently ignores search_terms and returns all products.
  */
 const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
-
-/** Fields to request from the text search endpoint. */
-const TEXT_SEARCH_FIELDS = 'code,product_name,brands,nutriscore_grade,nova_group,categories_tags';
 
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
 class RateLimiter {
@@ -218,7 +215,7 @@ export class OpenFoodFactsService {
    *   The /api/v2/search endpoint silently ignores the `search_terms` param and returns all products.
    * - When only tag filters (no query): /api/v2/search (structured facet filtering).
    */
-  async searchProducts(
+  searchProducts(
     params: SearchParams,
     ctx: Context,
   ): Promise<{
@@ -253,7 +250,7 @@ export class OpenFoodFactsService {
       async () => {
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/search`);
         url.searchParams.set('q', params.query ?? '');
-        url.searchParams.set('fields', TEXT_SEARCH_FIELDS);
+        url.searchParams.set('fields', SEARCH_FIELDS);
         url.searchParams.set('page', String(params.page ?? 1));
         url.searchParams.set('page_size', String(params.page_size ?? 20));
 
@@ -268,12 +265,6 @@ export class OpenFoodFactsService {
         });
 
         if (!response.ok) {
-          if (response.status >= 500) {
-            throw serviceUnavailable(
-              `Open Food Facts text search returned HTTP ${response.status}`,
-              { status: response.status },
-            );
-          }
           throw serviceUnavailable(`Open Food Facts text search returned HTTP ${response.status}`, {
             status: response.status,
           });

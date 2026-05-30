@@ -1,7 +1,8 @@
 {
   "name": "@cyanheads/openfoodfacts-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "mcpName": "io.github.cyanheads/openfoodfacts-mcp-server",
+  "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -39,12 +40,44 @@
     "start:http": "MCP_TRANSPORT_TYPE=http bun ./dist/index.js",
     "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish"
   },
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": [
+    "openfoodfacts",
+    "food",
+    "nutrition",
+    "barcode",
+    "nutriscore",
+    "nova",
+    "ingredients",
+    "allergens",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http"
+  ],
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/cyanheads/openfoodfacts-mcp-server.git"
   },
+  "homepage": "https://github.com/cyanheads/openfoodfacts-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/cyanheads/openfoodfacts-mcp-server/issues"
+  },
+  "author": "cyanheads <casey@caseyjhand.com> (https://github.com/cyanheads/openfoodfacts-mcp-server#readme)",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/cyanheads"
+    },
+    {
+      "type": "buy_me_a_coffee",
+      "url": "https://www.buymeacoffee.com/cyanheads"
+    }
+  ],
   "license": "Apache-2.0",
+  "packageManager": "bun@1.3.2",
   "engines": {
     "bun": ">=1.3.0",
     "node": ">=24.0.0"
