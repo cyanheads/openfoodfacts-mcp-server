@@ -1,0 +1,9 @@
+{
+  "openfoodfacts-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "openfoodfacts-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
