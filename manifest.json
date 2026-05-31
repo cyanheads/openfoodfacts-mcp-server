@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "openfoodfacts-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "author": { "name": "cyanheads" },
   "server": {
