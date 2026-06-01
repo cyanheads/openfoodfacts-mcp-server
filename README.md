@@ -72,7 +72,6 @@ Side-by-side nutrition and scoring comparison for 2–10 barcodes.
 - Returns a normalized comparison table: energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score
 - Missing nutrition data is preserved as `null` — comparisons are not imputed or estimated
 - `not_found` list identifies barcodes with no contributor record (partial results are not an error)
-- For batches of 5+ products, the comparison table is registered as a canvas dataframe for downstream SQL queries (`secedgar_dataframe_query`-style analytics)
 
 ---
 
