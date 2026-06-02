@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-06-02
+
+Adopt @cyanheads/mcp-ts-core ^0.9.21 — per-request log context fix, secret-stripped error messages, and fail-fast retry behavior.
+
 ## [0.1.1](changelog/0.1.x/0.1.1.md) — 2026-05-30
 
 Public hosted endpoint at https://openfoodfacts.caseyjhand.com/mcp — connect via Streamable HTTP without installing.
