@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/openfoodfacts-mcp-server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "mcpName": "io.github.cyanheads/openfoodfacts-mcp-server",
   "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "type": "module",
