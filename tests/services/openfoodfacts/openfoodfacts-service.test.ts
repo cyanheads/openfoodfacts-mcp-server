@@ -192,6 +192,90 @@ describe('OpenFoodFactsService', () => {
       expect(result.products[0]?.brands).toBe('Ferrero, Nutella');
     });
 
+    it('includes sort_by in the tag-filter URL when provided', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 10,
+          page: 1,
+          page_count: 10,
+          page_size: 20,
+          products: [],
+        }),
+      );
+
+      await svc.searchProducts(
+        { categories_tag: 'en:cheeses', sort_by: 'unique_scans_n', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('sort_by=unique_scans_n');
+      expect(fetchCall).toContain('api/v2/search');
+    });
+
+    it('does not include sort_by in the text-search URL (endpoint ignores it)', async () => {
+      // search.openfoodfacts.org does not support server-side sort — verify it is not sent.
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [],
+        }),
+      );
+
+      await svc.searchProducts(
+        { query: 'chocolate', sort_by: 'popularity_key', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('search.openfoodfacts.org');
+      expect(fetchCall).not.toContain('sort_by');
+    });
+
+    it('includes ecoscore_grade in SEARCH_FIELDS for tag-filter requests', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          page: 1,
+          page_count: 1,
+          page_size: 20,
+          products: [{ code: '3017620422003', ecoscore_grade: 'c' }],
+        }),
+      );
+
+      const result = await svc.searchProducts(
+        { categories_tag: 'en:spreads', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('ecoscore_grade');
+      expect(result.products[0]?.ecoscore_grade).toBe('c');
+    });
+
+    it('normalizes ecoscore_grade from text search hits to RawProduct', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [{ code: '3017620422003', product_name: 'Nutella', ecoscore_grade: 'c' }],
+        }),
+      );
+
+      const result = await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx);
+
+      expect(result.products[0]?.ecoscore_grade).toBe('c');
+    });
+
     it('text search result page_count reflects products-on-page, not total pages', async () => {
       // search.openfoodfacts.org page_count = total pages; /api/v2 page_count = products on page.
       // The service must normalize the text search response to use products-on-page.

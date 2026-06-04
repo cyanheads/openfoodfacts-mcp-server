@@ -222,4 +222,156 @@ describe('off_search_products', () => {
     expect(text).toContain('1234567890001');
     expect(text).not.toContain('undefined');
   });
+
+  // ── sort_by parameter ─────────────────────────────────────────────────────
+
+  it('passes sort_by to the service on tag-filter path', async () => {
+    mockSearchProducts.mockResolvedValue({
+      count: 5,
+      page: 1,
+      page_count: 5,
+      page_size: 20,
+      products: [],
+    });
+
+    await offSearchProductsTool.handler(
+      { categories_tag: 'en:cheeses', sort_by: 'unique_scans_n', page: 1, page_size: 20 },
+      ctx,
+    );
+
+    expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+      categories_tag: 'en:cheeses',
+      sort_by: 'unique_scans_n',
+    });
+  });
+
+  it('does not set sort_by when omitted', async () => {
+    mockSearchProducts.mockResolvedValue({
+      count: 1,
+      page: 1,
+      page_count: 1,
+      page_size: 20,
+      products: [],
+    });
+
+    await offSearchProductsTool.handler(
+      { categories_tag: 'en:spreads', page: 1, page_size: 20 },
+      ctx,
+    );
+
+    const params = mockSearchProducts.mock.calls[0][0];
+    expect(params.sort_by).toBeUndefined();
+  });
+
+  it('passes sort_by even on text-query path (service ignores it)', async () => {
+    // The tool passes sort_by to the service regardless of path — the service is responsible
+    // for ignoring it on the text-search path. This keeps the tool layer simple.
+    mockSearchProducts.mockResolvedValue({
+      count: 2,
+      page: 1,
+      page_count: 2,
+      page_size: 20,
+      products: [],
+    });
+
+    await offSearchProductsTool.handler(
+      { query: 'chocolate', sort_by: 'popularity_key', page: 1, page_size: 20 },
+      ctx,
+    );
+
+    const params = mockSearchProducts.mock.calls[0][0];
+    expect(params.sort_by).toBe('popularity_key');
+  });
+
+  // ── ecoscore_grade in search results ──────────────────────────────────────
+
+  it('surfaces ecoscore_grade in search result rows', async () => {
+    mockSearchProducts.mockResolvedValue({
+      count: 1,
+      page: 1,
+      page_count: 1,
+      page_size: 20,
+      products: [
+        {
+          code: '3017620422003',
+          product_name: 'Nutella',
+          brands: 'Ferrero',
+          nutriscore_grade: 'e',
+          nova_group: 4,
+          ecoscore_grade: 'c',
+          categories_tags: ['en:spreads'],
+        },
+      ],
+    });
+
+    const result = await offSearchProductsTool.handler(
+      { query: 'nutella', page: 1, page_size: 20 },
+      ctx,
+    );
+
+    expect(result.products[0]?.ecoscore_grade).toBe('c');
+  });
+
+  it('omits ecoscore_grade from rows when absent (no fabrication)', async () => {
+    mockSearchProducts.mockResolvedValue({
+      count: 1,
+      page: 1,
+      page_count: 1,
+      page_size: 20,
+      products: [
+        {
+          code: '1234567890001',
+          product_name: 'Sparse Product',
+        },
+      ],
+    });
+
+    const result = await offSearchProductsTool.handler(
+      { query: 'sparse', page: 1, page_size: 20 },
+      ctx,
+    );
+
+    expect(result.products[0]?.ecoscore_grade).toBeUndefined();
+  });
+
+  it('formats ecoscore_grade in the scores line', () => {
+    const output = {
+      total: 1,
+      page: 1,
+      page_count: 1,
+      products: [
+        {
+          barcode: '3017620422003',
+          product_name: 'Nutella',
+          brands: 'Ferrero',
+          nutriscore_grade: 'e',
+          nova_group: 4,
+          ecoscore_grade: 'c',
+          categories_tags: ['en:spreads'],
+        },
+      ],
+    };
+    const blocks = offSearchProductsTool.format!(output);
+    const text = blocks[0].text;
+    expect(text).toContain('Green-Score: c');
+  });
+
+  it('omits Green-Score line when ecoscore_grade is absent', () => {
+    const output = {
+      total: 1,
+      page: 1,
+      page_count: 1,
+      products: [
+        {
+          barcode: '3017620422003',
+          product_name: 'Nutella',
+          nutriscore_grade: 'e',
+          // no ecoscore_grade
+        },
+      ],
+    };
+    const blocks = offSearchProductsTool.format!(output);
+    const text = blocks[0].text;
+    expect(text).not.toContain('Green-Score');
+  });
 });

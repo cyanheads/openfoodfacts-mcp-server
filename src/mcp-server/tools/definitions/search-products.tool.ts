@@ -57,6 +57,12 @@ export const offSearchProductsTool = tool('off_search_products', {
       .describe(
         'Canonical country tag ID. Example: "en:france", "en:united-states". Filters to products sold in that country.',
       ),
+    sort_by: z
+      .enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'])
+      .optional()
+      .describe(
+        'Sort order for tag-filter results. "unique_scans_n" surfaces the most-scanned products. Ignored on text-query searches (search.openfoodfacts.org does not support server-side sort). Omitting returns results in default database order.',
+      ),
     page: z
       .number()
       .int()
@@ -105,6 +111,12 @@ export const offSearchProductsTool = tool('off_search_products', {
               .number()
               .optional()
               .describe('NOVA processing class (1–4). Absent when not assigned.'),
+            ecoscore_grade: z
+              .string()
+              .optional()
+              .describe(
+                'Green-Score letter (a–e). Environmental impact indicator. Absent when not computed.',
+              ),
             categories_tags: z
               .array(z.string().describe('Canonical category tag ID (e.g. "en:cheeses").'))
               .optional()
@@ -170,6 +182,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (input.nutrition_grade) searchParams.nutrition_grade = input.nutrition_grade;
     if (input.nova_group) searchParams.nova_group = input.nova_group;
     if (input.countries_tag?.trim()) searchParams.countries_tag = input.countries_tag.trim();
+    if (input.sort_by) searchParams.sort_by = input.sort_by;
 
     const response = await svc.searchProducts(searchParams, ctx);
 
@@ -202,6 +215,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       ...(p.brands && { brands: p.brands }),
       ...(p.nutriscore_grade && { nutriscore_grade: p.nutriscore_grade }),
       ...(typeof p.nova_group === 'number' && { nova_group: p.nova_group }),
+      ...(p.ecoscore_grade && { ecoscore_grade: p.ecoscore_grade }),
       ...(p.categories_tags && { categories_tags: p.categories_tags }),
     }));
 
@@ -235,6 +249,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       const scores: string[] = [];
       if (p.nutriscore_grade) scores.push(`Nutri-Score: ${p.nutriscore_grade}`);
       if (p.nova_group !== undefined) scores.push(`NOVA: ${p.nova_group}`);
+      if (p.ecoscore_grade) scores.push(`Green-Score: ${p.ecoscore_grade}`);
       if (scores.length > 0) lines.push(`**Scores:** ${scores.join(' | ')}`);
 
       if (p.categories_tags && p.categories_tags.length > 0) {

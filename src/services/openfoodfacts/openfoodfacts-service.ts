@@ -33,7 +33,8 @@ const PRODUCT_FIELDS =
   'packaging_tags,origins_tags,image_url,completeness,data_quality_tags';
 
 /** Fields to request on search results — summary rows for triage. Shared by both search paths. */
-const SEARCH_FIELDS = 'code,product_name,brands,nutriscore_grade,nova_group,categories_tags';
+const SEARCH_FIELDS =
+  'code,product_name,brands,nutriscore_grade,nova_group,ecoscore_grade,categories_tags';
 
 /**
  * Text search endpoint — search.openfoodfacts.org uses Elasticsearch and actually filters by the
@@ -288,6 +289,7 @@ export class OpenFoodFactsService {
             ...(brands !== undefined && { brands }),
             ...(hit.nutriscore_grade !== undefined && { nutriscore_grade: hit.nutriscore_grade }),
             ...(hit.nova_group !== undefined && { nova_group: hit.nova_group }),
+            ...(hit.ecoscore_grade !== undefined && { ecoscore_grade: hit.ecoscore_grade }),
             ...(hit.categories_tags !== undefined && { categories_tags: hit.categories_tags }),
             // code is the barcode — stored as a synthetic field for the search handler to read
             ...({ code: hit.code } as unknown as Partial<RawProduct>),
@@ -400,6 +402,7 @@ export class OpenFoodFactsService {
     if (params.nutrition_grade) url.searchParams.set('nutrition_grades', params.nutrition_grade);
     if (params.nova_group) url.searchParams.set('nova_groups', params.nova_group);
     if (params.countries_tag) url.searchParams.set('countries_tags', params.countries_tag);
+    if (params.sort_by) url.searchParams.set('sort_by', params.sort_by);
     url.searchParams.set('page', String(params.page ?? 1));
     url.searchParams.set('page_size', String(params.page_size ?? 20));
     return url.toString();

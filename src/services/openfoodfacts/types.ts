@@ -79,6 +79,7 @@ export type RawTextSearchHit = {
   brands?: string | string[];
   nutriscore_grade?: string;
   nova_group?: number;
+  ecoscore_grade?: string;
   categories_tags?: string[];
 };
 
@@ -91,6 +92,8 @@ export type SearchParams = {
   nutrition_grade?: string;
   nova_group?: string;
   countries_tag?: string;
+  /** Sort order — applied only on the tag-filter path (/api/v2/search). Ignored on text search. */
+  sort_by?: 'last_modified_t' | 'unique_scans_n' | 'created_t' | 'popularity_key';
   page?: number;
   page_size?: number;
 };
