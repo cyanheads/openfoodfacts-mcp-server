@@ -134,12 +134,15 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe('Guidance when results are empty — echoes filters and suggests how to broaden.'),
+    truncated: z.boolean().optional().describe('True when more results exist beyond this page.'),
+    shown: z.number().optional().describe('Number of products returned on this page.'),
+    cap: z.number().optional().describe('The page_size that was applied.'),
   },
 
   errors: [
     {
       reason: 'no_filters',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'No search query or filter was provided',
       recovery:
         'Provide at least one of: query, categories_tag, brands_tag, labels_tag, nutrition_grade, nova_group, or countries_tag.',
@@ -206,6 +209,13 @@ export const offSearchProductsTool = tool('off_search_products', {
         notice:
           `No products found for ${filterParts.join(', ')}. ` +
           'Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+      });
+    } else if (response.count > response.page_count) {
+      // Disclose when the page is smaller than the total result set
+      ctx.enrich.truncated({
+        shown: response.page_count,
+        cap: input.page_size,
+        guidance: `Page ${response.page} of ${Math.ceil(response.count / input.page_size)}. Use page parameter to fetch subsequent pages.`,
       });
     }
 

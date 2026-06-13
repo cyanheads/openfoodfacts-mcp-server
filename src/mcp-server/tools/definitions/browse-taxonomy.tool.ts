@@ -75,6 +75,12 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .describe('Total entries in this facet before search filtering. Large for categories.'),
   }),
 
+  enrichment: {
+    truncated: z.boolean().optional().describe('True when more tags exist beyond the limit.'),
+    shown: z.number().optional().describe('Number of tags returned.'),
+    cap: z.number().optional().describe('The limit that was applied.'),
+  },
+
   handler(input, ctx) {
     const svc = getTaxonomyService();
     const result = svc.search(
@@ -89,6 +95,11 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       returned: result.tags.length,
       total: result.total_in_facet,
     });
+
+    // Disclose truncation when the result was capped by limit
+    if (result.total_in_facet !== undefined && result.tags.length < result.total_in_facet) {
+      ctx.enrich.truncated({ shown: result.tags.length, cap: input.limit });
+    }
 
     return {
       facet: result.facet,
