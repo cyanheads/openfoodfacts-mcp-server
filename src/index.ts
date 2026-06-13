@@ -10,6 +10,8 @@ import { initOpenFoodFactsService } from './services/openfoodfacts/openfoodfacts
 import { initTaxonomyService } from './services/taxonomy/taxonomy-service.js';
 
 await createApp({
+  name: 'openfoodfacts-mcp-server',
+  title: 'openfoodfacts-mcp-server',
   tools: allToolDefinitions,
   instructions:
     'Use the off_* tools to query Open Food Facts — a free, crowd-sourced global food product database covering 3M+ products. ' +
