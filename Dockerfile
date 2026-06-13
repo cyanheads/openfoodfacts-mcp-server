@@ -36,11 +36,15 @@ WORKDIR /usr/src/app
 # production dependencies are installed.
 ENV NODE_ENV=production
 
+# Build arg for OCI version label — passed via --build-arg APP_VERSION=<version> at release time
+ARG APP_VERSION
+
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 LABEL org.opencontainers.image.title="openfoodfacts-mcp-server"
 LABEL org.opencontainers.image.description="Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/openfoodfacts-mcp-server"
+LABEL org.opencontainers.image.version="${APP_VERSION}"
 
 # Copy dependency manifests
 COPY package.json bun.lock ./
@@ -94,6 +98,10 @@ ENV MCP_FORCE_CONSOLE_LOGGING="true"
 
 # Expose the port the server listens on
 EXPOSE ${MCP_HTTP_PORT}
+
+# Health check — polls /healthz every 30s; no curl/wget dependency
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD bun -e "fetch('http://localhost:' + (process.env.MCP_HTTP_PORT || '3010') + '/healthz').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
 # The command to start the server
 CMD ["bun", "run", "dist/index.js"]
