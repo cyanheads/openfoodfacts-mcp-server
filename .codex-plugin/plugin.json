@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/openfoodfacts-mcp-server",
+  "name": "openfoodfacts-mcp-server",
   "version": "0.1.4",
   "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -25,7 +25,7 @@
   ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/openfoodfacts-mcp-server",
+    "displayName": "openfoodfacts-mcp-server",
     "shortDescription": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
     "longDescription": "",
     "developerName": "cyanheads",

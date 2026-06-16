@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/openfoodfacts-mcp-server",
+  "name": "openfoodfacts-mcp-server",
   "version": "0.1.4",
   "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -9,7 +9,7 @@
   "repository": "git+https://github.com/cyanheads/openfoodfacts-mcp-server.git",
   "license": "Apache-2.0",
   "mcpServers": {
-    "@cyanheads/openfoodfacts-mcp-server": {
+    "openfoodfacts-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/openfoodfacts-mcp-server"],
       "env": {
