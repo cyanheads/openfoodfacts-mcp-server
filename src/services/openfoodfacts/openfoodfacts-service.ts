@@ -22,7 +22,7 @@ import type {
  * Identifying User-Agent required by OFF terms — identifies the client and provides a contact email.
  * Format per OFF docs: <client>/<version> (<contact>)
  */
-const USER_AGENT = 'openfoodfacts-mcp-server/0.1.0 (casey@caseyjhand.com)';
+const USER_AGENT = 'openfoodfacts-mcp-server/0.1.6 (casey@caseyjhand.com)';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 

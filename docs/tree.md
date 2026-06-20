@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-06-13 03:55:29
+Generated on: 2026-06-20 17:39:44
 
 ```text
 openfoodfacts-mcp-server/
@@ -27,6 +27,7 @@ openfoodfacts-mcp-server/
 ├── scripts/
 │   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts

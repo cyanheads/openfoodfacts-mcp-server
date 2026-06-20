@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-06-20
+
+Adopt @cyanheads/mcp-ts-core ^0.10.9: two new static devcheck guards (dependency specifiers, plugin marketplace manifests), re-synced vendored skills, and dependency refresh.
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-15
 
 Run the release:github script under bun instead of tsx, which is not installed.

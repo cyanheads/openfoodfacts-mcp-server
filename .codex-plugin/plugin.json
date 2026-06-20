@@ -1,6 +1,6 @@
 {
   "name": "openfoodfacts-mcp-server",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -27,7 +27,7 @@
   "interface": {
     "displayName": "openfoodfacts-mcp-server",
     "shortDescription": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
-    "longDescription": "",
+    "longDescription": "MCP access to Open Food Facts, the crowd-sourced global food product database (3M+ products). Four tools: off_get_product fetches a product by EAN-13/UPC barcode with ingredients, allergens, additives, per-100g and per-serving nutrition, and the Nutri-Score, NOVA, and Green-Score indicators; off_search_products finds products by text query or canonical tag filters; off_compare_products returns a side-by-side nutrition table for 2-10 barcodes; off_browse_taxonomy resolves human terms to the canonical tag IDs the search filters expect. Missing fields mean a value has not yet been entered by contributors, and computed scores carry regional formula caveats. No API key required; runs over STDIO or Streamable HTTP. Data under ODbL 1.0 - cite Open Food Facts in downstream use.",
     "developerName": "cyanheads",
     "category": "data",
     "capabilities": ["Read"],
