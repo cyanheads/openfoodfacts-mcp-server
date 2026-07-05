@@ -399,8 +399,12 @@ export class OpenFoodFactsService {
     if (params.categories_tag) url.searchParams.set('categories_tags', params.categories_tag);
     if (params.brands_tag) url.searchParams.set('brands_tags', params.brands_tag);
     if (params.labels_tag) url.searchParams.set('labels_tags', params.labels_tag);
-    if (params.nutrition_grade) url.searchParams.set('nutrition_grades', params.nutrition_grade);
-    if (params.nova_group) url.searchParams.set('nova_groups', params.nova_group);
+    // Score filters use the *_tags param keys — the bare nutrition_grades / nova_groups keys are
+    // silently ignored by /api/v2/search and return unfiltered rows. Values pass through bare:
+    // nutrition_grades_tags accepts only the plain grade letter ("a", not "en:a").
+    if (params.nutrition_grade)
+      url.searchParams.set('nutrition_grades_tags', params.nutrition_grade);
+    if (params.nova_group) url.searchParams.set('nova_groups_tags', params.nova_group);
     if (params.countries_tag) url.searchParams.set('countries_tags', params.countries_tag);
     if (params.sort_by) url.searchParams.set('sort_by', params.sort_by);
     url.searchParams.set('page', String(params.page ?? 1));

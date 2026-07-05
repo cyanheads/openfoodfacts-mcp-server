@@ -1,6 +1,7 @@
 /**
  * @fileoverview Regression tests for OpenFoodFactsService — covers HTTP 404 not-found handling
- * (Bug #3), text search routing (Bug #2), and User-Agent header verification.
+ * (Bug #3), text search routing (Bug #2), score-filter query-param mapping (GH issue #3), and
+ * User-Agent header verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
@@ -299,6 +300,54 @@ describe('OpenFoodFactsService', () => {
       // page_count must be products-on-page (2), not total-pages (20)
       expect(result.page_count).toBe(2);
       expect(result.count).toBe(40);
+    });
+  });
+
+  // ── GH issue #3: score filters must use the *_tags query params ────────────
+
+  describe('searchProducts — score filter query params', () => {
+    /** Stub a tag-search response and return the URL the service fetched. */
+    async function urlForTagSearch(params: Record<string, unknown>): Promise<string> {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, ctx);
+      return vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+    }
+
+    it('maps nutrition_grade to nutrition_grades_tags (not the ignored nutrition_grades key)', async () => {
+      // GH issue #3: the API silently ignores nutrition_grades= and returns unfiltered rows.
+      // The tag-style nutrition_grades_tags= key is the one that actually filters.
+      const url = await urlForTagSearch({
+        categories_tag: 'en:breakfast-cereals',
+        nutrition_grade: 'a',
+      });
+
+      expect(url).toContain('nutrition_grades_tags=a');
+      expect(url).not.toContain('nutrition_grades=');
+    });
+
+    it('maps nova_group to nova_groups_tags (not the ignored nova_groups key)', async () => {
+      const url = await urlForTagSearch({
+        categories_tag: 'en:breakfast-cereals',
+        nova_group: '1',
+      });
+
+      expect(url).toContain('nova_groups_tags=1');
+      expect(url).not.toContain('nova_groups=');
+    });
+
+    it('passes the score value through bare — no en: prefix added', async () => {
+      // Live-verified: nutrition_grades_tags accepts only the bare grade letter
+      // (nutrition_grades_tags=en:a returns 0 matches). Value must not be prefixed.
+      const url = await urlForTagSearch({ nutrition_grade: 'a', nova_group: '1' });
+
+      expect(url).toContain('nutrition_grades_tags=a');
+      expect(url).not.toContain('nutrition_grades_tags=en');
+      expect(url).toContain('nova_groups_tags=1');
     });
   });
 
