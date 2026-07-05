@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 17:39:44
+Generated on: 2026-07-05 11:43:29
 
 ```text
 openfoodfacts-mcp-server/
@@ -169,6 +169,7 @@ openfoodfacts-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
