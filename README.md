@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -56,6 +56,7 @@ Search Open Food Facts by text and/or structured tag filters.
 
 - Full-text search across product names, brands, and ingredients
 - Structured filters: `categories_tag`, `brands_tag`, `labels_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag`
+- Text query and tag filters combine — a query with filters returns products that match the text *and* satisfy every filter (e.g., `query: "dark chocolate"` + `labels_tag: en:organic` + `countries_tag: en:france`)
 - All filter values are canonical tag IDs — use `off_browse_taxonomy` to resolve human terms (e.g., "organic" → `en:organic`)
 - Pagination via `page` (1-based) and `page_size` (1–50, default 20); response includes `total` count for computing total pages
 - Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — use `off_get_product` for full label data
@@ -68,7 +69,7 @@ Search Open Food Facts by text and/or structured tag filters.
 
 Side-by-side nutrition and scoring comparison for 2–10 barcodes.
 
-- Fetches all products in parallel
+- Accepts 2–10 barcodes, compared in the order provided
 - Returns a normalized comparison table: energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score
 - Missing nutrition data is preserved as `null` — comparisons are not imputed or estimated
 - `not_found` list identifies barcodes with no contributor record (partial results are not an error)
@@ -81,8 +82,8 @@ Browse the canonical Open Food Facts tag vocabulary before building `off_search_
 
 - Facets: `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`
 - Optional `search` parameter: case-insensitive substring match against tag ID or display name (e.g., `"gluten"` → `en:gluten`, `en:no-gluten`, `en:no-added-gluten`)
-- Taxonomy is embedded (not fetched live) because the OFF taxonomy API is unavailable to anonymous bot clients at current traffic levels
-- Categories facet has 200K+ entries — always include a `search` term when browsing categories
+- Taxonomy is served from a curated in-process vocabulary — no live network call, so lookups are instant and offline
+- The categories facet is broad — pass a `search` term to narrow it to the relevant tags
 - `limit` controls results returned (1–100, default 20)
 
 ---

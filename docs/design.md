@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|
 | `off_get_product` | Fetch a product by barcode (EAN-13/UPC). Returns name, brands, quantity, ingredients (raw text + parsed list), allergens, additives, Nutri-Score, NOVA group, Green-Score, nutriments per 100g and per serving, categories, labels, packaging, origins, image URL, and completeness signal. Missing fields mean "not yet entered in the database" — not that the attribute is absent from the real product. | `barcode` (string, required), `fields` (optional field subset) | `readOnlyHint: true` |
 | `off_search_products` | Search by keyword and/or structured tag filters. Returns summary rows with barcodes for follow-up lookups. Use when the barcode is unknown or to explore a category. Filters use canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. | `query` (text search), `categories_tag`, `brands_tag`, `labels_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, `page`, `page_size` | `readOnlyHint: true` |
-| `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 barcodes. Fetches all products in parallel, returns a normalized table of calories, fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA, and Green-Score. Designed for "which of these cereals is healthiest?" workflows. | `barcodes` (array of 2–10 EAN/UPC strings) | `readOnlyHint: true` |
+| `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 barcodes. Returns a normalized table of calories, fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA, and Green-Score. Designed for "which of these cereals is healthiest?" workflows. | `barcodes` (array of 2–10 EAN/UPC strings) | `readOnlyHint: true` |
 | `off_browse_taxonomy` | Look up canonical tag IDs for the common filter vocabularies: categories, labels, allergens, additives, countries, nova groups, nutrition grades. Returns a curated list of tag IDs and their display names for a given facet, optionally filtered by a search term. Use before `off_search_products` to build precise filter values. | `facet` (enum), `search` (optional filter term), `limit` | `readOnlyHint: true`, `openWorldHint: false` |
 
 ### Resources
@@ -33,7 +33,7 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 
 ## Requirements
 
-- No API key. Mandatory identifying `User-Agent` header: `openfoodfacts-mcp-server/0.1.0 (casey@caseyjhand.com)` — baked into the service layer, not per-call.
+- No API key. Mandatory identifying `User-Agent` header: `openfoodfacts-mcp-server/<version> (casey@caseyjhand.com)` — baked into the service layer, not per-call.
 - Read-only — no write-back of product edits.
 - Per-endpoint rate limits: product reads ~100/min, search ~10/min. Rate limiting enforced in service layer.
 - Field selection mandatory on every request — the product object is ~200 keys; always scope `fields=`.
@@ -105,7 +105,7 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 **Filter params confirmed working:**
 - `categories_tags_en=breakfast-cereals` — English label (no `en:` prefix needed for `_en` params)
 - `brands_tags=nutella` — brand slug
-- `nutrition_grades=e` — single letter a–e
+- `nutrition_grades_tags=e` — single letter a–e (the bare `nutrition_grades` key is silently ignored)
 - Multiple filters compose as AND
 
 **Tag filter params in search:** `categories_tags`, `labels_tags`, `allergens_tags`, `additives_tags`, `brands_tags`, `countries_tags` — use canonical `en:X` format. The `_en` suffix variants accept plain English slugs.
@@ -211,7 +211,7 @@ errors: [
 
 ### `off_search_products`
 
-**Description:** Search Open Food Facts by text and/or structured tag filters. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use `off_get_product` on the returned barcodes for complete details. Filter values must be canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. Data is crowd-sourced; result count reflects contributed products, not all products in the market.
+**Description:** Search Open Food Facts by full-text query, structured tag filters, or both together. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use `off_get_product` on the returned barcodes for complete details. A text query and tag filters combine: results match the query text and satisfy every provided filter. Filter values must be canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. Data is crowd-sourced; result count reflects contributed products, not all products in the market.
 
 **Input schema:**
 
@@ -282,7 +282,7 @@ errors: [
 
 ### `off_compare_products`
 
-**Description:** Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Fetches all products in parallel and returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these three cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as null — comparisons are not imputed. Scores carry regional caveats.
+**Description:** Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these three cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as null — comparisons are not imputed. Scores carry regional caveats.
 
 **Input schema:**
 
@@ -291,7 +291,7 @@ z.object({
   barcodes: z.array(
     z.string().regex(/^\d{8,14}$/).describe('EAN-13 or UPC barcode.')
   ).min(2).max(10)
-    .describe('2–10 barcodes to compare. All products are fetched in parallel. Example: ["3017620422003", "7622210100146"].'),
+    .describe('2–10 barcodes to compare, returned as one row each in input order. Example: ["3017620422003", "7622210100146"].'),
 })
 ```
 
@@ -329,7 +329,7 @@ DataCanvas: when comparing ≥5 products, the handler registers the comparison t
 
 ### `off_browse_taxonomy`
 
-**Description:** Browse and search the canonical tag vocabulary for Open Food Facts filter facets. Returns tag IDs and display names for use as filter values in `off_search_products`. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. The taxonomy is embedded — not fetched live — because the OFF taxonomy API is unavailable to anonymous bot clients. Tag IDs use the `en:` prefix convention (e.g. `en:organic`, `en:gluten-free`, `en:milk`).
+**Description:** Browse and search the canonical tag vocabulary for Open Food Facts filter facets. Returns tag IDs and display names for use as filter values in `off_search_products`. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Tag IDs use the `en:` prefix convention (e.g. `en:organic`, `en:gluten-free`, `en:milk`).
 
 **Input schema:**
 
@@ -342,7 +342,7 @@ z.object({
   search: z.string().optional()
     .describe('Filter term — case-insensitive substring match against tag ID or display name. Example: "gluten" returns en:gluten, en:no-gluten, en:no-added-gluten. Omit to list all entries for the facet (may be large for categories).'),
   limit: z.number().int().min(1).max(100).default(20)
-    .describe('Maximum entries to return (1–100, default 20). Categories has 200K+ entries — always provide a search term when browsing categories.'),
+    .describe('Maximum entries to return (1–100, default 20). The categories facet is broad; a search term narrows it to the relevant tags.'),
 })
 ```
 
@@ -374,7 +374,7 @@ z.object({
 ### `openfoodfacts-service`
 
 - **Base URL:** `https://world.openfoodfacts.org`
-- **User-Agent:** `openfoodfacts-mcp-server/0.1.0 (casey@caseyjhand.com)` — sent on every request. Required by OFF terms.
+- **User-Agent:** `openfoodfacts-mcp-server/<version> (casey@caseyjhand.com)` — sent on every request. Required by OFF terms.
 - **Field selection:** every call includes `fields=` to scope the product object.
 - **Methods:**
   - `getProduct(barcode, fields)` → raw product object or `null` (status:0)
@@ -398,7 +398,7 @@ Embedded static JSON mapping `facet → [{id, name, products?}]` for the major O
 | `OFF_RATE_LIMIT_PRODUCT` | No | Product read rate limit (requests/min). Default: `100`. |
 | `OFF_RATE_LIMIT_SEARCH` | No | Search rate limit (requests/min). Default: `10`. |
 
-No API key. The identifying User-Agent is hardcoded in the service layer from `package.json` name/version and a static contact address.
+No API key. The identifying User-Agent is derived in the service layer from `package.json` name/version and a static contact address.
 
 ---
 
@@ -472,8 +472,8 @@ All requests must include `fields=`. Without it, the response is ~200 keys and 5
 | Category (English slug) | `categories_tags_en` | `breakfast-cereals` |
 | Brand | `brands_tags` | `nutella` |
 | Label | `labels_tags` | `en:organic` |
-| Nutrition grade | `nutrition_grades` | `a` |
-| NOVA group | `nova_groups` | `4` |
+| Nutrition grade | `nutrition_grades_tags` | `a` |
+| NOVA group | `nova_groups_tags` | `4` |
 | Country | `countries_tags` | `en:france` |
 | Allergen | `allergens_tags` | `en:milk` |
 

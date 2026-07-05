@@ -9,7 +9,7 @@ import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-ser
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
   description:
-    'Browse and search the canonical tag vocabulary for Open Food Facts filter facets. Returns tag IDs and display names for use as filter values in off_search_products. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. The taxonomy is embedded — not fetched live — because the OFF taxonomy API is unavailable to anonymous bot clients. Tag IDs use the "en:" prefix convention (e.g. "en:organic", "en:gluten-free", "en:milk"). Always use these tag IDs as filter values, not plain English terms.',
+    'Browse and search the canonical tag vocabulary for Open Food Facts filter facets. Returns tag IDs and display names for use as filter values in off_search_products. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Tag IDs use the "en:" prefix convention (e.g. "en:organic", "en:gluten-free", "en:milk"). Use these tag IDs as filter values, not plain English terms.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -43,7 +43,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .max(100)
       .default(20)
       .describe(
-        'Maximum entries to return (1–100, default 20). Categories has many entries — always provide a search term when browsing categories.',
+        'Maximum entries to return (1–100, default 20). The categories facet is broad; a search term narrows it to the relevant tags.',
       ),
   }),
 

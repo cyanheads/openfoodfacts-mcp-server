@@ -104,6 +104,43 @@ describe('off_search_products', () => {
     });
   });
 
+  it('passes both a text query and tag filters to the service (combined search)', async () => {
+    // Combined case (issue #6): query + tag filters travel together in one service call so the
+    // service can build a merged search-a-licious query — the tool drops neither side.
+    mockSearchProducts.mockResolvedValue({
+      count: 6,
+      page: 1,
+      page_count: 6,
+      page_size: 20,
+      products: [
+        {
+          code: '0850013711000',
+          product_name: 'Theo Dark Chocolate',
+          brands: 'Theo',
+          labels_tags: ['en:organic'],
+        },
+      ],
+    });
+
+    const result = await offSearchProductsTool.handler(
+      {
+        query: 'dark chocolate',
+        labels_tag: 'en:organic',
+        countries_tag: 'en:france',
+        page: 1,
+        page_size: 20,
+      },
+      ctx,
+    );
+
+    expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+      query: 'dark chocolate',
+      labels_tag: 'en:organic',
+      countries_tag: 'en:france',
+    });
+    expect(result.products[0]?.barcode).toBe('0850013711000');
+  });
+
   it('formats results with nutriscore_grade and barcode visible', () => {
     const output = {
       total: 10,

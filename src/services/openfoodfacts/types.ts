@@ -83,7 +83,11 @@ export type RawTextSearchHit = {
   categories_tags?: string[];
 };
 
-/** Search parameters for the OFF /api/v2/search endpoint. */
+/**
+ * Search parameters shared by both search backends. A `query` (with or without tag filters) routes
+ * to search.openfoodfacts.org, where any tag filters are folded into the Lucene `q`; tag filters
+ * with no query route to /api/v2/search. `sort_by` applies only on the /api/v2/search path.
+ */
 export type SearchParams = {
   query?: string;
   categories_tag?: string;

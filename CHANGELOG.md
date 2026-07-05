@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-05
+
+Combine free-text queries with tag filters in off_search_products via a single search-a-licious Lucene query, escape free text against injection, rewrite tool descriptions to drop implementation details, and derive USER_AGENT from package.json.
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-05
 
 Fix off_search_products score-filter query params, off_browse_taxonomy false truncation on filtered searches, and off_get_product field-subset rendering; adopt mcp-ts-core ^0.10.12, clearing a transitive js-yaml DoS advisory.

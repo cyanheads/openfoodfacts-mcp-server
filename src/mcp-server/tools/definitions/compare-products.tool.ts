@@ -73,7 +73,7 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
 export const offCompareProductsTool = tool('off_compare_products', {
   title: 'Compare Food Products Side-by-Side',
   description:
-    'Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Fetches all products in parallel and returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -87,7 +87,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       .min(2)
       .max(10)
       .describe(
-        '2–10 barcodes to compare. All products are fetched in parallel. Example: ["3017620422003", "7622210100146"].',
+        '2–10 barcodes to compare, returned as one row each in input order. Example: ["3017620422003", "7622210100146"].',
       ),
   }),
 

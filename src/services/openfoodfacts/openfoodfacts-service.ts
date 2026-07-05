@@ -4,6 +4,7 @@
  * @module services/openfoodfacts/openfoodfacts-service
  */
 
+import { readFileSync } from 'node:fs';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
@@ -19,10 +20,18 @@ import type {
 } from './types.js';
 
 /**
+ * Package version, read from package.json at load so the identifying User-Agent always matches the
+ * shipped release rather than a hand-maintained constant that silently drifts between versions.
+ */
+const { version: PACKAGE_VERSION } = JSON.parse(
+  readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+) as { version: string };
+
+/**
  * Identifying User-Agent required by OFF terms — identifies the client and provides a contact email.
  * Format per OFF docs: <client>/<version> (<contact>)
  */
-const USER_AGENT = 'openfoodfacts-mcp-server/0.1.6 (casey@caseyjhand.com)';
+const USER_AGENT = `openfoodfacts-mcp-server/${PACKAGE_VERSION} (casey@caseyjhand.com)`;
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -41,6 +50,21 @@ const SEARCH_FIELDS =
  * query text. The /api/v2/search endpoint silently ignores search_terms and returns all products.
  */
 const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
+
+/**
+ * Reserved characters in search-a-licious's Lucene-style `q` syntax (field:value clauses, boolean
+ * operators, wildcards, ranges, grouping). Live-verified: an unescaped colon in free text is
+ * parsed as a field filter rather than literal text — e.g. `query: "brands: nutella"` with no
+ * `brands_tag` set returns only Nutella products, and `query: "nutriscore_grade: a"` silently
+ * hard-filters to grade "a" even though nutriscore_grade isn't a facet this tool exposes as a
+ * free-text-injectable filter.
+ */
+const LUCENE_RESERVED_CHARS = /[+\-=&|><!(){}[\]^"~*?:\\/]/g;
+
+/** Escapes Lucene reserved characters so free text is matched as literal terms, never as query syntax. */
+function escapeLuceneQueryText(text: string): string {
+  return text.replace(LUCENE_RESERVED_CHARS, '\\$&');
+}
 
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
 class RateLimiter {
@@ -208,13 +232,15 @@ export class OpenFoodFactsService {
   }
 
   /**
-   * Search products by text and/or tag filters.
+   * Search products by text query, tag filters, or both together.
    * Returns pagination envelope + product summary rows.
    *
    * Routing:
-   * - When `query` is present: search.openfoodfacts.org (Elasticsearch — actual text filtering).
-   *   The /api/v2/search endpoint silently ignores the `search_terms` param and returns all products.
-   * - When only tag filters (no query): /api/v2/search (structured facet filtering).
+   * - `query` present (with or without tag filters): search.openfoodfacts.org (search-a-licious).
+   *   Any tag filters are folded into the Lucene `q` alongside the free text, so combined results
+   *   are both text-relevant and filtered. The /api/v2/search endpoint silently ignores free text,
+   *   so it cannot serve a text query.
+   * - Tag filters only (no query): /api/v2/search (structured facet filtering).
    */
   searchProducts(
     params: SearchParams,
@@ -234,8 +260,9 @@ export class OpenFoodFactsService {
   }
 
   /**
-   * Text search via search.openfoodfacts.org — supports full-text queries.
-   * Tag filters are not supported by this endpoint and are silently dropped when routing here.
+   * Text search via search.openfoodfacts.org (search-a-licious). Handles both text-only queries and
+   * combined text + tag filtering: recognized tag facets are ANDed into the Lucene `q` as hard
+   * filters while the free-text terms drive relevance scoring.
    */
   private async searchProductsByText(
     params: SearchParams,
@@ -250,7 +277,7 @@ export class OpenFoodFactsService {
     return await withRetry(
       async () => {
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/search`);
-        url.searchParams.set('q', params.query ?? '');
+        url.searchParams.set('q', this.buildTextSearchQuery(params));
         url.searchParams.set('fields', SEARCH_FIELDS);
         url.searchParams.set('page', String(params.page ?? 1));
         url.searchParams.set('page_size', String(params.page_size ?? 20));
@@ -314,7 +341,11 @@ export class OpenFoodFactsService {
     );
   }
 
-  /** Tag-filter search via /api/v2/search — structured facet filtering, no text search. */
+  /**
+   * Tag-only search via /api/v2/search — structured facet filtering for requests with no text query.
+   * Combined text + tag requests route through searchProductsByText instead, which folds the tag
+   * facets into the Lucene `q`.
+   */
   private async searchProductsByTags(
     params: SearchParams,
     ctx: Context,
@@ -391,6 +422,30 @@ export class OpenFoodFactsService {
         signal: ctx.signal,
       },
     );
+  }
+
+  /**
+   * Build the search-a-licious Lucene `q` from a text query plus tag filters. Recognized
+   * `field:"value"` facet clauses become hard AND filters; the free-text query adds relevance
+   * scoring. Facet field names differ from /api/v2/search: nutrition grade → `nutriscore_grade`,
+   * NOVA → `nova_group` (no `_tags` suffix); the tag facets keep their names and `en:`-prefixed
+   * values. `en:`-prefixed tag IDs and brand slugs are quoted so their `:` and spaces aren't parsed
+   * as query syntax; the bare score/nova tokens carry no such characters and stay unquoted. The
+   * free-text query is escaped (not quoted) so it keeps multi-term relevance-ranked matching but
+   * can't smuggle in its own field:value clauses — an unescaped colon would otherwise let caller
+   * text override facets, including ones this tool never exposes as filters (see
+   * LUCENE_RESERVED_CHARS).
+   */
+  private buildTextSearchQuery(params: SearchParams): string {
+    const clauses: string[] = [];
+    if (params.categories_tag) clauses.push(`categories_tags:"${params.categories_tag}"`);
+    if (params.brands_tag) clauses.push(`brands_tags:"${params.brands_tag}"`);
+    if (params.labels_tag) clauses.push(`labels_tags:"${params.labels_tag}"`);
+    if (params.nutrition_grade) clauses.push(`nutriscore_grade:${params.nutrition_grade}`);
+    if (params.nova_group) clauses.push(`nova_group:${params.nova_group}`);
+    if (params.countries_tag) clauses.push(`countries_tags:"${params.countries_tag}"`);
+    if (params.query) clauses.push(escapeLuceneQueryText(params.query));
+    return clauses.join(' ');
   }
 
   private buildSearchUrl(params: SearchParams): string {

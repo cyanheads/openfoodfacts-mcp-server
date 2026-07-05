@@ -11,7 +11,7 @@ import type { SearchParams } from '@/services/openfoodfacts/types.js';
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by text query or structured tag filters. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. Text query and tag filters are mutually exclusive routing paths: when query is provided, a text search is performed and tag filters are ignored; when only tag filters are provided (no query), structured facet filtering is applied. Tag filter values must be canonical tag IDs (e.g. "en:organic", "en:gluten-free") — use off_browse_taxonomy to resolve human terms to tag IDs. At least one search parameter is required. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: results match the query text and satisfy every filter provided (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France). Tag filter values must be canonical tag IDs (e.g. "en:organic", "en:gluten-free") — use off_browse_taxonomy to resolve human terms to tag IDs. At least one search parameter is required. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -19,7 +19,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Full-text search term across product names, brands, and ingredients. When provided, routes to the text search engine — tag filters (categories_tag, brands_tag, etc.) are ignored in this path. Example: "dark chocolate 70%".',
+        'Full-text search term across product names, brands, and ingredients. Combines with any tag filters — results match this text and satisfy the filters. Example: "dark chocolate 70%".',
       ),
     categories_tag: z
       .string()
@@ -61,7 +61,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'])
       .optional()
       .describe(
-        'Sort order for tag-filter results. "unique_scans_n" surfaces the most-scanned products. Ignored on text-query searches (search.openfoodfacts.org does not support server-side sort). Omitting returns results in default database order.',
+        'Sort order for searches without a text query. "unique_scans_n" surfaces the most-scanned products; omitting returns results in default order. Searches that include a text query are relevance-ranked and ignore this option.',
       ),
     page: z
       .number()

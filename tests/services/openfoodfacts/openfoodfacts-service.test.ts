@@ -5,6 +5,7 @@
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
+import { readFileSync } from 'node:fs';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -123,12 +124,12 @@ describe('OpenFoodFactsService', () => {
     });
   });
 
-  // ── Bug #2 regression: text search routes to search.openfoodfacts.org ─────
+  // ── Search routing: text → search-a-licious, tags-only → /api/v2/search, both → combined ──
 
-  describe('searchProducts — text search routing', () => {
-    it('routes to search.openfoodfacts.org when query is provided', async () => {
-      // Bug #2: /api/v2/search silently ignores search_terms and returns all 4.5M products.
-      // When query is set, the service must route to search.openfoodfacts.org instead.
+  describe('searchProducts — routing', () => {
+    it('routes a text-only query to search.openfoodfacts.org', async () => {
+      // Bug #2: /api/v2/search silently ignores search_terms and returns all products, so any
+      // request carrying free text must route to search.openfoodfacts.org (search-a-licious).
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
@@ -152,7 +153,8 @@ describe('OpenFoodFactsService', () => {
     });
 
     it('routes to /api/v2/search when no query — tag-only search', async () => {
-      // When only tag filters are used (no text query), use /api/v2/search (structured facet API).
+      // Tag-only search (no text) stays on /api/v2/search — this path is unchanged by the combined
+      // feature, so it also guards the prior release's score-filter param fix (GH issue #3).
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
@@ -169,6 +171,90 @@ describe('OpenFoodFactsService', () => {
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
       expect(fetchCall).toContain('api/v2/search');
       expect(fetchCall).not.toContain('search.openfoodfacts.org');
+    });
+
+    it('combines a text query with tag filters into one search-a-licious Lucene q', async () => {
+      // Combined case (issue #6): a query PLUS tag filters routes to search-a-licious with a single
+      // Lucene q that ANDs the facet clauses with the free text — both text-relevant and filtered.
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 6070,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [{ code: '0850013711000', product_name: 'Theo Dark Chocolate', brands: ['Theo'] }],
+        }),
+      );
+
+      await svc.searchProducts(
+        {
+          query: 'chocolate',
+          labels_tag: 'en:organic',
+          countries_tag: 'en:france',
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('search.openfoodfacts.org');
+      // Combined requests never fall back to the text-blind /api/v2/search endpoint.
+      expect(fetchCall).not.toContain('api/v2/search');
+
+      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      expect(q).toContain('labels_tags:"en:organic"');
+      expect(q).toContain('countries_tags:"en:france"');
+      expect(q).toContain('chocolate');
+    });
+
+    it('maps score and NOVA filters to search-a-licious field names on the combined path', async () => {
+      // search-a-licious uses different field names than /api/v2/search: nutriscore_grade (not
+      // nutrition_grades_tags) and nova_group (no _tags suffix), both with bare values.
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 12, page: 1, page_size: 20, page_count: 1, hits: [] }),
+        );
+
+      await svc.searchProducts(
+        { query: 'cereal', nutrition_grade: 'a', nova_group: '1', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('search.openfoodfacts.org');
+
+      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      expect(q).toContain('nutriscore_grade:a');
+      expect(q).toContain('nova_group:1');
+      expect(q).toContain('cereal');
+      // The legacy /api/v2/search score-filter field names must not leak onto this path.
+      expect(q).not.toContain('nutrition_grades_tags');
+      expect(q).not.toContain('nova_groups_tags');
+    });
+
+    it('escapes Lucene-reserved characters in free text so it cannot inject a field filter', async () => {
+      // Live-verified against search-a-licious: an unescaped colon in free text is parsed as
+      // Lucene field:value syntax — `query: "brands: nutella"` with no brands_tag set returns
+      // only Nutella products, and `query: "nutriscore_grade: a"` silently hard-filters to grade
+      // "a" even though nutriscore_grade isn't a facet this tool exposes. Escaping must neutralize
+      // this without breaking ordinary free text (no reserved characters, e.g. "chocolate").
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 0, page: 1, page_size: 20, page_count: 1, hits: [] }),
+        );
+
+      await svc.searchProducts({ query: 'brands: nutella', page: 1, page_size: 20 }, ctx);
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      expect(q).toContain('brands\\: nutella');
+      expect(q).not.toMatch(/(?<!\\):/);
     });
 
     it('normalizes brands array from text search to a comma-joined string', async () => {
@@ -366,6 +452,24 @@ describe('OpenFoodFactsService', () => {
       const ua = (init?.headers as Record<string, string>)?.['User-Agent'];
       expect(ua).toMatch(/openfoodfacts-mcp-server\/\d+\.\d+\.\d+/);
       expect(ua).toContain('caseyjhand.com');
+    });
+
+    it('carries the package.json version so the User-Agent cannot drift (GH issue #8)', async () => {
+      // The version segment is derived from package.json, not a hand-maintained constant — this
+      // pins them together so a release bump can never leave the User-Agent behind.
+      const { version } = JSON.parse(
+        readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+      ) as { version: string };
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Test' } }));
+
+      await svc.getProduct('3017620422003', ctx);
+
+      const init = vi.mocked(global.fetch).mock.calls[0]?.[1] as RequestInit | undefined;
+      const ua = (init?.headers as Record<string, string>)?.['User-Agent'];
+      expect(ua).toContain(`openfoodfacts-mcp-server/${version}`);
     });
   });
 });
