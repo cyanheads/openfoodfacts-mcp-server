@@ -273,7 +273,15 @@ const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
 export type TaxonomySearchResult = {
   facet: string;
   tags: TaxonomyEntry[];
+  /** Full facet size before any search filter — the vocabulary total. */
   total_in_facet: number;
+  /**
+   * Count of entries matching the search filter, before the `limit` cap.
+   * Equals `total_in_facet` when no search term is given. Drives the truncation
+   * decision so a filtered result is never reported as truncated against the
+   * full facet size.
+   */
+  matched_in_facet: number;
 };
 
 export class TaxonomyService {
@@ -293,6 +301,7 @@ export class TaxonomyService {
       facet,
       tags: filtered.slice(0, limit),
       total_in_facet: all.length,
+      matched_in_facet: filtered.length,
     };
   }
 }

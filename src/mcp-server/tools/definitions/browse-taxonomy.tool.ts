@@ -96,8 +96,11 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       total: result.total_in_facet,
     });
 
-    // Disclose truncation when the result was capped by limit
-    if (result.total_in_facet !== undefined && result.tags.length < result.total_in_facet) {
+    // Disclose truncation only when matching rows were dropped by the limit. Compare the
+    // returned count against the filtered-match count, not the full facet size — otherwise a
+    // filtered search (including a zero-match one) falsely reports truncation against the
+    // pre-filter vocabulary total.
+    if (result.tags.length < result.matched_in_facet) {
       ctx.enrich.truncated({ shown: result.tags.length, cap: input.limit });
     }
 

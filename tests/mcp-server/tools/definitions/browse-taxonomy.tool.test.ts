@@ -4,7 +4,7 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 // The taxonomy service is embedded (no network) — import directly, no mock needed.
@@ -170,6 +170,59 @@ describe('off_browse_taxonomy', () => {
     expect(withSearch.total_in_facet).toBe(withoutSearch.total_in_facet);
     // Filtered tags must be a subset of (or equal to) total
     expect(withSearch.tags.length).toBeLessThanOrEqual(withSearch.total_in_facet ?? 0);
+  });
+
+  // ── Bug #4 regression: truncation reflects matched rows, not facet size ────
+
+  it('does not signal truncation when a filtered search returns zero matches', async () => {
+    // Bug #4: a 0-match filtered search compared returned (0) against the full pre-filter
+    // facet size (79), wrongly emitting truncated:true. There is nothing more to show.
+    const result = await offBrowseTaxonomyTool.handler(
+      { facet: 'categories', search: 'zzzz-no-match', limit: 5 },
+      ctx,
+    );
+
+    expect(result.tags).toHaveLength(0);
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
+  });
+
+  it('does not signal truncation when all filtered matches fit under the limit', async () => {
+    // Bug #4: labels + "gluten" yields fewer than `limit` matches; every match was returned,
+    // so truncation must not fire even though the full labels facet is larger.
+    const result = await offBrowseTaxonomyTool.handler(
+      { facet: 'labels', search: 'gluten', limit: 5 },
+      ctx,
+    );
+
+    expect(result.tags.length).toBeGreaterThan(0);
+    expect(result.tags.length).toBeLessThan(5);
+    // The full facet is larger than the returned page — the old code truncated on this.
+    expect(result.total_in_facet ?? 0).toBeGreaterThan(result.tags.length);
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
+  });
+
+  it('signals truncation when filtered matches exceed the limit', async () => {
+    // Regression guard for the genuinely-capped case: labels + "no" matches several entries
+    // (a strict subset of the facet); capping at 3 drops matches, so truncation must fire.
+    const result = await offBrowseTaxonomyTool.handler(
+      { facet: 'labels', search: 'no', limit: 3 },
+      ctx,
+    );
+
+    expect(result.tags).toHaveLength(3);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.shown).toBe(3);
+    expect(enrichment.cap).toBe(3);
+  });
+
+  it('signals truncation for an unfiltered browse that exceeds the limit', async () => {
+    // No search term: matched_in_facet === total_in_facet, so a page smaller than the facet
+    // still truncates. The fix must not suppress genuine truncation.
+    const result = await offBrowseTaxonomyTool.handler({ facet: 'categories', limit: 5 }, ctx);
+
+    expect(result.tags).toHaveLength(5);
+    expect(getEnrichment(ctx).truncated).toBe(true);
   });
 
   it('search matches against both id and name fields', async () => {
