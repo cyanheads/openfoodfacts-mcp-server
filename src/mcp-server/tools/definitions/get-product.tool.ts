@@ -249,6 +249,12 @@ export const offGetProductTool = tool('off_get_product', {
       })
       .optional()
       .describe('Product data. Absent when found is false.'),
+    requested_fields: z
+      .array(z.string().describe('A field name from the requested subset.'))
+      .optional()
+      .describe(
+        'The field subset that was requested, when the caller passed `fields`. Absent means all standard fields were requested. Sections outside this subset are omitted because they were not requested — not because Open Food Facts lacks the data.',
+      ),
   }),
 
   errors: [
@@ -291,7 +297,9 @@ export const offGetProductTool = tool('off_get_product', {
       completeness: product.completeness,
     });
 
-    const result = buildProductOutput(input.barcode, product);
+    // Thread the requested subset through so format() can distinguish "not requested" from
+    // "missing upstream data". A full request (no fields) leaves requested_fields absent.
+    const result = buildProductOutput(input.barcode, product, input.fields);
     return result;
   },
 
@@ -308,8 +316,19 @@ export const offGetProductTool = tool('off_get_product', {
     const p = result.product;
     const lines: string[] = [];
 
+    // When a field subset was requested, a section absent from `product` means "not requested",
+    // not "missing upstream." Distinguish the two so the text never implies OFF lacks the data.
+    const requested = result.requested_fields;
+    const notRequested = (field: string): boolean =>
+      requested !== undefined && !requested.includes(field);
+
     lines.push(`## ${p.product_name ?? 'Unknown product'}`);
     lines.push(`**Barcode:** ${result.barcode} | **Found:** ${result.found}`);
+    if (requested && requested.length > 0) {
+      lines.push(
+        `**Requested fields:** ${requested.join(', ')} — sections outside this subset were not requested (not missing from Open Food Facts).`,
+      );
+    }
     if (p.brands) lines.push(`**Brand:** ${p.brands}`);
     if (p.quantity) lines.push(`**Quantity:** ${p.quantity}`);
 
@@ -347,6 +366,8 @@ export const offGetProductTool = tool('off_get_product', {
         if (n.fat_serving !== undefined) lines.push(`**Fat:** ${n.fat_serving}g`);
         if (n.sugars_serving !== undefined) lines.push(`**Sugars:** ${n.sugars_serving}g`);
       }
+    } else if (notRequested('nutriments')) {
+      lines.push('\n**Nutrition:** Not requested');
     } else {
       lines.push('\n**Nutrition:** Not available');
     }
@@ -354,6 +375,8 @@ export const offGetProductTool = tool('off_get_product', {
     // Ingredients — fenced to prevent crowd-sourced text from being interpreted as markdown/instructions
     if (p.ingredients_text) {
       lines.push(`\n### Ingredients\n\`\`\`\n${p.ingredients_text}\n\`\`\``);
+    } else if (notRequested('ingredients_text')) {
+      lines.push('\n**Ingredients:** Not requested');
     } else {
       lines.push('\n**Ingredients:** Not available');
     }
@@ -377,6 +400,8 @@ export const offGetProductTool = tool('off_get_product', {
     // Allergens
     if (p.allergens_tags && p.allergens_tags.length > 0) {
       lines.push(`\n**Allergens:** ${p.allergens_tags.join(', ')}`);
+    } else if (notRequested('allergens_tags')) {
+      lines.push('\n**Allergens:** Not requested');
     } else {
       lines.push('\n**Allergens:** Not entered (absence does not mean allergen-free)');
     }
@@ -425,9 +450,11 @@ export const offGetProductTool = tool('off_get_product', {
 function buildProductOutput(
   barcode: string,
   raw: RawProduct,
+  requestedFields?: string[],
 ): {
   barcode: string;
   found: boolean;
+  requested_fields?: string[];
   product?: {
     product_name?: string;
     brands?: string;
@@ -502,5 +529,10 @@ function buildProductOutput(
   if (typeof raw.completeness === 'number') product.completeness = raw.completeness;
   if (raw.data_quality_tags) product.data_quality_tags = raw.data_quality_tags;
 
-  return { barcode, found: true, product };
+  return {
+    barcode,
+    found: true,
+    product,
+    ...(requestedFields && requestedFields.length > 0 && { requested_fields: requestedFields }),
+  };
 }

@@ -232,6 +232,83 @@ describe('off_get_product', () => {
     expect(result.product?.allergens_tags).toContain('en:milk');
   });
 
+  // ── requested_fields discriminator: "omitted" ≠ "missing upstream" (Bug #5) ─
+
+  it('carries requested_fields mirroring input.fields for a subset request', async () => {
+    // Bug #5: without threading the requested subset into the output, format() cannot tell
+    // "not requested" from "missing upstream." The handler must surface input.fields.
+    mockGetProductFields.mockResolvedValue({
+      product_name: 'Nutella',
+      brands: 'Ferrero',
+      nutriscore_grade: 'e',
+    });
+
+    const result = await offGetProductTool.handler(
+      { barcode: '3017620422003', fields: ['product_name', 'brands', 'nutriscore_grade'] },
+      ctx,
+    );
+
+    expect(result.requested_fields).toEqual(['product_name', 'brands', 'nutriscore_grade']);
+  });
+
+  it('omits requested_fields for a full request (no fields subset)', async () => {
+    mockGetProduct.mockResolvedValue({ product_name: 'Nutella', nutriscore_grade: 'e' });
+
+    const result = await offGetProductTool.handler({ barcode: '3017620422003' }, ctx);
+
+    expect(result.requested_fields).toBeUndefined();
+  });
+
+  it('format() marks omitted sections as "Not requested" for a field-subset result', () => {
+    // Bug #5: for a subset call, omitted sections must not read as "Not available"/"Not entered"
+    // — that conflates "not requested" with "OFF has no data."
+    const output = {
+      barcode: '3017620422003',
+      found: true,
+      product: {
+        product_name: 'Nutella',
+        brands: 'Ferrero, Nutella, Yum yum',
+        nutriscore_grade: 'e',
+      },
+      requested_fields: ['product_name', 'brands', 'nutriscore_grade'],
+    };
+
+    const blocks = offGetProductTool.format!(output);
+    const text = blocks[0].text;
+
+    // The requested subset is disclosed up front, carrying the field names.
+    expect(text).toContain('Requested fields:');
+    expect(text).toContain('product_name');
+    // Omitted sections read as "Not requested", not as missing upstream data.
+    expect(text).toContain('**Nutrition:** Not requested');
+    expect(text).toContain('**Ingredients:** Not requested');
+    expect(text).toContain('**Allergens:** Not requested');
+    // Must not imply Open Food Facts lacks the un-requested data.
+    expect(text).not.toContain('Not available');
+    expect(text).not.toContain('does not mean allergen-free');
+  });
+
+  it('format() still renders "Not available"/"Not entered" for genuinely-missing fields on a full request', () => {
+    // Sparse upstream payload on a FULL request (no fields subset): the honest missing-data
+    // rendering must be preserved — these fields really are absent from Open Food Facts.
+    const output = {
+      barcode: '0000000000000',
+      found: true,
+      product: { product_name: 'Bare Product', nutriscore_grade: 'd' },
+      // requested_fields absent → full request
+    };
+
+    const blocks = offGetProductTool.format!(output);
+    const text = blocks[0].text;
+
+    expect(text).toContain('**Nutrition:** Not available');
+    expect(text).toContain('**Ingredients:** Not available');
+    expect(text).toContain('**Allergens:** Not entered');
+    // No subset was requested, so nothing is "Not requested".
+    expect(text).not.toContain('Not requested');
+    expect(text).not.toContain('Requested fields:');
+  });
+
   // ── crowd-sourced sparsity: missing field ≠ absent attribute ─────────────
 
   it('preserves absent allergens_tags without fabricating an empty array', async () => {
