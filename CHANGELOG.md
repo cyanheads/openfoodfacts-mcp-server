@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-07-26
+
+Declare typed reasons (upstream_error, upstream_timeout, upstream_rejected, rate_limited) across the service layer, split off_compare_products failures from not_found, pre-flight the text-search 10k-result window, and adopt mcp-ts-core ^0.11.0.
+
 ## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-05
 
 Combine free-text queries with tag filters in off_search_products via a single search-a-licious Lucene query, escape free text against injection, rewrite tool descriptions to drop implementation details, and derive USER_AGENT from package.json.

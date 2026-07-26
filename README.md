@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -59,9 +59,10 @@ Search Open Food Facts by text and/or structured tag filters.
 - Text query and tag filters combine — a query with filters returns products that match the text *and* satisfy every filter (e.g., `query: "dark chocolate"` + `labels_tag: en:organic` + `countries_tag: en:france`)
 - All filter values are canonical tag IDs — use `off_browse_taxonomy` to resolve human terms (e.g., "organic" → `en:organic`)
 - Pagination via `page` (1-based) and `page_size` (1–50, default 20); response includes `total` count for computing total pages
+- Searches carrying a text query serve only the first 10,000 results — a deeper `page * page_size` is rejected up front with the highest reachable page, not sent and retried. Tag-only searches publish no window, but deep pages are refused unpredictably, so narrowing the filters beats paging far in
 - Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — use `off_get_product` for full label data
 - Result counts reflect contributed products, not total products on the market
-- Search rate-limited to ~10 requests/min by the Open Food Facts API
+- Search limited to ~10 requests/min by this server's own client-side budget, kept well inside what Open Food Facts asks of clients
 
 ---
 
@@ -73,6 +74,7 @@ Side-by-side nutrition and scoring comparison for 2–10 barcodes.
 - Returns a normalized comparison table: energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score
 - Missing nutrition data is preserved as `null` — comparisons are not imputed or estimated
 - `not_found` list identifies barcodes with no contributor record (partial results are not an error)
+- `failed` list identifies barcodes whose fetch failed, with the per-barcode reason — kept separate from `not_found`, which claims the opposite. A failed barcode never blocks the rows that resolved
 
 ---
 
@@ -102,8 +104,8 @@ Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp
 Open Food Facts-specific:
 
 - No API key required — the identifying `User-Agent` header (required by OFF terms) is baked into the service layer
-- Token-bucket rate limiting per endpoint class: product reads (~100/min), search (~10/min)
-- Automatic retry (3 attempts, 500ms base) with HTML error page detection for 503 during high load
+- Token-bucket rate limiting per endpoint class: product reads (~100/min), search (~10/min). A local refusal says so — it never reports itself as an Open Food Facts rate limit
+- Automatic retry (3 attempts, 500ms base) for transient failures only — 5xx, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. A 4xx is never retried; the upstream's own explanation is surfaced instead
 - Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — only the `_100g` and `_serving` variants are returned
 - Embedded tag taxonomy for `off_browse_taxonomy` — curated 200+ category subset, full allergen/label/additive vocabularies
 
@@ -112,7 +114,8 @@ Agent-friendly output:
 - `found` field on every product response — explicit `false` when a barcode has no contributor record, not a thrown error
 - Missing fields signal incomplete crowd-sourced data, not product attribute absence — surfaced in descriptions and format output
 - Computed scores (Nutri-Score, NOVA, Green-Score) returned as-is with regional caveat notes — not interpreted or normalized to health claims
-- `not_found` list in `off_compare_products` allows partial batch comparisons without request failure
+- `not_found` list in `off_compare_products` allows partial batch comparisons without request failure — and a barcode whose fetch failed lands in `failed` instead, so a transport error is never reported as "no contributor record"
+- Every failure carries a declared `reason` and a recovery hint on both client surfaces — timeouts, upstream outages, upstream rejections, and rate limits each resolve to their own error code and their own next step
 
 ## Getting started
 
