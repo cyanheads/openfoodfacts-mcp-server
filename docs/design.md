@@ -40,7 +40,6 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 - Tag vocabulary, not free text — search filters use canonical tag IDs (`en:organic`, `en:gluten-free`).
 - Missing fields signal incomplete crowd-sourced data, not product attribute absence — surface this distinction explicitly in tool descriptions and output.
 - Computed scores (Nutri-Score, NOVA, Green-Score) carry regional formula and missing-data caveats — return grade letters as-is, never infer absolute health claims.
-- DataCanvas for `off_compare_products` when comparing large batches.
 - Data is under ODbL; tool descriptions note attribution requirement.
 
 ---
@@ -200,9 +199,30 @@ errors: [
   {
     reason: 'upstream_error',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Open Food Facts API returns 5xx or is unreachable',
+    when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
     retryable: true,
-    recovery: 'Retry after a brief pause. If persistent, the Open Food Facts service may be experiencing high load.',
+    recovery: 'Retry after a brief pause. If it keeps failing, Open Food Facts is degraded — check the barcode again later.',
+  },
+  {
+    reason: 'upstream_timeout',
+    code: JsonRpcErrorCode.Timeout,
+    when: 'Open Food Facts did not answer within the request deadline',
+    retryable: true,
+    recovery: 'Retry once. If it times out again, pass a narrower fields subset so Open Food Facts assembles less per request.',
+  },
+  {
+    reason: 'upstream_rejected',
+    code: JsonRpcErrorCode.InvalidParams,
+    when: 'Open Food Facts answers 4xx for something other than a missing barcode',
+    retryable: false,
+    recovery: 'Do not retry — the request will be refused again. Read data.status and the upstream explanation in the message, then correct the request.',
+  },
+  {
+    reason: 'rate_limited',
+    code: JsonRpcErrorCode.RateLimited,
+    when: "This server's own per-minute request budget is spent, or Open Food Facts answers 429",
+    retryable: true,
+    recovery: 'Wait the seconds given in data.retryAfter, then retry. Spread lookups out rather than issuing them in a burst.',
   },
 ]
 ```
@@ -231,8 +251,10 @@ z.object({
     .describe('Filter by NOVA food processing class. 1=unprocessed/minimally processed, 4=ultra-processed. Products without a NOVA score are excluded.'),
   countries_tag: z.string().optional()
     .describe('Canonical country tag ID. Example: "en:france", "en:united-states". Filters to products sold in that country.'),
+  sort_by: z.enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key']).optional()
+    .describe('Sort order for searches without a text query. "unique_scans_n" surfaces the most-scanned products; omitting returns results in default order. Searches that include a text query are relevance-ranked and ignore this option.'),
   page: z.number().int().min(1).default(1)
-    .describe('Page number (1-based). Use with page_size to paginate results.'),
+    .describe('Page number (1-based). Use with page_size to paginate results. Searches that include a text query serve only the first 10,000 results, so page * page_size must stay at or below 10,000 — a deeper request is rejected rather than sent. Tag-only searches have no published window, but Open Food Facts refuses deep pages unpredictably; narrowing the filters is more reliable than paging far in.'),
   page_size: z.number().int().min(1).max(50).default(20)
     .describe('Results per page (1–50, default 20). Keep low for initial exploration; increase for comparison workflows.'),
 })
@@ -264,19 +286,49 @@ z.object({
 errors: [
   {
     reason: 'no_filters',
-    code: JsonRpcErrorCode.InvalidParams,
+    code: JsonRpcErrorCode.ValidationError,
     when: 'No search query or filter was provided',
     recovery: 'Provide at least one of: query, categories_tag, brands_tag, labels_tag, nutrition_grade, nova_group, or countries_tag.',
   },
   {
+    reason: 'page_out_of_range',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'A text search asks for page * page_size beyond the 10,000-result window the text backend serves',
+    retryable: false,
+    recovery: 'Request an earlier page, or add filters so the products you need fall inside the first results rather than deep in the ranking.',
+  },
+  {
     reason: 'upstream_error',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Open Food Facts API returns 5xx or is unreachable',
+    when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
     retryable: true,
-    recovery: 'Retry after a brief pause. The Open Food Facts service may be rate-limiting or experiencing high load.',
+    recovery: 'Retry after a brief pause. The Open Food Facts service may be shedding load — narrow the filters if deep pages keep failing.',
+  },
+  {
+    reason: 'upstream_timeout',
+    code: JsonRpcErrorCode.Timeout,
+    when: 'Open Food Facts did not answer within the request deadline',
+    retryable: true,
+    recovery: 'Retry once with a smaller page_size. Broad unfiltered searches are the slowest for Open Food Facts to assemble.',
+  },
+  {
+    reason: 'upstream_rejected',
+    code: JsonRpcErrorCode.InvalidParams,
+    when: 'Open Food Facts answers 4xx — the request as formed will be refused again',
+    retryable: false,
+    recovery: 'Do not retry. Read data.status and the upstream explanation in the message; reduce the page depth or correct the filter values.',
+  },
+  {
+    reason: 'rate_limited',
+    code: JsonRpcErrorCode.RateLimited,
+    when: "This server's own per-minute search budget is spent, or Open Food Facts answers 429",
+    retryable: true,
+    recovery: 'Wait the seconds given in data.retryAfter, then retry. Searches carry a much smaller budget than product lookups.',
   },
 ]
 ```
+
+The `page_out_of_range` check runs in the handler before the service is called, mirroring the `no_filters` pre-check. It is scoped to the text path — `/api/v2/search` publishes no equivalent ceiling.
 
 ---
 
@@ -315,15 +367,20 @@ z.object({
     proteins_100g: z.number().optional().describe('Protein per 100g (g).'),
     fiber_100g: z.number().optional().describe('Dietary fiber per 100g (g). Often absent.'),
     completeness: z.number().optional().describe('Data completeness 0–1. Low values mean many fields are missing.'),
-  })).describe('Comparison rows, one per barcode in input order.'),
+  })).describe('Comparison rows in input order — one per barcode whose fetch completed, whether or not a record exists. Barcodes whose fetch failed have no row here; they appear in failed.'),
   succeeded: z.number().describe('Number of barcodes that resolved to a found product.'),
-  not_found: z.array(z.string()).describe('Barcodes with no contributor record. Not an error — product may exist but not yet entered.'),
+  not_found: z.array(z.string()).describe('Barcodes Open Food Facts answered for, confirming no contributor record exists. Not an error — the product may exist but not yet be entered. Never used for a fetch that failed.'),
+  failed: z.array(z.object({
+    barcode: z.string().describe('EAN-13 or UPC barcode whose fetch failed.'),
+    reason: z.string().describe('Declared failure reason — one of upstream_error, upstream_timeout, upstream_rejected, rate_limited.'),
+    error: z.string().describe('What went wrong for this barcode and what to do about it.'),
+  })).optional().describe('Barcodes whose fetch failed, with the per-barcode reason. Absent when every fetch completed. A barcode listed here is unknown, not absent from Open Food Facts.'),
 })
 ```
 
-DataCanvas: when comparing ≥5 products, the handler registers the comparison table as a canvas dataframe and returns a `canvas_id` in enrichment for downstream SQL queries. Use `spillover()` from `api-canvas` for the spill logic.
+No DataCanvas spill: a batch caps at 10 products, which is too small to warrant a canvas/SQL layer.
 
-**Errors:** No declared contract — partial results (some barcodes found, some not) are returned in the output, not thrown as errors. Upstream 5xx → `serviceUnavailable()` factory.
+**Errors:** Declares `upstream_error`, `upstream_timeout`, `upstream_rejected`, and `rate_limited` — the same four reasons the service raises, with recovery text scoped to a batch ("retry the barcodes listed in failed"). None of them aborts the call: a batch is not all-or-nothing, so each is surfaced per barcode in `failed[]` while the rows that resolved are kept. Confirmed-missing barcodes stay in `not_found`, which claims the opposite of a failed fetch.
 
 ---
 
@@ -379,10 +436,11 @@ z.object({
 - **Methods:**
   - `getProduct(barcode, fields)` → raw product object or `null` (status:0)
   - `searchProducts(params)` → `{count, page, page_count, page_size, products[]}`
-- **Rate limiting:** token bucket per endpoint class — product reads (100/min), search (10/min). Implemented via the framework's rate limiter.
-- **Retry:** `withRetry` on the full fetch+parse pipeline. 3 attempts, 500ms base delay (upstream is stateless; 5xx is transient).
-- **Parse failure:** HTML error pages (503 during high load) detected by content-type check → `ServiceUnavailable` (not `SerializationError`).
-- **Missing barcode:** `status:0` in a 200 response → handler calls `ctx.fail('not_found', ...)`. Do not throw on HTTP status.
+- **Rate limiting:** token bucket per endpoint class — product reads (100/min), search (10/min). A refusal is local, so it raises `rate_limited` (`RateLimited`) naming this server, not Open Food Facts, and carries the seconds until a slot frees.
+- **Transport:** `fetchWithTimeout` at every call site, so HTTP status → error code, canonical `status`/`body` on `error.data`, `Retry-After` honoring, and distinct `Timeout` classification all come from the framework rather than a hand-rolled status ladder.
+- **Retry:** `withRetry` on the full fetch+parse pipeline. 3 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped code decides: 5xx, timeouts, and 429 retry; 4xx fails immediately.
+- **Parse failure:** HTML error pages (503 during high load) detected by content-type check → `upstream_error` (`ServiceUnavailable`, not `SerializationError`).
+- **Missing barcode:** `status:0` in a 200 response, or an HTTP 404, → `null` from the service; the handler calls `ctx.fail('not_found', ...)`. `null` is reserved for this case alone.
 
 ### `taxonomy-service`
 
@@ -409,7 +467,7 @@ No API key. The identifying User-Agent is derived in the service layer from `pac
 3. **OpenFoodFacts service** — `src/services/openfoodfacts/openfoodfacts-service.ts` with `getProduct()` and `searchProducts()`. Validate against real API.
 4. **`off_get_product`** — primary tool, single-product lookup with field normalization.
 5. **`off_search_products`** — search with composed tag filters.
-6. **`off_compare_products`** — parallel fetch + normalization + optional DataCanvas spill.
+6. **`off_compare_products`** — parallel fetch + normalization + per-barcode failure reporting.
 7. **`off_browse_taxonomy`** — thin wrapper over taxonomy service.
 8. **`createApp()` wiring** — register all tools, set `instructions`.
 
@@ -426,6 +484,14 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 **Taxonomy is embedded, not live.** The OFF taxonomy API (`/labels.json`, `/categories.json`) returns 503 for anonymous bot clients at current traffic levels. Embedding a curated vocabulary is the only reliable path. The tradeoff is that very new tags won't appear, but the 200 most-used category tags, all 14 major allergens, and the full label/certification vocabulary are stable.
 
 **`off_compare_products` keeps partial results in output, not errors.** When 3 of 5 barcodes resolve and 2 are not found, the caller gets a comparison table for the 3 found products plus a `not_found` list. Throwing when any product is missing would break "compare this grocery basket" workflows where some products are regional or recent.
+
+**A barcode whose fetch failed goes in `failed`, never in `not_found`.** The two are opposite claims: `not_found` asserts Open Food Facts answered and holds no record, while a failed fetch means the barcode was never checked. Classification is by how the promise settled, never by error text — the service resolves `null` only for a genuine not-found, so any rejection is a failure. Failures stay per-barcode instead of aborting the call, so a mixed batch keeps the rows that resolved; the framework reads a non-empty `failed` array as partial success and records it on the tool span.
+
+**Failures leave the service already carrying their contract `reason` and recovery hint.** Handlers stay pure — the service passes `{ reason, ...ctx.recoveryFor(reason) }` on every throw, so `data.reason` and `data.recovery.hint` reach both client surfaces with no handler-side try/catch. Reasons resolve from the error's `JsonRpcErrorCode`, never from message text.
+
+**Every upstream 4xx is `upstream_rejected` and non-retryable.** A request the upstream refuses will be refused again, so retrying only aims more traffic at a backend already saying no. `data.status` disambiguates which 4xx it was, and the upstream's own `detail` is surfaced in the message.
+
+**The text backend's 10,000-result window is enforced before the request.** `search.openfoodfacts.org` rejects `page * page_size > 10000` with an HTTP 400. Checking it in the handler turns a four-attempt backoff ending in a retryable-looking outage into a validation failure naming the highest reachable page. Scoped to the text path — `/api/v2/search` publishes no equivalent ceiling and its deep pages fail unpredictably rather than at a fixed bound, so truncation guidance there warns instead of promising a reachable page count.
 
 **`off_browse_taxonomy` is a separate tool, not bundled into `off_search_products`.** Tag vocabulary lookup is an independent need — it's used to build search filters, not as part of executing a search. Keeping it separate maintains clean tool boundaries and allows tag exploration without triggering a search call.
 
