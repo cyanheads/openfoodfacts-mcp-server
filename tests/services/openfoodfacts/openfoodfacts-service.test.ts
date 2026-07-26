@@ -1,11 +1,13 @@
 /**
  * @fileoverview Regression tests for OpenFoodFactsService — covers HTTP 404 not-found handling
- * (Bug #3), text search routing (Bug #2), score-filter query-param mapping (GH issue #3), and
- * User-Agent header verification.
+ * (Bug #3), text search routing (Bug #2), score-filter query-param mapping (GH issue #3), the
+ * declared error contract carried by every failure (GH issue #12), retry classification and
+ * upstream-detail surfacing (GH issue #19), and User-Agent header verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
 import { readFileSync } from 'node:fs';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,6 +19,8 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
+import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
+import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
 import { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 /** Build a minimal service instance with default test config. */
@@ -35,9 +39,22 @@ function mockResponse(body: unknown, status = 200): Response {
     status,
     headers: new Headers({ 'content-type': 'application/json' }),
     json: async () => body,
-    text: async () => JSON.stringify(body),
+    text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
   } as unknown as Response;
 }
+
+/** The fields these tests assert on a thrown `McpError`, without casting through `any`. */
+type McpErrorish = {
+  code: number;
+  message: string;
+  data?: {
+    reason?: string;
+    status?: number;
+    retryable?: boolean;
+    retryAfter?: number;
+    recovery?: { hint?: string };
+  };
+};
 
 describe('OpenFoodFactsService', () => {
   let svc: OpenFoodFactsService;
@@ -100,14 +117,6 @@ describe('OpenFoodFactsService', () => {
 
       expect(result).not.toBeNull();
       expect(result?.product_name).toBe('Nutella');
-    });
-
-    it('throws serviceUnavailable for HTTP 500 (retryable upstream error)', async () => {
-      // 5xx is a transient server error — should throw, not return null.
-      const ctx = createMockContext();
-      global.fetch = vi.fn().mockResolvedValue(mockResponse('Internal Server Error', 500));
-
-      await expect(svc.getProduct('3017620422003', ctx)).rejects.toThrow();
     });
   });
 
@@ -434,6 +443,202 @@ describe('OpenFoodFactsService', () => {
       expect(url).toContain('nutrition_grades_tags=a');
       expect(url).not.toContain('nutrition_grades_tags=en');
       expect(url).toContain('nova_groups_tags=1');
+    });
+  });
+
+  // ── declared error contract on every failure (GH issue #12) ──────────────
+  //
+  // These drive the real classification path: global fetch is stubbed, so the framework's
+  // fetchWithTimeout does the status → code mapping the service then maps onto a contract reason.
+
+  describe('error contract', () => {
+    it('carries reason and recovery for an unreachable upstream', async () => {
+      // The reported repro (OFF_BASE_URL pointed at a dead port) surfaced a bare -32603 with no
+      // reason and no recovery hint on either client surface.
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockRejectedValue(new TypeError('Unable to connect.'));
+
+      const error = await svc
+        .getProduct('3017620422003', ctx)
+        .catch((e: unknown) => e as McpErrorish);
+
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.data?.recovery?.hint).toBe(
+        offGetProductTool.errors?.find((e) => e.reason === 'upstream_error')?.recovery,
+      );
+    });
+
+    it('classifies an upstream 5xx as a retryable upstream_error', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Internal Server Error', 503));
+
+      const error = await svc
+        .getProduct('3017620422003', ctx)
+        .catch((e: unknown) => e as McpErrorish);
+
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.data?.status).toBe(503);
+      // Retryability is stated on every reason, not left absent for the client to infer from
+      // the code — the non-retryable case asserts the same field in the 4xx suite below.
+      expect(error.data?.retryable).toBe(true);
+      // Transient — the framework retried the full budget before giving up.
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+    });
+
+    /**
+     * A 200 response whose body is not served as JSON — the high-load shape OFF sometimes returns.
+     * The body is single-consumption, like a real `Response`, so reading it twice fails here the
+     * same way it would in production.
+     */
+    function nonJsonResponse(body: string): Response {
+      let consumed = false;
+      const read = (): string => {
+        if (consumed) throw new TypeError('Body already read');
+        consumed = true;
+        return body;
+      };
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+        json: async () => JSON.parse(read()),
+        text: async () => read(),
+      } as unknown as Response;
+    }
+
+    it('classifies an HTML page served with a 200 as upstream_error', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      // A fresh Response per attempt — a real fetch never hands the same body to two retries.
+      global.fetch = vi.fn(async () =>
+        nonJsonResponse('<!doctype html><html><body>busy</body></html>'),
+      );
+
+      const error = await svc
+        .getProduct('3017620422003', ctx)
+        .catch((e: unknown) => e as McpErrorish);
+
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data?.reason).toBe('upstream_error');
+    });
+
+    it('still parses a 200 whose JSON was served under a non-JSON content type', async () => {
+      // The body is read exactly once — sniffing it as text and then calling response.json()
+      // would fail on the consumed stream.
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn(async () =>
+        nonJsonResponse(JSON.stringify({ status: 1, product: { product_name: 'Nutella' } })),
+      );
+
+      const result = await svc.getProduct('3017620422003', ctx);
+
+      expect(result?.product_name).toBe('Nutella');
+    });
+
+    it('classifies a blown request deadline as upstream_timeout, not upstream_error', async () => {
+      // Reject with the abort signal's own reason — the TimeoutError DOMException the framework
+      // raises — rather than a hand-built AbortError the real abort path never produces. Timeouts
+      // resolve to a distinct wire code, so folding them into upstream_error would lose it.
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn(
+        (_url: unknown, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      );
+
+      vi.useFakeTimers();
+      try {
+        const pending = svc
+          .getProduct('3017620422003', ctx)
+          .catch((e: unknown) => e as McpErrorish);
+        await vi.runAllTimersAsync();
+        const error = await pending;
+
+        expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error.data?.reason).toBe('upstream_timeout');
+        expect(error.data?.recovery?.hint).toBe(
+          offGetProductTool.errors?.find((e) => e.reason === 'upstream_timeout')?.recovery,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('refuses locally with rate_limited without contacting Open Food Facts', async () => {
+      // The refusal is this server's own; the message must not attribute it to Open Food Facts.
+      const limited = new OpenFoodFactsService({
+        baseUrl: 'https://world.openfoodfacts.org',
+        rateLimitProduct: 1,
+        rateLimitSearch: 1,
+      });
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Nutella' } }));
+
+      await limited.getProduct('3017620422003', ctx);
+      const error = await limited
+        .getProduct('7622210100146', ctx)
+        .catch((e: unknown) => e as McpErrorish);
+
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data?.reason).toBe('rate_limited');
+      expect(error.data?.retryAfter).toBeGreaterThan(0);
+      expect(error.message).toContain('openfoodfacts-mcp-server declined');
+      expect(error.message).not.toMatch(/Open Food Facts rate limit/);
+      // Only the first call reached the network.
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+  });
+
+  // ── retry classification and upstream detail (GH issue #19) ──────────────
+
+  describe('4xx handling', () => {
+    /** The body search-a-licious returns when page * page_size exceeds its result window. */
+    const windowRejection = {
+      detail:
+        '1 validation error for SearchParameters\n  Value error, Maximum number of returned results is 10 000 (here: page * page_size = 10002)',
+    };
+
+    it('does not retry a text-search 400 and surfaces the upstream explanation', async () => {
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(windowRejection, 400));
+
+      const startedAt = Date.now();
+      const error = await svc
+        .searchProducts({ query: 'chocolate', page: 5001, page_size: 2 }, ctx)
+        .catch((e: unknown) => e as McpErrorish);
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      // No backoff sequence — the first retry alone would cost about a second.
+      expect(elapsedMs).toBeLessThan(500);
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.data?.retryable).toBe(false);
+      expect(error.message).toContain('Maximum number of returned results is 10 000');
+    });
+
+    it('does not retry a tag-search 4xx, and summarizes the rendered error page', async () => {
+      // Deep tag pages are refused with a 401 whose body is the site's rendered error page. Its
+      // markup carries no signal, and — as observed live — it opens with a template comment rather
+      // than the doctype, so detection must not anchor at the start of the body.
+      const errorPage =
+        '<!-- start templates/web/common/site_layout.tt.html -->\n\n<!doctype html>\n<html lang="en"><head><title>Error</title></head></html>';
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(errorPage, 401));
+
+      const error = await svc
+        .searchProducts({ categories_tag: 'en:pizzas', page: 50, page_size: 5 }, ctx)
+        .catch((e: unknown) => e as McpErrorish);
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.data?.status).toBe(401);
+      expect(error.message).toContain('rendered error page');
+      expect(error.message).not.toContain('<!doctype');
     });
   });
 

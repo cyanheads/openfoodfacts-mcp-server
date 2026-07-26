@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import type { RawProduct } from '@/services/openfoodfacts/types.js';
 
@@ -34,6 +34,32 @@ type CompareRow = {
 function n(raw: Record<string, number | string | undefined>, key: string): number | undefined {
   const v = raw[key];
   return typeof v === 'number' ? v : undefined;
+}
+
+type FailedFetch = {
+  barcode: string;
+  reason: string;
+  error: string;
+};
+
+/**
+ * Describe a rejected fetch for the `failed` array. The service raises declared contract failures,
+ * so the reason and the recovery hint are read off the error rather than re-derived from its text.
+ * The upstream's own explanation is appended raw and rarely ends in punctuation, so the hint is
+ * joined as its own sentence instead of running on from the message.
+ */
+function describeFailure(barcode: string, error: unknown): FailedFetch {
+  if (error instanceof McpError) {
+    const reason = typeof error.data?.reason === 'string' ? error.data.reason : 'upstream_error';
+    const hint = (error.data?.recovery as { hint?: string } | undefined)?.hint;
+    const message = /[.!?]$/.test(error.message) ? error.message : `${error.message}.`;
+    return { barcode, reason, error: hint ? `${message} ${hint}` : message };
+  }
+  return {
+    barcode,
+    reason: 'upstream_error',
+    error: error instanceof Error ? error.message : String(error),
+  };
 }
 
 /** Build a comparison row from a raw product. */
@@ -73,7 +99,7 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
 export const offCompareProductsTool = tool('off_compare_products', {
   title: 'Compare Food Products Side-by-Side',
   description:
-    'Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -153,12 +179,32 @@ export const offCompareProductsTool = tool('off_compare_products', {
           })
           .describe('A single product comparison row.'),
       )
-      .describe('Comparison rows, one per barcode in input order.'),
+      .describe(
+        'Comparison rows in input order — one per barcode whose fetch completed, whether or not a record exists. Barcodes whose fetch failed have no row here; they appear in failed.',
+      ),
     succeeded: z.number().describe('Number of barcodes that resolved to a found product.'),
     not_found: z
       .array(z.string().describe('EAN-13 or UPC barcode with no contributor record.'))
       .describe(
-        'Barcodes with no contributor record. Not an error — the product may exist but not yet entered in Open Food Facts.',
+        'Barcodes Open Food Facts answered for, confirming no contributor record exists. Not an error — the product may exist but not yet be entered. Never used for a fetch that failed.',
+      ),
+    failed: z
+      .array(
+        z
+          .object({
+            barcode: z.string().describe('EAN-13 or UPC barcode whose fetch failed.'),
+            reason: z
+              .string()
+              .describe(
+                'Declared failure reason — one of upstream_error, upstream_timeout, upstream_rejected, rate_limited.',
+              ),
+            error: z.string().describe('What went wrong for this barcode and what to do about it.'),
+          })
+          .describe('A single barcode whose fetch failed.'),
+      )
+      .optional()
+      .describe(
+        'Barcodes whose fetch failed, with the per-barcode reason. Absent when every fetch completed. A barcode listed here is unknown, not absent from Open Food Facts — retry it with off_get_product before concluding anything about the product.',
       ),
   }),
 
@@ -166,10 +212,34 @@ export const offCompareProductsTool = tool('off_compare_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts API returns 5xx or is unreachable for one or more barcodes',
+      when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable — surfaced per barcode in failed[]',
       retryable: true,
       recovery:
-        'Retry after a brief pause. Partial failures surface individual barcodes in not_found — verify those barcodes with off_get_product.',
+        'Retry the barcodes listed in failed after a brief pause. Rows that already resolved are kept, so only the failures need repeating.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'Open Food Facts did not answer within the request deadline — surfaced per barcode in failed[]',
+      retryable: true,
+      recovery:
+        'Retry the barcodes listed in failed, or fetch them one at a time with off_get_product to reduce the load per request.',
+    },
+    {
+      reason: 'upstream_rejected',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Open Food Facts answers 4xx for a barcode — surfaced per barcode in failed[]',
+      retryable: false,
+      recovery:
+        'Do not retry unchanged. Check the digits of the barcodes listed in failed, then look them up individually with off_get_product.',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "This server's own per-minute request budget is spent, or Open Food Facts answers 429 — surfaced per barcode in failed[]",
+      retryable: true,
+      recovery:
+        'Wait the seconds given in the failed entry, then retry only those barcodes. Compare fewer barcodes per call to stay inside the budget.',
     },
   ],
 
@@ -183,27 +253,19 @@ export const offCompareProductsTool = tool('off_compare_products', {
 
     const products: CompareRow[] = [];
     const not_found: string[] = [];
+    const failed: FailedFetch[] = [];
     let succeeded = 0;
 
+    // Classify by how the fetch settled, never by error text. The service resolves null only for a
+    // barcode Open Food Facts confirmed it has no record of, so a rejection is always a failure to
+    // learn anything about that barcode — reporting it as not_found would assert the opposite.
+    // Failures stay per-barcode so a mixed batch keeps the rows that did resolve.
     for (let i = 0; i < input.barcodes.length; i++) {
       const barcode = input.barcodes[i] as string;
-      const result = settlements[i];
+      const result = settlements[i] as PromiseSettledResult<RawProduct | null>;
 
-      if (result === undefined || result.status === 'rejected') {
-        // If it was an explicit service error (not just not-found), propagate it
-        if (result?.status === 'rejected') {
-          const err = result.reason as Error;
-          // If it looks like an upstream error, throw it
-          if (err.message?.includes('Open Food Facts')) {
-            throw serviceUnavailable(
-              `Failed to fetch barcode ${barcode}: ${err.message}`,
-              { barcode },
-              { cause: err },
-            );
-          }
-        }
-        products.push({ barcode, found: false });
-        not_found.push(barcode);
+      if (result.status === 'rejected') {
+        failed.push(describeFailure(barcode, result.reason));
         continue;
       }
 
@@ -221,20 +283,28 @@ export const offCompareProductsTool = tool('off_compare_products', {
       total: input.barcodes.length,
       succeeded,
       not_found: not_found.length,
+      failed: failed.length,
     });
 
-    return { products, succeeded, not_found };
+    return { products, succeeded, not_found, ...(failed.length > 0 && { failed }) };
   },
 
   format: (result) => {
-    const lines: string[] = [
-      `## Product Comparison (${result.succeeded}/${result.products.length} found)\n`,
-    ];
+    const attempted = result.products.length + (result.failed?.length ?? 0);
+    const lines: string[] = [`## Product Comparison (${result.succeeded}/${attempted} found)\n`];
 
     if (result.not_found.length > 0) {
       lines.push(
         `**Not found:** ${result.not_found.join(', ')} (not yet entered in Open Food Facts)\n`,
       );
+    }
+
+    if (result.failed && result.failed.length > 0) {
+      lines.push('**Fetch failed** — these barcodes were not checked, not confirmed missing:');
+      for (const f of result.failed) {
+        lines.push(`- ${f.barcode} (${f.reason}): ${f.error}`);
+      }
+      lines.push('');
     }
 
     const found = result.products.filter((p) => p.found);

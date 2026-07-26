@@ -4,6 +4,7 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
+import { rateLimited, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -226,24 +227,83 @@ describe('off_compare_products', () => {
     expect(notFoundRow?.fat_100g).toBeUndefined();
   });
 
-  // ── upstream_error propagation ────────────────────────────────────────────
+  // ── rejected fetches are failures, never not_found (GH issue #11) ─────────
 
-  it('throws upstream error (serviceUnavailable) when a product fetch fails with an OFF error', async () => {
-    // Design: "Upstream 5xx → serviceUnavailable() factory." When a rejected settlement contains
-    // an Open Food Facts error, the handler should propagate it.
+  it('reports a rejected fetch in failed and keeps the rows that resolved', async () => {
+    // Only a resolved null means "no contributor record". A rejection means the barcode was never
+    // checked, so it must not enter not_found — and the barcode that did resolve must survive.
     mockGetProductFields
       .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
-      .mockRejectedValueOnce(new Error('Open Food Facts API error: HTTP 503'));
+      .mockRejectedValueOnce(
+        serviceUnavailable('Open Food Facts is unavailable (HTTP 503).', {
+          reason: 'upstream_error',
+          recovery: { hint: 'Retry the barcodes listed in failed after a brief pause.' },
+        }),
+      );
 
-    await expect(
-      offCompareProductsTool.handler({ barcodes: ['1111111111111', '2222222222222'] }, ctx),
-    ).rejects.toThrow('Open Food Facts');
+    const result = await offCompareProductsTool.handler(
+      { barcodes: ['1111111111111', '2222222222222'] },
+      ctx,
+    );
+
+    expect(result.succeeded).toBe(1);
+    expect(result.products[0]?.product_name).toBe('Good Product');
+    expect(result.not_found).toHaveLength(0);
+    expect(result.failed).toEqual([
+      {
+        barcode: '2222222222222',
+        reason: 'upstream_error',
+        error:
+          'Open Food Facts is unavailable (HTTP 503). Retry the barcodes listed in failed after a brief pause.',
+      },
+    ]);
   });
 
-  it('treats a non-OFF rejection as a not_found row rather than throwing', async () => {
-    // Design: rejected settlements that aren't explicit OFF errors get folded into not_found.
-    // The current handler checks err.message?.includes('Open Food Facts') — other errors are
-    // treated as not-found silently.
+  it('separates the recovery hint from a message that does not end in punctuation', async () => {
+    // The upstream's own explanation is appended raw and rarely ends in a period; without a
+    // separator the hint runs on from it as a single sentence.
+    mockGetProductFields
+      .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
+      .mockRejectedValueOnce(
+        serviceUnavailable('Open Food Facts refused the request (HTTP 400): page too deep', {
+          reason: 'upstream_rejected',
+          recovery: { hint: 'Do not retry unchanged.' },
+        }),
+      );
+
+    const result = await offCompareProductsTool.handler(
+      { barcodes: ['1111111111111', '2222222222222'] },
+      ctx,
+    );
+
+    expect(result.failed?.[0]?.error).toBe(
+      'Open Food Facts refused the request (HTTP 400): page too deep. Do not retry unchanged.',
+    );
+  });
+
+  it('keeps a rate-limited barcode out of not_found and out of the comparison rows', async () => {
+    // The local limiter refuses the second barcode outright. The already-fetched row is kept.
+    mockGetProductFields
+      .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
+      .mockRejectedValueOnce(
+        rateLimited('openfoodfacts-mcp-server declined this product request.', {
+          reason: 'rate_limited',
+          retryAfter: 47,
+        }),
+      );
+
+    const result = await offCompareProductsTool.handler(
+      { barcodes: ['1111111111111', '2222222222222'] },
+      ctx,
+    );
+
+    expect(result.succeeded).toBe(1);
+    expect(result.not_found).toHaveLength(0);
+    expect(result.failed?.[0]?.reason).toBe('rate_limited');
+    expect(result.products.map((p) => p.barcode)).toEqual(['1111111111111']);
+  });
+
+  it('describes a plain rejection without a contract reason as an upstream failure', async () => {
     mockGetProductFields
       .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
       .mockRejectedValueOnce(new Error('Network timeout'));
@@ -254,7 +314,45 @@ describe('off_compare_products', () => {
     );
 
     expect(result.succeeded).toBe(1);
-    expect(result.not_found).toContain('2222222222222');
+    expect(result.not_found).toHaveLength(0);
+    expect(result.failed).toEqual([
+      { barcode: '2222222222222', reason: 'upstream_error', error: 'Network timeout' },
+    ]);
+  });
+
+  it('omits failed entirely when every fetch completes', async () => {
+    mockGetProductFields
+      .mockResolvedValueOnce({ product_name: 'Found', nutriments: {} })
+      .mockResolvedValueOnce(null);
+
+    const result = await offCompareProductsTool.handler(
+      { barcodes: ['1111111111111', '2222222222222'] },
+      ctx,
+    );
+
+    expect(result.failed).toBeUndefined();
+    expect(result.not_found).toEqual(['2222222222222']);
+  });
+
+  it('renders failed barcodes distinctly from not_found', () => {
+    const blocks = offCompareProductsTool.format!({
+      products: [
+        { barcode: '1111111111111', product_name: 'Found', found: true },
+        { barcode: '2222222222222', found: false },
+      ],
+      succeeded: 1,
+      not_found: ['2222222222222'],
+      failed: [
+        { barcode: '3333333333333', reason: 'upstream_error', error: 'Open Food Facts is down.' },
+      ],
+    });
+    const text = blocks[0].text as string;
+
+    expect(text).toContain('not yet entered in Open Food Facts');
+    expect(text).toContain('not checked, not confirmed missing');
+    expect(text).toContain('3333333333333 (upstream_error)');
+    // The header counts every barcode attempted, including the ones that failed.
+    expect(text).toContain('(1/3 found)');
   });
 
   // ── sparsity: missing nutrition fields ≠ zero ────────────────────────────

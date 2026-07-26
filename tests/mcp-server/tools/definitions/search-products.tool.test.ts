@@ -7,12 +7,18 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
+// Partial mock: only the service accessor is stubbed. TEXT_SEARCH_RESULT_WINDOW comes through from
+// the real module so the handler's page bound and these assertions can never drift apart.
+vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/openfoodfacts/openfoodfacts-service.js')>()),
   getOpenFoodFactsService: vi.fn(),
 }));
 
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
-import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  getOpenFoodFactsService,
+  TEXT_SEARCH_RESULT_WINDOW,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 const mockSearchProducts = vi.fn();
 
@@ -202,6 +208,142 @@ describe('off_search_products', () => {
     await expect(
       offSearchProductsTool.handler({ query: 'test', page: 1, page_size: 20 }, ctx),
     ).rejects.toThrow('HTTP 503');
+  });
+
+  // ── text-search result window (GH issue #19) ──────────────────────────────
+
+  it('rejects a text search past the result window before sending a request', async () => {
+    // The text backend answers page * page_size > 10,000 with an HTTP 400 that no retry can clear.
+    // Pre-flight rejection replaces four retries and a ServiceUnavailable with an actionable limit.
+    await expect(
+      offSearchProductsTool.handler({ query: 'chocolate', page: 5001, page_size: 2 }, ctx),
+    ).rejects.toMatchObject({
+      data: {
+        reason: 'page_out_of_range',
+        max_page: TEXT_SEARCH_RESULT_WINDOW / 2,
+        result_window: TEXT_SEARCH_RESULT_WINDOW,
+      },
+    });
+
+    expect(mockSearchProducts).not.toHaveBeenCalled();
+  });
+
+  it('carries a recovery hint naming the highest page this page_size can reach', async () => {
+    const error = await offSearchProductsTool
+      .handler({ query: 'chocolate', page: 900, page_size: 50 }, ctx)
+      .catch((e: unknown) => e as { data?: { recovery?: { hint?: string } } });
+
+    expect(error.data?.recovery?.hint).toContain('page 200');
+  });
+
+  it('serves the last page inside the window', async () => {
+    // page * page_size === 10,000 exactly is the boundary the backend still answers.
+    mockSearchProducts.mockResolvedValue({
+      count: 20_000,
+      page: 5000,
+      page_count: 2,
+      page_size: 2,
+      products: [{ code: '1234567890001' }],
+    });
+
+    const result = await offSearchProductsTool.handler(
+      { query: 'chocolate', page: 5000, page_size: 2 },
+      ctx,
+    );
+
+    expect(result.page).toBe(5000);
+    expect(mockSearchProducts).toHaveBeenCalledOnce();
+  });
+
+  it('does not apply the text window to a tag-only search', async () => {
+    // The 10,000-result cap belongs to search.openfoodfacts.org; /api/v2/search publishes none.
+    mockSearchProducts.mockResolvedValue({
+      count: 50_000,
+      page: 5001,
+      page_count: 2,
+      page_size: 2,
+      products: [{ code: '1234567890001' }],
+    });
+
+    await offSearchProductsTool.handler(
+      { categories_tag: 'en:pizzas', page: 5001, page_size: 2 },
+      ctx,
+    );
+
+    expect(mockSearchProducts).toHaveBeenCalledOnce();
+  });
+
+  it('caps text-search truncation guidance at the pages the backend will serve', async () => {
+    // The match total implies 6,633 pages; only the first 500 are reachable at page_size 20.
+    mockSearchProducts.mockResolvedValue({
+      count: 132_650,
+      page: 1,
+      page_count: 20,
+      page_size: 20,
+      products: [{ code: '1234567890001' }],
+    });
+
+    await offSearchProductsTool.handler({ query: 'chocolate', page: 1, page_size: 20 }, ctx);
+
+    const guidance = String(getEnrichment(ctx).notice ?? '');
+    expect(guidance).toContain('500 reachable pages');
+    expect(guidance).not.toMatch(/of 6633\b/);
+  });
+
+  it('warns that deep tag-search pages may be refused rather than promising them', async () => {
+    mockSearchProducts.mockResolvedValue({
+      count: 13_265,
+      page: 1,
+      page_count: 5,
+      page_size: 5,
+      products: [{ code: '1234567890001' }],
+    });
+
+    await offSearchProductsTool.handler(
+      { categories_tag: 'en:pizzas', page: 1, page_size: 5 },
+      ctx,
+    );
+
+    const guidance = String(getEnrichment(ctx).notice ?? '');
+    expect(guidance).toContain('refuses deep pages');
+  });
+
+  it('does not point at the page parameter from the last page text search will serve', async () => {
+    // page 5000 at page_size 2 is the deepest request inside the window; page 5001 is rejected by
+    // the pre-flight check. Guidance that still said "fetch subsequent pages" here would send the
+    // caller straight into that rejection.
+    mockSearchProducts.mockResolvedValue({
+      count: TEXT_SEARCH_RESULT_WINDOW,
+      page: 5000,
+      page_count: 2,
+      page_size: 2,
+      products: [{ code: '1234567890001' }],
+    });
+
+    await offSearchProductsTool.handler({ query: 'chocolate', page: 5000, page_size: 2 }, ctx);
+
+    const guidance = String(getEnrichment(ctx).notice ?? '');
+    expect(guidance).toContain('as deep as text search paginates');
+    expect(guidance).not.toContain('fetch subsequent pages');
+  });
+
+  it('says no further pages exist on the last page of a tag search', async () => {
+    mockSearchProducts.mockResolvedValue({
+      count: 25,
+      page: 5,
+      page_count: 5,
+      page_size: 5,
+      products: [{ code: '1234567890001' }],
+    });
+
+    await offSearchProductsTool.handler(
+      { categories_tag: 'en:pizzas', page: 5, page_size: 5 },
+      ctx,
+    );
+
+    const guidance = String(getEnrichment(ctx).notice ?? '');
+    expect(guidance).toContain('No further pages of matches exist.');
+    expect(guidance).not.toContain('fetch subsequent pages');
   });
 
   // ── sparse upstream products in search results ─────────────────────────────

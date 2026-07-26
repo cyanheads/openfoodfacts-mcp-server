@@ -268,10 +268,34 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts API returns 5xx or is unreachable',
+      when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
       retryable: true,
       recovery:
-        'Retry after a brief pause. If persistent, the Open Food Facts service may be experiencing high load.',
+        'Retry after a brief pause. If it keeps failing, Open Food Facts is degraded — check the barcode again later.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'Open Food Facts did not answer within the request deadline',
+      retryable: true,
+      recovery:
+        'Retry once. If it times out again, pass a narrower fields subset so Open Food Facts assembles less per request.',
+    },
+    {
+      reason: 'upstream_rejected',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Open Food Facts answers 4xx for something other than a missing barcode',
+      retryable: false,
+      recovery:
+        'Do not retry — the request will be refused again. Read data.status and the upstream explanation in the message, then correct the request.',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "This server's own per-minute request budget is spent, or Open Food Facts answers 429",
+      retryable: true,
+      recovery:
+        'Wait the seconds given in data.retryAfter, then retry. Spread lookups out rather than issuing them in a burst.',
     },
   ],
 

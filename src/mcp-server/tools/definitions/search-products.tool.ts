@@ -5,7 +5,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  getOpenFoodFactsService,
+  TEXT_SEARCH_RESULT_WINDOW,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
 import type { SearchParams } from '@/services/openfoodfacts/types.js';
 
 export const offSearchProductsTool = tool('off_search_products', {
@@ -68,7 +71,9 @@ export const offSearchProductsTool = tool('off_search_products', {
       .int()
       .min(1)
       .default(1)
-      .describe('Page number (1-based). Use with page_size to paginate results.'),
+      .describe(
+        'Page number (1-based). Use with page_size to paginate results. Searches that include a text query serve only the first 10,000 results, so page * page_size must stay at or below 10,000 — a deeper request is rejected rather than sent. Tag-only searches have no published window, but Open Food Facts refuses deep pages unpredictably; narrowing the filters is more reliable than paging far in.',
+      ),
     page_size: z
       .number()
       .int()
@@ -133,7 +138,9 @@ export const offSearchProductsTool = tool('off_search_products', {
     notice: z
       .string()
       .optional()
-      .describe('Guidance when results are empty — echoes filters and suggests how to broaden.'),
+      .describe(
+        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, or names the current page and how far the backend will actually paginate when more results exist.',
+      ),
     truncated: z.boolean().optional().describe('True when more results exist beyond this page.'),
     shown: z.number().optional().describe('Number of products returned on this page.'),
     cap: z.number().optional().describe('The page_size that was applied.'),
@@ -148,29 +155,82 @@ export const offSearchProductsTool = tool('off_search_products', {
         'Provide at least one of: query, categories_tag, brands_tag, labels_tag, nutrition_grade, nova_group, or countries_tag.',
     },
     {
+      reason: 'page_out_of_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: `A text search asks for page * page_size beyond the ${TEXT_SEARCH_RESULT_WINDOW}-result window the text backend serves`,
+      retryable: false,
+      recovery:
+        'Request an earlier page, or add filters so the products you need fall inside the first results rather than deep in the ranking.',
+    },
+    {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts API returns 5xx or is unreachable',
+      when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
       retryable: true,
       recovery:
-        'Retry after a brief pause. The Open Food Facts service may be rate-limiting or experiencing high load.',
+        'Retry after a brief pause. The Open Food Facts service may be shedding load — narrow the filters if deep pages keep failing.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'Open Food Facts did not answer within the request deadline',
+      retryable: true,
+      recovery:
+        'Retry once with a smaller page_size. Broad unfiltered searches are the slowest for Open Food Facts to assemble.',
+    },
+    {
+      reason: 'upstream_rejected',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Open Food Facts answers 4xx — the request as formed will be refused again',
+      retryable: false,
+      recovery:
+        'Do not retry. Read data.status and the upstream explanation in the message; reduce the page depth or correct the filter values.',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "This server's own per-minute search budget is spent, or Open Food Facts answers 429",
+      retryable: true,
+      recovery:
+        'Wait the seconds given in data.retryAfter, then retry. Searches carry a much smaller budget than product lookups.',
     },
   ],
 
   async handler(input, ctx) {
+    const isTextSearch = Boolean(input.query?.trim());
     const hasFilter =
-      (input.query && input.query.trim().length > 0) ||
-      (input.categories_tag && input.categories_tag.trim().length > 0) ||
-      (input.brands_tag && input.brands_tag.trim().length > 0) ||
-      (input.labels_tag && input.labels_tag.trim().length > 0) ||
-      input.nutrition_grade ||
-      input.nova_group ||
-      (input.countries_tag && input.countries_tag.trim().length > 0);
+      isTextSearch ||
+      Boolean(input.categories_tag?.trim()) ||
+      Boolean(input.brands_tag?.trim()) ||
+      Boolean(input.labels_tag?.trim()) ||
+      Boolean(input.nutrition_grade) ||
+      Boolean(input.nova_group) ||
+      Boolean(input.countries_tag?.trim());
 
     if (!hasFilter) {
       throw ctx.fail('no_filters', 'At least one search parameter is required.', {
         ...ctx.recoveryFor('no_filters'),
       });
+    }
+
+    // The text backend refuses page * page_size beyond its result window with an HTTP 400 that no
+    // retry can clear. Reject it here so the caller gets the reachable page bound instead of a
+    // backoff sequence. Scoped to the text path — the tag-only backend publishes no such window.
+    if (isTextSearch && input.page * input.page_size > TEXT_SEARCH_RESULT_WINDOW) {
+      const maxPage = Math.floor(TEXT_SEARCH_RESULT_WINDOW / input.page_size);
+      throw ctx.fail(
+        'page_out_of_range',
+        `Text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, and page ${input.page} at page_size ${input.page_size} asks for result ${input.page * input.page_size}.`,
+        {
+          page: input.page,
+          page_size: input.page_size,
+          max_page: maxPage,
+          result_window: TEXT_SEARCH_RESULT_WINDOW,
+          recovery: {
+            hint: `Request page ${maxPage} or lower at page_size ${input.page_size}, or add filters so the products you need rank inside the first ${TEXT_SEARCH_RESULT_WINDOW} results.`,
+          },
+        },
+      );
     }
 
     const svc = getOpenFoodFactsService();
@@ -211,11 +271,40 @@ export const offSearchProductsTool = tool('off_search_products', {
           'Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
       });
     } else if (response.count > response.page_count) {
-      // Disclose when the page is smaller than the total result set
+      // Disclose when the page is smaller than the total result set. The guidance counts pages the
+      // backend will actually serve, not pages implied by the match total — on the text path that
+      // is capped by the result window, and on the tag path deep pages are refused unpredictably,
+      // so neither is promised as reachable.
+      const totalPages = Math.ceil(response.count / input.page_size);
+      const reachablePages = isTextSearch
+        ? Math.min(totalPages, Math.floor(TEXT_SEARCH_RESULT_WINDOW / input.page_size))
+        : totalPages;
+
+      const position =
+        reachablePages < totalPages
+          ? `Page ${response.page} of ${reachablePages} reachable pages — ${totalPages} pages of matches exist, ` +
+            `but text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results.`
+          : `Page ${response.page} of ${totalPages}.`;
+
+      let nextStep: string;
+      if (response.page >= reachablePages) {
+        // Already at the deepest page this backend serves. Pointing at the page parameter here
+        // would send the caller into the rejection the pre-flight check exists to prevent.
+        nextStep = isTextSearch
+          ? 'That is as deep as text search paginates — add filters so the products you need rank higher instead of paging further.'
+          : 'No further pages of matches exist.';
+      } else if (isTextSearch) {
+        nextStep = 'Use the page parameter to fetch subsequent pages.';
+      } else {
+        nextStep =
+          'Use the page parameter to fetch subsequent pages; Open Food Facts refuses deep pages ' +
+          'unpredictably, so narrow the filters rather than paging far into a large result set.';
+      }
+
       ctx.enrich.truncated({
         shown: response.page_count,
         cap: input.page_size,
-        guidance: `Page ${response.page} of ${Math.ceil(response.count / input.page_size)}. Use page parameter to fetch subsequent pages.`,
+        guidance: `${position} ${nextStep}`,
       });
     }
 

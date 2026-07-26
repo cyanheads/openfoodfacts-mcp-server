@@ -6,9 +6,9 @@
 
 import { readFileSync } from 'node:fs';
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { JsonRpcErrorCode, McpError, rateLimited } from '@cyanheads/mcp-ts-core/errors';
+import type { RequestContext, RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import type {
   RawProduct,
@@ -34,6 +34,175 @@ const { version: PACKAGE_VERSION } = JSON.parse(
 const USER_AGENT = `openfoodfacts-mcp-server/${PACKAGE_VERSION} (casey@caseyjhand.com)`;
 
 const REQUEST_TIMEOUT_MS = 15_000;
+
+/** Headers sent on every upstream request. The identifying User-Agent is required by OFF terms. */
+const REQUEST_HEADERS: Record<string, string> = {
+  'User-Agent': USER_AGENT,
+  Accept: 'application/json',
+};
+
+/**
+ * search.openfoodfacts.org (search-a-licious) refuses any request whose `page * page_size` exceeds
+ * this many results, with an HTTP 400 naming the window. Exported so the search tool can reject
+ * those requests before they are sent. The tag-only backend (`/api/v2/search`) publishes no
+ * equivalent ceiling, so this bound is scoped to the text path.
+ */
+export const TEXT_SEARCH_RESULT_WINDOW = 10_000;
+
+/**
+ * Failure reasons this service raises, mapped to the wire code each tool declares for them in its
+ * `errors: [...]` contract. Errors leave the service already carrying `reason` + `recovery.hint`,
+ * so both client surfaces satisfy the contract without any handler-side try/catch.
+ */
+const REASON_CODES = {
+  upstream_error: JsonRpcErrorCode.ServiceUnavailable,
+  upstream_timeout: JsonRpcErrorCode.Timeout,
+  upstream_rejected: JsonRpcErrorCode.InvalidParams,
+  rate_limited: JsonRpcErrorCode.RateLimited,
+} as const;
+
+type UpstreamReason = keyof typeof REASON_CODES;
+
+/** Message stem per reason. The upstream status and its own explanation are appended when present. */
+const REASON_MESSAGES: Record<UpstreamReason, string> = {
+  upstream_error: 'Open Food Facts is unavailable',
+  upstream_timeout: 'Open Food Facts did not respond within the request deadline',
+  upstream_rejected: 'Open Food Facts refused the request',
+  rate_limited: 'Open Food Facts is rate-limiting this client',
+};
+
+/**
+ * Classifies a framework fetch error onto a declared reason. Deliberately code-driven, never
+ * message-driven: `fetchWithTimeout` maps HTTP status to a `JsonRpcErrorCode` and raises `Timeout`
+ * for a blown deadline, so the code already carries the authoritative classification.
+ *
+ * Every 4xx becomes `upstream_rejected` — the request as formed will be refused again, so it is
+ * flagged non-retryable and the upstream's own `detail` is surfaced instead of being retried away.
+ * `InternalError` here is an upstream 500/501 (the caller-abort case is filtered out before this).
+ */
+function reasonForCode(code: JsonRpcErrorCode): UpstreamReason {
+  if (code === JsonRpcErrorCode.Timeout) return 'upstream_timeout';
+  if (code === JsonRpcErrorCode.RateLimited) return 'rate_limited';
+  if (code === JsonRpcErrorCode.ServiceUnavailable || code === JsonRpcErrorCode.InternalError) {
+    return 'upstream_error';
+  }
+  return 'upstream_rejected';
+}
+
+/**
+ * True when a body is an HTML document rather than JSON. Open Food Facts serves a rendered error
+ * page under load and on refused requests, and those pages open with a template comment, so the
+ * doctype is matched wherever it appears rather than only at the very start of the body.
+ */
+function looksLikeHtml(body: string): boolean {
+  return /<(!doctype\s+html|html[\s>])/i.test(body);
+}
+
+/**
+ * Extracts the upstream's own explanation from a captured error body. search-a-licious answers a
+ * rejected request with `{"detail": "..."}` naming the exact constraint that was violated; anything
+ * else falls back to a short snippet so the caller still learns why the request was refused.
+ * `error.data.body` is head-truncated by the framework, so this reads whatever survived — and a
+ * rendered error page is summarized rather than pasted, since its markup carries no signal.
+ */
+function upstreamDetail(body: unknown): string | undefined {
+  if (typeof body !== 'string' || body.trim() === '') return;
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown };
+    if (typeof parsed.detail === 'string') return parsed.detail;
+  } catch {
+    /* Not JSON (HTML error page, plain text) — fall through to the snippet. */
+  }
+  if (looksLikeHtml(body)) {
+    return 'the upstream served a rendered error page rather than JSON, which usually means it is shedding load or refusing this client';
+  }
+  return body.slice(0, 200);
+}
+
+/**
+ * Parses a 2xx body as JSON, catching the rendered error page Open Food Facts serves with a 200
+ * under load. The body is read exactly once — reading it as text to sniff for markup and then
+ * calling `response.json()` would fail on the already-consumed stream.
+ */
+async function parseJsonBody<T>(
+  response: Response,
+  ctx: Context,
+  data: Record<string, unknown>,
+): Promise<T> {
+  if ((response.headers.get('content-type') ?? '').includes('application/json')) {
+    return (await response.json()) as T;
+  }
+  const body = await response.text();
+  if (looksLikeHtml(body)) {
+    throw contractError(
+      'upstream_error',
+      'Open Food Facts served an HTML page instead of JSON — the service is rate-limiting or temporarily down.',
+      ctx,
+      data,
+    );
+  }
+  return JSON.parse(body) as T;
+}
+
+/**
+ * Log bindings for the framework fetch helper. `RequestContext` is an open context bag and the
+ * handler `Context` is not structurally assignable to it, so the correlation fields are projected
+ * explicitly rather than cast through `unknown`.
+ */
+function fetchLogContext(ctx: Context, operation: string): RequestContext {
+  return {
+    requestId: ctx.requestId,
+    tenantId: ctx.tenantId,
+    timestamp: new Date().toISOString(),
+    operation,
+  };
+}
+
+/**
+ * Builds a failure carrying the reason, retryability, and recovery hint declared by the calling
+ * tool. `retryable` is emitted for every reason, not just the non-retryable one, so a client reading
+ * `data.retryable` gets an answer rather than an absence it has to interpret. Only an upstream
+ * rejection is non-retryable — the request as formed will be refused again.
+ */
+function contractError(
+  reason: UpstreamReason,
+  message: string,
+  ctx: Context,
+  data: Record<string, unknown>,
+  cause?: unknown,
+): McpError {
+  return new McpError(
+    REASON_CODES[reason],
+    message,
+    {
+      ...data,
+      reason,
+      retryable: reason !== 'upstream_rejected',
+      ...ctx.recoveryFor(reason),
+    },
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
+ * Re-raises a framework fetch error as the declared contract failure. Called inside the retry
+ * boundary so the mapped code — not the raw one — drives `withRetry`'s transient classification:
+ * 5xx, timeouts, and 429s stay retryable while a 4xx fails immediately.
+ */
+function toContractError(error: unknown, ctx: Context, data: Record<string, unknown>): unknown {
+  if (!(error instanceof McpError)) return error;
+  // A caller-cancelled request is not an upstream failure — leave it untouched.
+  if (error.data?.errorSource === 'FetchAborted') return error;
+
+  const reason = reasonForCode(error.code);
+  const status = error.data?.status;
+  const detail = upstreamDetail(error.data?.body);
+  const message =
+    `${REASON_MESSAGES[reason]}${typeof status === 'number' ? ` (HTTP ${status})` : ''}` +
+    `${detail ? `: ${detail}` : '.'}`;
+
+  return contractError(reason, message, ctx, { ...error.data, ...data }, error);
+}
 
 /** Fields to request on every product fetch — scopes the ~200-key object to what we handle. */
 const PRODUCT_FIELDS =
@@ -76,8 +245,12 @@ class RateLimiter {
     this.maxRequests = maxRequestsPerMin;
   }
 
-  /** Checks and records a request. Throws `ServiceUnavailable` if the limit is exceeded. */
-  check(endpoint: string): void {
+  /**
+   * Checks and records a request. Throws the declared `rate_limited` failure when this server's own
+   * per-minute budget is spent. The refusal is local — nothing was sent upstream — so the message
+   * names this server rather than Open Food Facts, and carries the wait until a slot frees.
+   */
+  check(endpoint: string, ctx: Context): void {
     const now = Date.now();
     const windowStart = now - this.windowMs;
     // Evict timestamps outside the window
@@ -85,10 +258,22 @@ class RateLimiter {
       this.timestamps.shift();
     }
     if (this.timestamps.length >= this.maxRequests) {
-      throw serviceUnavailable(
-        `Open Food Facts rate limit reached for ${endpoint} (${this.maxRequests} req/min). ` +
-          'Retry after a brief pause.',
-        { endpoint, limit: this.maxRequests },
+      const retryAfter = Math.max(
+        1,
+        Math.ceil(((this.timestamps[0] ?? now) + this.windowMs - now) / 1000),
+      );
+      throw rateLimited(
+        `openfoodfacts-mcp-server declined this ${endpoint} request: its own client-side budget of ` +
+          `${this.maxRequests} ${endpoint} requests/min is spent, so nothing was sent to Open Food ` +
+          `Facts. A slot frees in about ${retryAfter}s.`,
+        {
+          endpoint,
+          limit: this.maxRequests,
+          retryAfter,
+          reason: 'rate_limited',
+          retryable: true,
+          ...ctx.recoveryFor('rate_limited'),
+        },
       );
     }
     this.timestamps.push(now);
@@ -112,23 +297,13 @@ export class OpenFoodFactsService {
    * The caller is responsible for surfacing the not-found condition via ctx.fail.
    */
   async getProduct(barcode: string, ctx: Context): Promise<RawProduct | null> {
-    this.productLimiter.check('product');
+    this.productLimiter.check('product', ctx);
 
     return await withRetry(
-      async () => {
-        const fields = PRODUCT_FIELDS;
-        const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${fields}`;
+      () => {
+        const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${PRODUCT_FIELDS}`;
         ctx.log.debug('Fetching product', { barcode, url });
-
-        const response = await fetch(url, {
-          signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-          headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'application/json',
-          },
-        });
-
-        return this.handleProductResponse(response, barcode, ctx);
+        return this.fetchProduct(url, barcode, ctx);
       },
       {
         operation: `OFF:getProduct:${barcode}`,
@@ -148,22 +323,13 @@ export class OpenFoodFactsService {
     fields: string,
     ctx: Context,
   ): Promise<RawProduct | null> {
-    this.productLimiter.check('product');
+    this.productLimiter.check('product', ctx);
 
     return await withRetry(
-      async () => {
+      () => {
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${fields}`;
         ctx.log.debug('Fetching product fields', { barcode, fields });
-
-        const response = await fetch(url, {
-          signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-          headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'application/json',
-          },
-        });
-
-        return this.handleProductResponse(response, barcode, ctx);
+        return this.fetchProduct(url, barcode, ctx);
       },
       {
         operation: `OFF:getProductFields:${barcode}`,
@@ -174,53 +340,34 @@ export class OpenFoodFactsService {
     );
   }
 
-  /** Handle a product fetch response — normalizes status:0 and HTTP 404 to null, throws on 5xx. */
-  private async handleProductResponse(
-    response: Response,
+  /**
+   * Fetch and normalize a single product. HTTP 404 — which OFF returns for barcodes no contributor
+   * has entered, alongside the HTTP 200 + `status:0` form of the same condition — resolves to
+   * `null`; every other failure is re-raised as a declared contract failure. Returning `null` only
+   * for a genuine not-found is what lets callers distinguish "no record" from "the fetch failed".
+   */
+  private async fetchProduct(
+    url: string,
     barcode: string,
     ctx: Context,
   ): Promise<RawProduct | null> {
-    const contentType = response.headers.get('content-type') ?? '';
-
-    if (!response.ok) {
-      if (response.status >= 500) {
-        // Check for HTML error pages (common during high load)
-        const body = await response.text();
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(body)) {
-          throw serviceUnavailable(
-            'Open Food Facts returned an HTML error page — likely rate-limited or temporarily down.',
-            { barcode, status: response.status },
-          );
-        }
-        throw serviceUnavailable(`Open Food Facts API error: HTTP ${response.status}`, {
-          barcode,
-          status: response.status,
-        });
-      }
-      // HTTP 404: OFF returns this for barcodes not in the database (alongside status:0 in body).
-      // Treat as not-found (null) rather than an upstream error — the JSON body confirms status:0.
-      if (response.status === 404) {
+    let response: Response;
+    try {
+      response = await fetchWithTimeout(
+        url,
+        REQUEST_TIMEOUT_MS,
+        fetchLogContext(ctx, 'OFF:product'),
+        { signal: ctx.signal, headers: REQUEST_HEADERS, expectedStatuses: [404] },
+      );
+    } catch (error) {
+      if (error instanceof McpError && error.code === JsonRpcErrorCode.NotFound) {
         ctx.log.debug('Product not found (HTTP 404)', { barcode });
         return null;
       }
-      throw serviceUnavailable(`Open Food Facts returned HTTP ${response.status}`, {
-        barcode,
-        status: response.status,
-      });
+      throw toContractError(error, ctx, { barcode });
     }
 
-    // Detect HTML error pages masquerading as 200 responses (happens during high OFF load)
-    if (!contentType.includes('application/json')) {
-      const body = await response.text();
-      if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(body)) {
-        throw serviceUnavailable(
-          'Open Food Facts returned an HTML page instead of JSON — likely rate-limited.',
-          { barcode },
-        );
-      }
-    }
-
-    const data = (await response.json()) as RawProductResponse;
+    const data = await parseJsonBody<RawProductResponse>(response, ctx, { barcode });
     ctx.log.debug('Product response received', { barcode, status: data.status });
 
     // status:0 = barcode not found in any contributor record (still HTTP 200)
@@ -229,6 +376,26 @@ export class OpenFoodFactsService {
     }
 
     return data.product ?? null;
+  }
+
+  /**
+   * Fetch a search endpoint, re-raising every failure as a declared contract failure. Runs inside
+   * the caller's retry boundary so the mapped code drives retry classification.
+   */
+  private async fetchSearch(
+    url: string,
+    ctx: Context,
+    operation: string,
+    data: Record<string, unknown>,
+  ): Promise<Response> {
+    try {
+      return await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchLogContext(ctx, operation), {
+        signal: ctx.signal,
+        headers: REQUEST_HEADERS,
+      });
+    } catch (error) {
+      throw toContractError(error, ctx, data);
+    }
   }
 
   /**
@@ -252,7 +419,7 @@ export class OpenFoodFactsService {
     page_size: number;
     products: RawProduct[];
   }> {
-    this.searchLimiter.check('search');
+    this.searchLimiter.check('search', ctx);
 
     return params.query
       ? this.searchProductsByText(params, ctx)
@@ -284,21 +451,14 @@ export class OpenFoodFactsService {
 
         ctx.log.debug('Text-searching products', { query: params.query, url: url.toString() });
 
-        const response = await fetch(url.toString(), {
-          signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-          headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'application/json',
-          },
+        const response = await this.fetchSearch(url.toString(), ctx, 'OFF:searchProductsByText', {
+          page: params.page ?? 1,
+          page_size: params.page_size ?? 20,
         });
 
-        if (!response.ok) {
-          throw serviceUnavailable(`Open Food Facts text search returned HTTP ${response.status}`, {
-            status: response.status,
-          });
-        }
-
-        const data = (await response.json()) as RawTextSearchResponse;
+        const data = await parseJsonBody<RawTextSearchResponse>(response, ctx, {
+          page: params.page ?? 1,
+        });
         const pageSize = params.page_size ?? 20;
 
         ctx.log.debug('Text search response received', {
@@ -361,45 +521,14 @@ export class OpenFoodFactsService {
         const url = this.buildSearchUrl(params);
         ctx.log.debug('Searching products by tags', { params, url });
 
-        const response = await fetch(url, {
-          signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-          headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'application/json',
-          },
+        const response = await this.fetchSearch(url, ctx, 'OFF:searchProductsByTags', {
+          page: params.page ?? 1,
+          page_size: params.page_size ?? 20,
         });
 
-        const contentType = response.headers.get('content-type') ?? '';
-
-        if (!response.ok) {
-          if (response.status >= 500) {
-            const body = await response.text();
-            if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(body)) {
-              throw serviceUnavailable(
-                'Open Food Facts returned an HTML error page — likely rate-limited or temporarily down.',
-                { status: response.status },
-              );
-            }
-            throw serviceUnavailable(`Open Food Facts API error: HTTP ${response.status}`, {
-              status: response.status,
-            });
-          }
-          throw serviceUnavailable(`Open Food Facts search returned HTTP ${response.status}`, {
-            status: response.status,
-          });
-        }
-
-        if (!contentType.includes('application/json')) {
-          const body = await response.text();
-          if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(body)) {
-            throw serviceUnavailable(
-              'Open Food Facts returned HTML instead of JSON — likely rate-limited.',
-              {},
-            );
-          }
-        }
-
-        const data = (await response.json()) as RawSearchResponse;
+        const data = await parseJsonBody<RawSearchResponse>(response, ctx, {
+          page: params.page ?? 1,
+        });
 
         ctx.log.debug('Tag search response received', {
           count: data.count,
