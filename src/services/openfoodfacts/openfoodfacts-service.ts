@@ -17,6 +17,7 @@ import type {
   RawTextSearchHit,
   RawTextSearchResponse,
   SearchParams,
+  SearchResult,
 } from './types.js';
 
 /**
@@ -46,6 +47,11 @@ const REQUEST_HEADERS: Record<string, string> = {
  * this many results, with an HTTP 400 naming the window. Exported so the search tool can reject
  * those requests before they are sent. The tag-only backend (`/api/v2/search`) publishes no
  * equivalent ceiling, so this bound is scoped to the text path.
+ *
+ * This bounds how deep a request may page — it is deliberately not reused to detect a clipped hit
+ * count. That ceiling is a separate limit in the same backend that happens to sit at the same
+ * number today, and the response reports it directly via `is_count_exact`, so reading the flag
+ * survives either limit moving independently.
  */
 export const TEXT_SEARCH_RESULT_WINDOW = 10_000;
 
@@ -409,16 +415,7 @@ export class OpenFoodFactsService {
    *   so it cannot serve a text query.
    * - Tag filters only (no query): /api/v2/search (structured facet filtering).
    */
-  searchProducts(
-    params: SearchParams,
-    ctx: Context,
-  ): Promise<{
-    count: number;
-    page: number;
-    page_count: number;
-    page_size: number;
-    products: RawProduct[];
-  }> {
+  searchProducts(params: SearchParams, ctx: Context): Promise<SearchResult> {
     this.searchLimiter.check('search', ctx);
 
     return params.query
@@ -431,16 +428,7 @@ export class OpenFoodFactsService {
    * combined text + tag filtering: recognized tag facets are ANDed into the Lucene `q` as hard
    * filters while the free-text terms drive relevance scoring.
    */
-  private async searchProductsByText(
-    params: SearchParams,
-    ctx: Context,
-  ): Promise<{
-    count: number;
-    page: number;
-    page_count: number;
-    page_size: number;
-    products: RawProduct[];
-  }> {
+  private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/search`);
@@ -463,6 +451,7 @@ export class OpenFoodFactsService {
 
         ctx.log.debug('Text search response received', {
           count: data.count,
+          count_is_exact: data.is_count_exact,
           page: data.page,
           returned: data.hits?.length ?? 0,
         });
@@ -485,6 +474,11 @@ export class OpenFoodFactsService {
 
         return {
           count: data.count ?? 0,
+          // The backend stops counting hits at a ceiling and reports which side of it this count
+          // fell on. Read the flag rather than comparing the count against a local constant: the
+          // two are different limits, and only the backend knows when it stopped counting. A
+          // response that omits the flag makes no clipping claim, so none is manufactured here.
+          count_is_exact: data.is_count_exact ?? true,
           page: data.page ?? 1,
           // page_count in text search response is TOTAL PAGES; normalize to products-on-page
           page_count: products.length,
@@ -506,16 +500,7 @@ export class OpenFoodFactsService {
    * Combined text + tag requests route through searchProductsByText instead, which folds the tag
    * facets into the Lucene `q`.
    */
-  private async searchProductsByTags(
-    params: SearchParams,
-    ctx: Context,
-  ): Promise<{
-    count: number;
-    page: number;
-    page_count: number;
-    page_size: number;
-    products: RawProduct[];
-  }> {
+  private async searchProductsByTags(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
         const url = this.buildSearchUrl(params);
@@ -538,6 +523,9 @@ export class OpenFoodFactsService {
 
         return {
           count: data.count ?? 0,
+          // This endpoint counts every match — live-verified returning totals more than twenty
+          // times the ceiling the text backend stops counting at — so its count is never a floor.
+          count_is_exact: true,
           page: data.page ?? 1,
           page_count: data.page_count ?? data.products?.length ?? 0,
           page_size: data.page_size ?? params.page_size ?? 20,
@@ -564,12 +552,19 @@ export class OpenFoodFactsService {
    * can't smuggle in its own field:value clauses — an unescaped colon would otherwise let caller
    * text override facets, including ones this tool never exposes as filters (see
    * LUCENE_RESERVED_CHARS).
+   *
+   * `additives_tag` has no clause here on purpose. The search-a-licious index carries no
+   * `additives_tags` field, so a clause naming it is parsed as a phrase match against a field that
+   * does not exist and returns zero hits with no error — live-verified across several E-numbers
+   * that match hundreds of thousands of products on the tag path. The tool rejects that
+   * combination up front rather than sending a filter that silently empties the result set.
    */
   private buildTextSearchQuery(params: SearchParams): string {
     const clauses: string[] = [];
     if (params.categories_tag) clauses.push(`categories_tags:"${params.categories_tag}"`);
     if (params.brands_tag) clauses.push(`brands_tags:"${params.brands_tag}"`);
     if (params.labels_tag) clauses.push(`labels_tags:"${params.labels_tag}"`);
+    if (params.allergens_tag) clauses.push(`allergens_tags:"${params.allergens_tag}"`);
     if (params.nutrition_grade) clauses.push(`nutriscore_grade:${params.nutrition_grade}`);
     if (params.nova_group) clauses.push(`nova_group:${params.nova_group}`);
     if (params.countries_tag) clauses.push(`countries_tags:"${params.countries_tag}"`);
@@ -583,6 +578,8 @@ export class OpenFoodFactsService {
     if (params.categories_tag) url.searchParams.set('categories_tags', params.categories_tag);
     if (params.brands_tag) url.searchParams.set('brands_tags', params.brands_tag);
     if (params.labels_tag) url.searchParams.set('labels_tags', params.labels_tag);
+    if (params.allergens_tag) url.searchParams.set('allergens_tags', params.allergens_tag);
+    if (params.additives_tag) url.searchParams.set('additives_tags', params.additives_tag);
     // Score filters use the *_tags param keys — the bare nutrition_grades / nova_groups keys are
     // silently ignored by /api/v2/search and return unfiltered rows. Values pass through bare:
     // nutrition_grades_tags accepts only the plain grade letter ("a", not "en:a").

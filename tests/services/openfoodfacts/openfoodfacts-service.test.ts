@@ -398,6 +398,181 @@ describe('OpenFoodFactsService', () => {
     });
   });
 
+  // ── allergen and additive filters (GH issue #10) ─────────────────────────
+
+  describe('searchProducts — allergen and additive filters', () => {
+    it('sends allergens_tags and additives_tags on the tag-filter path', async () => {
+      // Both facets filter on /api/v2/search — live-verified returning hundreds of thousands of
+      // matches each, and a smaller intersection when combined.
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 103_458, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+
+      await svc.searchProducts(
+        { allergens_tag: 'en:milk', additives_tag: 'en:e322', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const url = new URL(vi.mocked(global.fetch).mock.calls[0]?.[0] as string);
+      expect(url.pathname).toContain('api/v2/search');
+      expect(url.searchParams.get('allergens_tags')).toBe('en:milk');
+      expect(url.searchParams.get('additives_tags')).toBe('en:e322');
+    });
+
+    it('folds allergens_tag into the Lucene q on the combined path', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 12,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [],
+        }),
+      );
+
+      await svc.searchProducts(
+        { query: 'chocolate', allergens_tag: 'en:milk', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      expect(q).toContain('allergens_tags:"en:milk"');
+      expect(q).toContain('chocolate');
+    });
+
+    it('never builds an additives clause for the text backend', async () => {
+      // search-a-licious has no additives_tags field — the clause compiles to a phrase match on a
+      // missing field and returns zero hits for every E-number. Building it would turn a filter
+      // into a silent "no such product". The tool refuses the pairing; this pins the query builder
+      // so a direct service call cannot construct it either.
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 0,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 0,
+          hits: [],
+        }),
+      );
+
+      await svc.searchProducts(
+        { query: 'chocolate', additives_tag: 'en:e322', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('search.openfoodfacts.org');
+      expect(new URL(fetchCall).searchParams.get('q') ?? '').not.toContain('additives_tags');
+    });
+  });
+
+  // ── clipped hit counts (GH issue #18) ────────────────────────────────────
+
+  describe('searchProducts — count exactness', () => {
+    it('reports a clipped text-search count as inexact', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 10_000,
+          is_count_exact: false,
+          page: 1,
+          page_size: 2,
+          page_count: 5000,
+          hits: [{ code: '1234567890001' }],
+        }),
+      );
+
+      const result = await svc.searchProducts({ query: 'chocolate', page: 1, page_size: 2 }, ctx);
+
+      expect(result.count).toBe(10_000);
+      expect(result.count_is_exact).toBe(false);
+    });
+
+    it('reports a counted text-search total as exact', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 3464,
+          is_count_exact: true,
+          page: 1,
+          page_size: 2,
+          page_count: 1732,
+          hits: [{ code: '1234567890001' }],
+        }),
+      );
+
+      const result = await svc.searchProducts({ query: 'kombucha', page: 1, page_size: 2 }, ctx);
+
+      expect(result.count_is_exact).toBe(true);
+    });
+
+    it('reads exactness from the backend flag, not from the count reaching a threshold', async () => {
+      // The page-depth window and the hit-counting ceiling are separate limits that sit at the
+      // same number today. A count of exactly 10,000 that the backend says it finished counting
+      // is exact; a small count it says it did not finish is not. Comparing the count against
+      // TEXT_SEARCH_RESULT_WINDOW would get both of these backwards.
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 10_000,
+          is_count_exact: true,
+          page: 1,
+          page_size: 2,
+          page_count: 5000,
+          hits: [],
+        }),
+      );
+      expect(
+        (await svc.searchProducts({ query: 'a', page: 1, page_size: 2 }, ctx)).count_is_exact,
+      ).toBe(true);
+
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 42,
+          is_count_exact: false,
+          page: 1,
+          page_size: 2,
+          page_count: 21,
+          hits: [],
+        }),
+      );
+      expect(
+        (await svc.searchProducts({ query: 'b', page: 1, page_size: 2 }, ctx)).count_is_exact,
+      ).toBe(false);
+    });
+
+    it('reports tag-search counts as exact past the text backend ceiling', async () => {
+      // /api/v2/search counts every match — live-verified at 230,860 for a filter that clips to
+      // 10,000 on the text path.
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 230_860,
+          page: 1,
+          page_count: 20,
+          page_size: 20,
+          products: [{ code: '1234567890001' }],
+        }),
+      );
+
+      const result = await svc.searchProducts(
+        { categories_tag: 'en:beverages', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      expect(result.count).toBe(230_860);
+      expect(result.count_is_exact).toBe(true);
+    });
+  });
+
   // ── GH issue #3: score filters must use the *_tags query params ────────────
 
   describe('searchProducts — score filter query params', () => {

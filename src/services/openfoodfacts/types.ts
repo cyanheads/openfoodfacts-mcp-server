@@ -64,6 +64,12 @@ export type RawSearchResponse = {
  */
 export type RawTextSearchResponse = {
   count?: number;
+  /**
+   * False when `count` is the backend's hit-tracking ceiling rather than the real match total —
+   * search-a-licious stops counting at 10,000 and says so here. Required by its response schema;
+   * typed optional to match this file's convention that no upstream field is assumed present.
+   */
+  is_count_exact?: boolean;
   page?: number;
   page_size?: number;
   /** Total number of pages (not products on this page — differs from /api/v2/search). */
@@ -93,6 +99,13 @@ export type SearchParams = {
   categories_tag?: string;
   brands_tag?: string;
   labels_tag?: string;
+  allergens_tag?: string;
+  /**
+   * Applied only on the tag-filter path (/api/v2/search). search-a-licious does not index
+   * `additives_tags`, so the tool rejects this filter alongside a text query rather than sending a
+   * clause that would silently match nothing.
+   */
+  additives_tag?: string;
   nutrition_grade?: string;
   nova_group?: string;
   countries_tag?: string;
@@ -100,4 +113,22 @@ export type SearchParams = {
   sort_by?: 'last_modified_t' | 'unique_scans_n' | 'created_t' | 'popularity_key';
   page?: number;
   page_size?: number;
+};
+
+/**
+ * Normalized envelope both search paths return. `page_count` is products on this page on both
+ * paths — the text backend's own `page_count` means total pages and is converted before it gets
+ * here.
+ */
+export type SearchResult = {
+  count: number;
+  /**
+   * False when `count` is a floor rather than the match total. Only the text backend clips; the
+   * tag-filter path reports real totals well past the text ceiling, so it always reports true.
+   */
+  count_is_exact: boolean;
+  page: number;
+  page_count: number;
+  page_size: number;
+  products: RawProduct[];
 };

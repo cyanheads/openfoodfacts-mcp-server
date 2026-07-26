@@ -14,7 +14,7 @@ import type { SearchParams } from '@/services/openfoodfacts/types.js';
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: results match the query text and satisfy every filter provided (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France). Tag filter values must be canonical tag IDs (e.g. "en:organic", "en:gluten-free") — use off_browse_taxonomy to resolve human terms to tag IDs. At least one search parameter is required. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: results match the query text and satisfy every filter provided (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); additives_tag is the one exception, filtering only on searches with no text query. Tag filter values must be canonical tag IDs (e.g. "en:organic", "en:gluten-free") — use off_browse_taxonomy to resolve human terms to tag IDs. At least one search parameter is required. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -34,13 +34,25 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Brand slug (lowercased, hyphenated). Example: "nutella", "kelloggs". Fuzzy — partial matches may work.',
+        'Brand slug (lowercased, hyphenated). Example: "nutella", "kelloggs". Matched exactly against the normalized slug — a partial or misspelled slug matches nothing rather than falling back to a near match, so put open-ended brand wording in query instead.',
       ),
     labels_tag: z
       .string()
       .optional()
       .describe(
         'Canonical label/certification tag ID. Example: "en:organic", "en:fair-trade", "en:no-gluten". Use off_browse_taxonomy with facet="labels".',
+      ),
+    allergens_tag: z
+      .string()
+      .optional()
+      .describe(
+        'Canonical allergen tag ID. Example: "en:milk", "en:gluten". Use off_browse_taxonomy with facet="allergens". Selects products that declare this allergen; it cannot select allergen-free products, because a product with no allergen tags may simply have none entered yet.',
+      ),
+    additives_tag: z
+      .string()
+      .optional()
+      .describe(
+        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches with no query — the text backend does not index additives, so combining the two is rejected instead of silently returning nothing.',
       ),
     nutrition_grade: z
       .enum(['a', 'b', 'c', 'd', 'e'])
@@ -86,7 +98,16 @@ export const offSearchProductsTool = tool('off_search_products', {
   }),
 
   output: z.object({
-    total: z.number().describe('Total matching products in the database for this query.'),
+    total: z
+      .number()
+      .describe(
+        'Matching products in the database for this search. Exact unless total_is_lower_bound is true, in which case at least this many match and the real figure is unknown.',
+      ),
+    total_is_lower_bound: z
+      .boolean()
+      .describe(
+        'True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count.',
+      ),
     page: z.number().describe('Current page number (1-based).'),
     page_count: z
       .number()
@@ -152,7 +173,15 @@ export const offSearchProductsTool = tool('off_search_products', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'No search query or filter was provided',
       recovery:
-        'Provide at least one of: query, categories_tag, brands_tag, labels_tag, nutrition_grade, nova_group, or countries_tag.',
+        'Provide at least one of: query, categories_tag, brands_tag, labels_tag, allergens_tag, additives_tag, nutrition_grade, nova_group, or countries_tag.',
+    },
+    {
+      reason: 'additives_filter_needs_tag_search',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'additives_tag was combined with a text query, which the text backend cannot filter on',
+      retryable: false,
+      recovery:
+        'Drop query and search by tags alone to keep the additive filter, or drop additives_tag to keep the text query. Every other filter combines with a text query.',
     },
     {
       reason: 'page_out_of_range',
@@ -203,6 +232,8 @@ export const offSearchProductsTool = tool('off_search_products', {
       Boolean(input.categories_tag?.trim()) ||
       Boolean(input.brands_tag?.trim()) ||
       Boolean(input.labels_tag?.trim()) ||
+      Boolean(input.allergens_tag?.trim()) ||
+      Boolean(input.additives_tag?.trim()) ||
       Boolean(input.nutrition_grade) ||
       Boolean(input.nova_group) ||
       Boolean(input.countries_tag?.trim());
@@ -211,6 +242,20 @@ export const offSearchProductsTool = tool('off_search_products', {
       throw ctx.fail('no_filters', 'At least one search parameter is required.', {
         ...ctx.recoveryFor('no_filters'),
       });
+    }
+
+    // Only the tag-filter backend indexes additives. The text backend accepts an additives clause
+    // and answers zero hits for every value, so honoring the combination would report "no such
+    // product" about products that plainly exist. Refuse it instead of returning that lie.
+    if (isTextSearch && input.additives_tag?.trim()) {
+      throw ctx.fail(
+        'additives_filter_needs_tag_search',
+        'additives_tag filters only on searches with no text query — the text backend does not index additives, so pairing the two would match nothing regardless of the additive.',
+        {
+          additives_tag: input.additives_tag,
+          ...ctx.recoveryFor('additives_filter_needs_tag_search'),
+        },
+      );
     }
 
     // The text backend refuses page * page_size beyond its result window with an HTTP 400 that no
@@ -242,6 +287,8 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (input.categories_tag?.trim()) searchParams.categories_tag = input.categories_tag.trim();
     if (input.brands_tag?.trim()) searchParams.brands_tag = input.brands_tag.trim();
     if (input.labels_tag?.trim()) searchParams.labels_tag = input.labels_tag.trim();
+    if (input.allergens_tag?.trim()) searchParams.allergens_tag = input.allergens_tag.trim();
+    if (input.additives_tag?.trim()) searchParams.additives_tag = input.additives_tag.trim();
     if (input.nutrition_grade) searchParams.nutrition_grade = input.nutrition_grade;
     if (input.nova_group) searchParams.nova_group = input.nova_group;
     if (input.countries_tag?.trim()) searchParams.countries_tag = input.countries_tag.trim();
@@ -251,6 +298,7 @@ export const offSearchProductsTool = tool('off_search_products', {
 
     ctx.log.info('Product search completed', {
       total: response.count,
+      total_is_lower_bound: !response.count_is_exact,
       returned: response.products.length,
       page: response.page,
     });
@@ -261,6 +309,8 @@ export const offSearchProductsTool = tool('off_search_products', {
       if (input.categories_tag) filterParts.push(`category="${input.categories_tag}"`);
       if (input.brands_tag) filterParts.push(`brand="${input.brands_tag}"`);
       if (input.labels_tag) filterParts.push(`label="${input.labels_tag}"`);
+      if (input.allergens_tag) filterParts.push(`allergen="${input.allergens_tag}"`);
+      if (input.additives_tag) filterParts.push(`additive="${input.additives_tag}"`);
       if (input.nutrition_grade) filterParts.push(`nutriscore="${input.nutrition_grade}"`);
       if (input.nova_group) filterParts.push(`nova="${input.nova_group}"`);
       if (input.countries_tag) filterParts.push(`country="${input.countries_tag}"`);
@@ -280,11 +330,20 @@ export const offSearchProductsTool = tool('off_search_products', {
         ? Math.min(totalPages, Math.floor(TEXT_SEARCH_RESULT_WINDOW / input.page_size))
         : totalPages;
 
-      const position =
-        reachablePages < totalPages
-          ? `Page ${response.page} of ${reachablePages} reachable pages — ${totalPages} pages of matches exist, ` +
-            `but text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results.`
-          : `Page ${response.page} of ${totalPages}.`;
+      let position: string;
+      if (!response.count_is_exact) {
+        // totalPages is derived from a count the backend stopped incrementing, so stating it would
+        // dress the ceiling up as a measured figure. Only the reachable bound is knowable here.
+        position =
+          `Page ${response.page} of ${reachablePages} reachable pages — the backend stopped counting at ` +
+          `${response.count} matches, so more exist than it will either count or serve.`;
+      } else if (reachablePages < totalPages) {
+        position =
+          `Page ${response.page} of ${reachablePages} reachable pages — ${totalPages} pages of matches exist, ` +
+          `but text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results.`;
+      } else {
+        position = `Page ${response.page} of ${totalPages}.`;
+      }
 
       let nextStep: string;
       if (response.page >= reachablePages) {
@@ -320,6 +379,7 @@ export const offSearchProductsTool = tool('off_search_products', {
 
     return {
       total: response.count,
+      total_is_lower_bound: !response.count_is_exact,
       page: response.page,
       page_count: response.page_count,
       products,
@@ -337,8 +397,14 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     const lines: string[] = [
-      `**${result.total} total products** (page ${result.page}, showing ${result.page_count})\n`,
+      `**${result.total}${result.total_is_lower_bound ? '+' : ''} total products** (page ${result.page}, showing ${result.page_count})`,
     ];
+    if (result.total_is_lower_bound) {
+      lines.push(
+        `*At least ${result.total} products match — the search backend stops counting there and does not report the true total. Add filters for an exact count.*`,
+      );
+    }
+    lines.push('');
 
     for (const p of result.products) {
       lines.push(`### ${p.product_name ?? 'Unknown product'}`);
