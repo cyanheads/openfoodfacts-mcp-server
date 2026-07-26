@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** openfoodfacts-mcp-server
-**Version:** 0.1.10
+**Version:** 0.2.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.0`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -42,8 +42,10 @@ export const offGetProduct = tool('off_get_product', {
   }),
   output: z.object({
     barcode: z.string().describe('Barcode as returned by the API.'),
-    found: z.boolean().describe('False when the barcode has no contributor record.'),
-    product: z.object({ /* ... */ }).optional().describe('Product data. Absent when found is false.'),
+    // No `found` flag: a missing record is the thrown not_found error, so a boolean here could
+    // only ever be true. Don't advertise a state the handler cannot return — a caller that
+    // branches on it never handles the path that actually fires.
+    product: z.object({ /* ... */ }).describe('Product data. Always present on success.'),
   }),
   errors: [
     {
@@ -56,16 +58,14 @@ export const offGetProduct = tool('off_get_product', {
 
   async handler(input, ctx) {
     const svc = getOpenFoodFactsService();
-    const result = await svc.getProduct(input.barcode, input.fields);
-    if (!result.found) throw ctx.fail('not_found', `Barcode ${input.barcode} not found`);
-    return result;
+    const product = await svc.getProduct(input.barcode, ctx);
+    if (!product) throw ctx.fail('not_found', `Barcode ${input.barcode} not found`);
+    return { barcode: input.barcode, product };
   },
 
   format: (result) => [{
     type: 'text',
-    text: result.found
-      ? `**${result.product?.product_name ?? 'Unknown'}** (${result.barcode})`
-      : `Not found: ${result.barcode}`,
+    text: `**${result.product.product_name ?? 'Unknown'}** (${result.barcode})`,
   }],
 });
 ```

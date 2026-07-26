@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -43,10 +43,10 @@ Four tools for working with [Open Food Facts](https://world.openfoodfacts.org/) 
 Fetch a packaged food product by barcode (EAN-13 or UPC).
 
 - Accepts 8–14 digit barcodes (EAN-13, EAN-8, UPC-A, UPC-E)
-- Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags), all 14 major allergens as tag IDs, E-number additives, Nutri-Score a–e, NOVA 1–4, Green-Score/Eco-Score, full nutriments per 100g and per serving, categories/labels/packaging/origins as canonical tag IDs, front image URL, and data completeness score (0–1)
+- Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags), all 14 major allergens as tag IDs, E-number additives, Nutri-Score a–e, NOVA 1–4, Green-Score/Eco-Score, every nutrient Open Food Facts holds per 100g and per serving, the serving size those per-serving figures are measured against, categories/labels/packaging/origins as canonical tag IDs, front image URL, and data completeness score (0–1)
 - Optional `fields` parameter restricts the response to a subset (e.g., scores only, or nutrition only)
 - Open Food Facts is crowd-sourced — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product
-- `found: false` means no contributor has recorded this barcode yet — not a product defect
+- A barcode no contributor has recorded raises the `not_found` error carrying a recovery hint — it is never returned as an empty result
 
 ---
 
@@ -108,12 +108,12 @@ Open Food Facts-specific:
 - No API key required — the identifying `User-Agent` header (required by OFF terms) is baked into the service layer
 - Token-bucket rate limiting per endpoint class: product reads (~100/min), search (~10/min). A local refusal says so — it never reports itself as an Open Food Facts rate limit
 - Automatic retry (3 attempts, 500ms base) for transient failures only — 5xx, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. A 4xx is never retried; the upstream's own explanation is surfaced instead
-- Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — only the `_100g` and `_serving` variants are returned
+- Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — the `_100g` and `_serving` variants of every nutrient on the record, with the macros as named fields and the rest in an open map that carries each nutrient's own unit (micronutrients are reported in grams, so calcium `0.071` is 71 mg)
 - Embedded tag taxonomy for `off_browse_taxonomy` — curated 200+ category subset, full allergen/label/additive vocabularies
 
 Agent-friendly output:
 
-- `found` field on every product response — explicit `false` when a barcode has no contributor record, not a thrown error
+- Per-serving nutrition always carries its denominator — `serving_size` as printed plus the parsed `serving_quantity`/`serving_quantity_unit`, and an explicit note when Open Food Facts has recorded none
 - Missing fields signal incomplete crowd-sourced data, not product attribute absence — surfaced in descriptions and format output
 - Computed scores (Nutri-Score, NOVA, Green-Score) returned as-is with regional caveat notes — not interpreted or normalized to health claims
 - `not_found` list in `off_compare_products` allows partial batch comparisons without request failure — and a barcode whose fetch failed lands in `failed` instead, so a transport error is never reported as "no contributor record"

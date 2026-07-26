@@ -162,7 +162,6 @@ z.object({
 ```ts
 z.object({
   barcode: z.string().describe('Barcode as returned by the API.'),
-  found: z.boolean().describe('False when the barcode exists in no record (status:0). A false result means no contributor has entered this product yet.'),
   product: z.object({
     product_name: z.string().optional().describe('Product name. May be absent if not yet entered.'),
     brands: z.string().optional().describe('Brand name(s), comma-separated.'),
@@ -193,7 +192,12 @@ z.object({
       energy_kcal_serving: z.number().optional().describe('Energy per serving in kcal. Absent when serving size not defined.'),
       fat_serving: z.number().optional().describe('Total fat per serving in grams.'),
       sugars_serving: z.number().optional().describe('Sugars per serving in grams.'),
+      additional_100g: z.record(z.string(), z.object({ value: z.number(), unit: z.string().optional() })).optional().describe('Every other per-100g nutrient on the record (calcium, iron, trans_fat, added_sugars, energy in kJ, …), each with the unit Open Food Facts reported it in.'),
+      additional_serving: z.record(z.string(), z.object({ value: z.number(), unit: z.string().optional() })).optional().describe('The same nutrients per serving, plus per-serving macros that have no named field.'),
     }).optional().describe('Nutrition figures. All values may be absent if nutrition data not yet entered.'),
+    serving_size: z.string().optional().describe('Serving size as printed on the label (e.g. "28 g", "1 can (12 fl oz)") — the denominator for every per-serving figure.'),
+    serving_quantity: z.number().optional().describe('Serving size parsed to a number, in serving_quantity_unit.'),
+    serving_quantity_unit: z.string().optional().describe('Unit of serving_quantity — "g" for most products, "ml" for liquids.'),
     categories_tags: z.array(z.string()).optional().describe('Category tag IDs in canonical form (e.g. "en:spreads"). Useful as filter values for off_search_products.'),
     labels_tags: z.array(z.string()).optional().describe('Label/certification tag IDs (e.g. "en:organic", "en:no-gluten").'),
     packaging_tags: z.array(z.string()).optional().describe('Packaging material tag IDs.'),
@@ -201,7 +205,7 @@ z.object({
     image_url: z.string().optional().describe('Front image URL (CDN-hosted JPEG).'),
     completeness: z.number().optional().describe('Data completeness score from 0–1. Below 0.5 indicates many fields are missing.'),
     data_quality_tags: z.array(z.string()).optional().describe('Crowd-sourced data quality flags (e.g. "en:nutrition-completed", "en:ingredients-completed-at-least-for-one-language").'),
-  }).optional().describe('Product data. Absent when found is false.'),
+  }).describe('Product data. Always present on a successful call — a barcode with no contributor record raises the not_found error instead.'),
 })
 ```
 
@@ -525,6 +529,8 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 
 **The text backend's 10,000-result window is enforced before the request.** `search.openfoodfacts.org` rejects `page * page_size > 10000` with an HTTP 400. Checking it in the handler turns a four-attempt backoff ending in a retryable-looking outage into a validation failure naming the highest reachable page. Scoped to the text path — `/api/v2/search` publishes no equivalent ceiling and its deep pages fail unpredictably rather than at a fixed bound, so truncation guidance there warns instead of promising a reachable page count.
 
+**`format()` renders what `structuredContent` carries — no formatter-local slicing.** The text surface previously capped parsed ingredients at 20 and category tags at 5 (3 in search), rendered completeness only as a rounded percentage, and dropped `vegan`/`vegetarian` when the value was `maybe`. None of it reduced the payload — the full arrays and exact scalars were already in `structuredContent` — so the caps bought nothing and left text-only clients (Claude Desktop) with a quietly incomplete record that no follow-up call could complete, since re-calling returns the same trimmed text. Two of the losses were silent misreadings rather than omissions: `79%` is indistinguishable from an exact `0.79` when the value is `0.7875`, and `maybe` is a real OFF verdict ("depends on sourcing") that rendered identically to no verdict at all. These are capped-*list* cases in name only; the honest fix is full parity, and the `fields` input already exists for callers who want a smaller response. Outline-on-overflow does not apply — it addresses one document-shaped record too large to inline, and a product record is neither document-shaped nor near the budget: the heaviest real payloads observed (55 parsed ingredients) serialize to roughly 9 KB of `structuredContent` and 7.5 KB of text against a 24 KB outline budget, and the `fields` input already gives a caller who wants less a way to ask for it.
+
 **A clipped hit count is labelled, never rounded off or hidden.** The text backend stops counting at 10,000 and reports `is_count_exact: false` when it does; `total_is_lower_bound` carries that straight through to the caller, and `format()` renders the figure as `10000+`. The alternative — presenting the ceiling as an exact total — makes every broad query report the same fabricated number, and made the pagination guidance derive a precise page count from it. Detection reads the upstream flag rather than comparing the count against `TEXT_SEARCH_RESULT_WINDOW`: the page-depth limit and the hit-counting limit are separate limits that sit at the same number today, and only the backend knows when it stopped counting.
 
 **`additives_tag` is refused alongside a text query instead of being sent.** The search-a-licious index has no `additives_tags` field, so the clause compiles to a phrase match on a missing field and returns zero hits — an answer indistinguishable from "no product contains this additive". A declared `additives_filter_needs_tag_search` failure naming the working combination beats a silent empty result. Every other filter is indexed on both backends and combines with a query freely.
@@ -533,9 +539,18 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 
 **Field selection via input enum, not open string array.** Restricts to the fields the server actually handles and normalizes, preventing callers from requesting raw OFF fields that the output schema doesn't cover. The enum doubles as documentation of what's available.
 
-**NOVA group as `number` in output, `enum(['1','2','3','4'])` in search input.** Zod coercion converts the input string to the parameter value. The nutriments object also embeds `nova-group` as a number; consistency is preserved in the output schema.
+**NOVA group as `number` in output, `enum(['1','2','3','4'])` in search input.** Zod coercion converts the input string to the parameter value. The raw nutriments object also embeds `nova-group` as a number, but the typed `nova_group` field is its only home in the output — see the nutrient-coverage note below for why it is excluded from the open nutrient maps.
 
-**Nutriments normalized in the output schema.** The raw OFF nutriments object uses hyphenated keys (`energy-kcal_100g`) that are not valid TypeScript identifiers. The service layer normalizes to underscore form (`energy_kcal_100g`) and extracts only the `_100g` and `_serving` variants — the raw key suffixes (`_value`, `_unit`, `_modifier`) are dropped from structured output but surfaced in `format()` for display context where relevant.
+**Nutriments normalized in the output schema.** The raw OFF nutriments object uses hyphenated keys (`energy-kcal_100g`) that are not valid TypeScript identifiers. Normalization maps to underscore form (`energy_kcal_100g`) and takes the `_100g` and `_serving` variants; `_value` and `_modifier` are dropped as redundant with `_100g`.
+
+**Nutrient coverage is open, not an allowlist.** The macros keep named schema fields, and every other nutrient on the record lands in `additional_100g` / `additional_serving` keyed by normalized name. A fixed map silently narrowed a nutrition database to a dozen macronutrients — calcium, iron, cholesterol, trans fat, added sugars, and the vitamins were all present upstream and dropped, so questions the record could answer came back empty with no field subset or follow-up call that would retrieve them. Two constraints make the open map safe:
+
+- **Exclusion is per exact raw key, not per base nutrient**, derived from the named map so the two cannot drift. The named set is asymmetric across suffixes — `saturated-fat_100g` is named while `saturated-fat_serving` is not — so excluding by base name would drop per-serving macros from both surfaces. Each nutrient therefore appears in exactly one place.
+- **The per-key unit is carried, never assumed.** OFF reports most nutrients in grams but not all: `energy` is kJ and `energy-kcal` is kcal on the same product, and some keys (the fruits-vegetables estimates) have no `_unit` sibling at all, so the unit is optional rather than defaulted. Normalizing everything to "grams" would have mislabeled them.
+
+`nova-group` is excluded outright: OFF stores the NOVA processing class inside the nutriments map with an empty unit, and it is already surfaced as the typed `nova_group` field, so passing it through would report the same classification twice.
+
+**Per-serving figures always carry their denominator.** `serving_size` (as printed), `serving_quantity` (parsed), and `serving_quantity_unit` are requested and returned alongside the `_serving` nutriments; `format()` restates the serving size on the per-serving heading and says outright when OFF has recorded none. Per-serving numbers without a serving size cannot be compared across products or converted to or from the per-100g figures. `serving_quantity` is coerced rather than type-tested — OFF returns it as a JSON number for most products and a numeric string for others, so a `typeof === 'number'` guard would drop it for a whole class of records. Its unit is not assumed to be grams: it is millilitres for liquids.
 
 ---
 
