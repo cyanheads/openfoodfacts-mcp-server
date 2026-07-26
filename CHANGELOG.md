@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-07-26 · ⚠️ Breaking
+
+BREAKING: off_get_product drops the unreachable found field and makes product required. Nutriments now cover every upstream nutrient via additional_100g/additional_serving, per-serving figures carry serving_size, and format() reaches full parity with structuredContent.
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-07-26
 
 Add allergens_tag/additives_tag search filters, correct the brands_tag exact-match description, and stop reporting the text backend's clipped 10,000-result count as an exact total.
