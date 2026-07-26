@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-07-26
+
+Add allergens_tag/additives_tag search filters, correct the brands_tag exact-match description, and stop reporting the text backend's clipped 10,000-result count as an exact total.
+
 ## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-07-26
 
 Declare typed reasons (upstream_error, upstream_timeout, upstream_rejected, rate_limited) across the service layer, split off_compare_products failures from not_found, pre-flight the text-search 10k-result window, and adopt mcp-ts-core ^0.11.0.
