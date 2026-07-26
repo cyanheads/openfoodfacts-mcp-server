@@ -213,8 +213,9 @@ function toContractError(error: unknown, ctx: Context, data: Record<string, unkn
 /** Fields to request on every product fetch — scopes the ~200-key object to what we handle. */
 const PRODUCT_FIELDS =
   'product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,additives_tags,' +
-  'nutriscore_grade,nova_group,ecoscore_grade,nutriments,categories_tags,labels_tags,' +
-  'packaging_tags,origins_tags,image_url,completeness,data_quality_tags';
+  'nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,' +
+  'serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,image_url,' +
+  'completeness,data_quality_tags';
 
 /** Fields to request on search results — summary rows for triage. Shared by both search paths. */
 const SEARCH_FIELDS =

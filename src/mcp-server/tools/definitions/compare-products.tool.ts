@@ -321,8 +321,12 @@ export const offCompareProductsTool = tool('off_compare_products', {
       const name = p.product_name
         ? `${p.product_name}${p.brands ? ` (${p.brands})` : ''}`
         : `Barcode ${p.barcode}`;
+      // The exact scalar rides alongside the rounded percentage: 0.7875 and 0.79 both render as
+      // "79%", and a text-only client has no second call that would recover the difference.
       const completeness =
-        p.completeness !== undefined ? `${Math.round(p.completeness * 100)}%` : 'N/A';
+        p.completeness !== undefined
+          ? `${Math.round(p.completeness * 100)}% (${p.completeness})`
+          : 'N/A';
       lines.push(
         `| ${name} | ${p.barcode} | ${p.found} | ${p.nutriscore_grade ?? 'N/A'} | ${p.nova_group ?? 'N/A'} | ${p.ecoscore_grade ?? 'N/A'} | ${completeness} |`,
       );

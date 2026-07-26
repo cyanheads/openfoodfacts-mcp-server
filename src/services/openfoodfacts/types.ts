@@ -29,6 +29,17 @@ export type RawProduct = {
   nova_group?: number;
   ecoscore_grade?: string;
   nutriments?: RawNutriments;
+  /** Serving size as printed on the label (e.g. "28 g", "1 can (12 fl oz)"). */
+  serving_size?: string;
+  /**
+   * Serving size parsed to a number. Typed as a union because OFF is inconsistent about it:
+   * live-verified as the JSON number `39` on barcode 0016000275287 and the JSON string `"28"` on
+   * 0028400157827. Narrowing this to `number` silently drops the value for every product on the
+   * string side, so callers coerce rather than type-test.
+   */
+  serving_quantity?: number | string;
+  /** Unit of `serving_quantity` — not always grams (live-verified `"ml"` on barcode 0049000042566). */
+  serving_quantity_unit?: string;
   categories_tags?: string[];
   labels_tags?: string[];
   packaging_tags?: string[];

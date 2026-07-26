@@ -814,5 +814,30 @@ describe('off_search_products', () => {
       expect(text).not.toContain('+ total products');
       expect(text).not.toContain('At least');
     });
+
+    it('renders every category tag per row, not the first 3', () => {
+      // #9 regression: format() sliced categories_tags to 3 while structuredContent carried the
+      // full array, so text-only clients saw a silently short list with no way to complete it.
+      const categories_tags = [
+        'en:frozen-foods',
+        'en:meals',
+        'en:pizzas-pies-and-quiches',
+        'en:pizzas',
+        'en:frozen-pizzas',
+        'en:cheese-pizzas',
+        'en:margherita-pizzas',
+      ];
+      const output = {
+        total: 1,
+        total_is_lower_bound: false,
+        page: 1,
+        page_count: 1,
+        products: [{ barcode: '1234567890001', product_name: 'Frozen Pizza', categories_tags }],
+      };
+
+      const text = offSearchProductsTool.format!(output)[0].text;
+
+      for (const tag of categories_tags) expect(text).toContain(tag);
+    });
   });
 });

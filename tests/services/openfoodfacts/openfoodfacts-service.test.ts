@@ -852,4 +852,30 @@ describe('OpenFoodFactsService', () => {
       expect(ua).toContain(`openfoodfacts-mcp-server/${version}`);
     });
   });
+
+  // ── requested product fields ──────────────────────────────────────────────
+
+  describe('PRODUCT_FIELDS', () => {
+    it('asks Open Food Facts for the serving fields (GH issue #16)', async () => {
+      // #16 starts at the request, not the output shape: the default field list never named
+      // serving_size or serving_quantity, so per-serving nutrition arrived with no denominator no
+      // matter what the output schema declared. serving_quantity_unit is requested with them —
+      // the parsed number alone is ambiguous, since it is millilitres for liquids, not grams.
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Test' } }));
+
+      await svc.getProduct('0028400157827', ctx);
+
+      const url = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      const requested = new URL(url).searchParams.get('fields')?.split(',') ?? [];
+      expect(requested).toContain('serving_size');
+      expect(requested).toContain('serving_quantity');
+      expect(requested).toContain('serving_quantity_unit');
+      // The whole nutriments object is still requested, so the open nutrient map costs no extra
+      // upstream fields.
+      expect(requested).toContain('nutriments');
+    });
+  });
 });

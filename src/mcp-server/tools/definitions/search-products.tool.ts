@@ -418,7 +418,9 @@ export const offSearchProductsTool = tool('off_search_products', {
       if (scores.length > 0) lines.push(`**Scores:** ${scores.join(' | ')}`);
 
       if (p.categories_tags && p.categories_tags.length > 0) {
-        lines.push(`**Categories:** ${p.categories_tags.slice(0, 3).join(', ')}`);
+        // Rendered in full — structuredContent already carries every tag, so slicing here only
+        // left text-only clients with a short list they had no way to complete.
+        lines.push(`**Categories:** ${p.categories_tags.join(', ')}`);
       }
       lines.push('');
     }

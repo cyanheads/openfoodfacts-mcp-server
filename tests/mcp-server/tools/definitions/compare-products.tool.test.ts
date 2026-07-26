@@ -148,6 +148,23 @@ describe('off_compare_products', () => {
     expect(text).toContain('539');
   });
 
+  it('renders the exact completeness scalar alongside the rounded percentage', () => {
+    // #9 regression: the table rendered only Math.round(completeness * 100), so 0.7875 and 0.79
+    // both read as "79%" while structuredContent carried the exact value. Re-calling returns the
+    // same rounded string, so a text-only client had no path to the scalar.
+    const output = {
+      products: [
+        { barcode: '3017620422003', product_name: 'Nutella', found: true, completeness: 0.7875 },
+      ],
+      succeeded: 1,
+      not_found: [],
+    };
+    const text = offCompareProductsTool.format!(output)[0].text;
+
+    expect(text).toContain('79%');
+    expect(text).toContain('0.7875');
+  });
+
   it('formats result with not_found barcodes listed', () => {
     const output = {
       products: [
