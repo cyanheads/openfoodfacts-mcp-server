@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -34,7 +34,7 @@ Four tools for working with [Open Food Facts](https://world.openfoodfacts.org/) 
 | Tool | Description |
 |:-----|:------------|
 | `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, allergens, additives, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, and data completeness. |
-| `off_search_products` | Search by text query and/or structured tag filters (category, brand, label, Nutri-Score grade, NOVA group, country). Returns summary rows with barcodes for follow-up lookups. |
+| `off_search_products` | Search by text query and/or structured tag filters (category, brand, label, allergen, additive, Nutri-Score grade, NOVA group, country). Returns summary rows with barcodes for follow-up lookups. |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy, macros, salt, Nutri-Score, NOVA, and Green-Score. |
 | `off_browse_taxonomy` | Browse and search the canonical tag vocabulary (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) for use as filter values in `off_search_products`. |
 
@@ -55,10 +55,12 @@ Fetch a packaged food product by barcode (EAN-13 or UPC).
 Search Open Food Facts by text and/or structured tag filters.
 
 - Full-text search across product names, brands, and ingredients
-- Structured filters: `categories_tag`, `brands_tag`, `labels_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag`
+- Structured filters: `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag`
 - Text query and tag filters combine — a query with filters returns products that match the text *and* satisfy every filter (e.g., `query: "dark chocolate"` + `labels_tag: en:organic` + `countries_tag: en:france`)
-- All filter values are canonical tag IDs — use `off_browse_taxonomy` to resolve human terms (e.g., "organic" → `en:organic`)
-- Pagination via `page` (1-based) and `page_size` (1–50, default 20); response includes `total` count for computing total pages
+- All filter values are canonical tag IDs — use `off_browse_taxonomy` to resolve human terms (e.g., "organic" → `en:organic`). `brands_tag` takes a brand slug and matches it exactly; open-ended brand wording belongs in `query`
+- `additives_tag` filters only on searches with no text query — the text backend does not index additives, so pairing the two is rejected up front rather than returning an empty result set that looks like "no such product"
+- Pagination via `page` (1-based) and `page_size` (1–50, default 20)
+- `total` is exact on tag-only searches. Text searches stop counting at 10,000 matches, and when that ceiling is hit the response says so with `total_is_lower_bound: true` and renders the count as `10000+` — add filters for an exact figure
 - Searches carrying a text query serve only the first 10,000 results — a deeper `page * page_size` is rejected up front with the highest reachable page, not sent and retried. Tag-only searches publish no window, but deep pages are refused unpredictably, so narrowing the filters beats paging far in
 - Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — use `off_get_product` for full label data
 - Result counts reflect contributed products, not total products on the market

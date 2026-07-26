@@ -7,7 +7,7 @@
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `off_get_product` | Fetch a product by barcode (EAN-13/UPC). Returns name, brands, quantity, ingredients (raw text + parsed list), allergens, additives, Nutri-Score, NOVA group, Green-Score, nutriments per 100g and per serving, categories, labels, packaging, origins, image URL, and completeness signal. Missing fields mean "not yet entered in the database" — not that the attribute is absent from the real product. | `barcode` (string, required), `fields` (optional field subset) | `readOnlyHint: true` |
-| `off_search_products` | Search by keyword and/or structured tag filters. Returns summary rows with barcodes for follow-up lookups. Use when the barcode is unknown or to explore a category. Filters use canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. | `query` (text search), `categories_tag`, `brands_tag`, `labels_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, `page`, `page_size` | `readOnlyHint: true` |
+| `off_search_products` | Search by keyword and/or structured tag filters. Returns summary rows with barcodes for follow-up lookups. Use when the barcode is unknown or to explore a category. Filters use canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. | `query` (text search), `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, `sort_by`, `page`, `page_size` | `readOnlyHint: true` |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 barcodes. Returns a normalized table of calories, fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA, and Green-Score. Designed for "which of these cereals is healthiest?" workflows. | `barcodes` (array of 2–10 EAN/UPC strings) | `readOnlyHint: true` |
 | `off_browse_taxonomy` | Look up canonical tag IDs for the common filter vocabularies: categories, labels, allergens, additives, countries, nova groups, nutrition grades. Returns a curated list of tag IDs and their display names for a given facet, optionally filtered by a search term. Use before `off_search_products` to build precise filter values. | `facet` (enum), `search` (optional filter term), `limit` | `readOnlyHint: true`, `openWorldHint: false` |
 
@@ -107,7 +107,26 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 - `nutrition_grades_tags=e` — single letter a–e (the bare `nutrition_grades` key is silently ignored)
 - Multiple filters compose as AND
 
-**Tag filter params in search:** `categories_tags`, `labels_tags`, `allergens_tags`, `additives_tags`, `brands_tags`, `countries_tags` — use canonical `en:X` format. The `_en` suffix variants accept plain English slugs.
+**Tag filter params in search:** `categories_tags`, `labels_tags`, `allergens_tags`, `additives_tags`, `brands_tags`, `countries_tags` — use canonical `en:X` format. The `_en` suffix variants accept plain English slugs. Tag values match exactly against the normalized slug: `brands_tags=nutella` matches while `brands_tags=nutell` returns zero, on this endpoint and on the text backend alike.
+
+### Text search (`https://search.openfoodfacts.org/search`)
+
+Separate backend (search-a-licious over Elasticsearch), reached whenever a request carries free text. Its envelope differs from `/api/v2/search` in three ways that the service normalizes or surfaces:
+
+```json
+{
+  "count": 10000,
+  "is_count_exact": false,
+  "page": 1,
+  "page_size": 2,
+  "page_count": 5000,
+  "hits": []
+}
+```
+
+- **`count` is a floor, not a total, when `is_count_exact` is false.** The backend stops counting hits at 10,000 and reports which side of that it landed on. Live-probed: `chocolate`, `water`, `milk` all report `count: 10000, is_count_exact: false`; `kombucha` reports `count: 3464, is_count_exact: true`. `/api/v2/search` has no such ceiling — the same `en:beverages` filter that clips to 10,000 here counts 230,860 there. `is_count_exact` is a required property of the endpoint's documented success schema, so it is read directly rather than inferred by comparing `count` to a local constant.
+- **`page_count` means total pages**, not products on this page. Normalized to products-on-page in the service so both paths return one shape.
+- **Indexed facets differ.** `allergens_tags` is a keyword field and filters correctly. `additives_tags` **is not in the index** — a clause naming it is compiled to a phrase match against a missing field and returns zero hits with no error (live-probed for `en:e322`, `en:e330`, `en:e100`, all of which match hundreds of thousands of products on the tag path). The tool refuses `additives_tag` alongside a query rather than sending that clause.
 
 ### Taxonomy endpoints
 
@@ -231,7 +250,7 @@ errors: [
 
 ### `off_search_products`
 
-**Description:** Search Open Food Facts by full-text query, structured tag filters, or both together. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use `off_get_product` on the returned barcodes for complete details. A text query and tag filters combine: results match the query text and satisfy every provided filter. Filter values must be canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. Data is crowd-sourced; result count reflects contributed products, not all products in the market.
+**Description:** Search Open Food Facts by full-text query, structured tag filters, or both together. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use `off_get_product` on the returned barcodes for complete details. A text query and tag filters combine: results match the query text and satisfy every provided filter; `additives_tag` is the one exception, filtering only on searches with no text query. Filter values must be canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. Data is crowd-sourced; result count reflects contributed products, not all products in the market.
 
 **Input schema:**
 
@@ -242,9 +261,13 @@ z.object({
   categories_tag: z.string().optional()
     .describe('Canonical category tag ID. Example: "en:breakfast-cereals", "en:cheeses". Use off_browse_taxonomy with facet="categories" to discover valid values.'),
   brands_tag: z.string().optional()
-    .describe('Brand slug (lowercased, hyphenated). Example: "nutella", "kellogs". Fuzzy — partial matches may work.'),
+    .describe('Brand slug (lowercased, hyphenated). Example: "nutella", "kelloggs". Matched exactly against the normalized slug — a partial or misspelled slug matches nothing rather than falling back to a near match, so put open-ended brand wording in query instead.'),
   labels_tag: z.string().optional()
     .describe('Canonical label/certification tag ID. Example: "en:organic", "en:fair-trade", "en:no-gluten". Use off_browse_taxonomy with facet="labels".'),
+  allergens_tag: z.string().optional()
+    .describe('Canonical allergen tag ID. Example: "en:milk", "en:gluten". Use off_browse_taxonomy with facet="allergens". Selects products that declare this allergen; it cannot select allergen-free products, because a product with no allergen tags may simply have none entered yet.'),
+  additives_tag: z.string().optional()
+    .describe('Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches with no query — the text backend does not index additives, so combining the two is rejected instead of silently returning nothing.'),
   nutrition_grade: z.enum(['a', 'b', 'c', 'd', 'e']).optional()
     .describe('Filter by Nutri-Score grade. "a" is highest nutritional quality, "e" is lowest. Products without a score are excluded.'),
   nova_group: z.enum(['1', '2', '3', '4']).optional()
@@ -260,21 +283,23 @@ z.object({
 })
 ```
 
-At least one of `query`, `categories_tag`, `brands_tag`, `labels_tag`, `nutrition_grade`, `nova_group`, or `countries_tag` must be provided (validated in handler).
+At least one of `query`, `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, or `countries_tag` must be provided (validated in handler).
 
 **Output schema:**
 
 ```ts
 z.object({
-  total: z.number().describe('Total matching products in the database for this query.'),
+  total: z.number().describe('Matching products in the database for this search. Exact unless total_is_lower_bound is true, in which case at least this many match and the real figure is unknown.'),
+  total_is_lower_bound: z.boolean().describe('True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count.'),
   page: z.number().describe('Current page number (1-based).'),
-  page_count: z.number().describe('Products returned on this page (mirrors page_size except possibly on the last page). Not the total number of pages — compute total_pages as Math.ceil(total / page_size) if needed.'),
+  page_count: z.number().describe('Products returned on this page (mirrors page_size except on the last page). Not the total number of pages.'),
   products: z.array(z.object({
     barcode: z.string().describe('EAN/UPC barcode. Pass to off_get_product for full details.'),
     product_name: z.string().optional().describe('Product name. May be absent for incompletely entered products.'),
     brands: z.string().optional().describe('Brand name(s).'),
     nutriscore_grade: z.string().optional().describe('Nutri-Score letter (a–e). Absent when not computed.'),
     nova_group: z.number().optional().describe('NOVA processing class (1–4). Absent when not assigned.'),
+    ecoscore_grade: z.string().optional().describe('Green-Score letter (a–e). Environmental impact indicator. Absent when not computed.'),
     categories_tags: z.array(z.string()).optional().describe('Category tag IDs.'),
   })).describe('Matching products. Use barcodes with off_get_product for full label data.'),
 })
@@ -288,7 +313,14 @@ errors: [
     reason: 'no_filters',
     code: JsonRpcErrorCode.ValidationError,
     when: 'No search query or filter was provided',
-    recovery: 'Provide at least one of: query, categories_tag, brands_tag, labels_tag, nutrition_grade, nova_group, or countries_tag.',
+    recovery: 'Provide at least one of: query, categories_tag, brands_tag, labels_tag, allergens_tag, additives_tag, nutrition_grade, nova_group, or countries_tag.',
+  },
+  {
+    reason: 'additives_filter_needs_tag_search',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'additives_tag was combined with a text query, which the text backend cannot filter on',
+    retryable: false,
+    recovery: 'Drop query and search by tags alone to keep the additive filter, or drop additives_tag to keep the text query. Every other filter combines with a text query.',
   },
   {
     reason: 'page_out_of_range',
@@ -328,7 +360,7 @@ errors: [
 ]
 ```
 
-The `page_out_of_range` check runs in the handler before the service is called, mirroring the `no_filters` pre-check. It is scoped to the text path — `/api/v2/search` publishes no equivalent ceiling.
+The `page_out_of_range` and `additives_filter_needs_tag_search` checks run in the handler before the service is called, mirroring the `no_filters` pre-check. Both are scoped to the text path — `/api/v2/search` publishes no result-window ceiling and does filter on `additives_tags`.
 
 ---
 
@@ -435,7 +467,7 @@ z.object({
 - **Field selection:** every call includes `fields=` to scope the product object.
 - **Methods:**
   - `getProduct(barcode, fields)` → raw product object or `null` (status:0)
-  - `searchProducts(params)` → `{count, page, page_count, page_size, products[]}`
+  - `searchProducts(params)` → `{count, count_is_exact, page, page_count, page_size, products[]}` (the `SearchResult` type — one shape from both backends)
 - **Rate limiting:** token bucket per endpoint class — product reads (100/min), search (10/min). A refusal is local, so it raises `rate_limited` (`RateLimited`) naming this server, not Open Food Facts, and carries the seconds until a slot frees.
 - **Transport:** `fetchWithTimeout` at every call site, so HTTP status → error code, canonical `status`/`body` on `error.data`, `Retry-After` honoring, and distinct `Timeout` classification all come from the framework rather than a hand-rolled status ladder.
 - **Retry:** `withRetry` on the full fetch+parse pipeline. 3 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped code decides: 5xx, timeouts, and 429 retry; 4xx fails immediately.
@@ -493,6 +525,10 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 
 **The text backend's 10,000-result window is enforced before the request.** `search.openfoodfacts.org` rejects `page * page_size > 10000` with an HTTP 400. Checking it in the handler turns a four-attempt backoff ending in a retryable-looking outage into a validation failure naming the highest reachable page. Scoped to the text path — `/api/v2/search` publishes no equivalent ceiling and its deep pages fail unpredictably rather than at a fixed bound, so truncation guidance there warns instead of promising a reachable page count.
 
+**A clipped hit count is labelled, never rounded off or hidden.** The text backend stops counting at 10,000 and reports `is_count_exact: false` when it does; `total_is_lower_bound` carries that straight through to the caller, and `format()` renders the figure as `10000+`. The alternative — presenting the ceiling as an exact total — makes every broad query report the same fabricated number, and made the pagination guidance derive a precise page count from it. Detection reads the upstream flag rather than comparing the count against `TEXT_SEARCH_RESULT_WINDOW`: the page-depth limit and the hit-counting limit are separate limits that sit at the same number today, and only the backend knows when it stopped counting.
+
+**`additives_tag` is refused alongside a text query instead of being sent.** The search-a-licious index has no `additives_tags` field, so the clause compiles to a phrase match on a missing field and returns zero hits — an answer indistinguishable from "no product contains this additive". A declared `additives_filter_needs_tag_search` failure naming the working combination beats a silent empty result. Every other filter is indexed on both backends and combines with a query freely.
+
 **`off_browse_taxonomy` is a separate tool, not bundled into `off_search_products`.** Tag vocabulary lookup is an independent need — it's used to build search filters, not as part of executing a search. Keeping it separate maintains clean tool boundaries and allows tag exploration without triggering a search call.
 
 **Field selection via input enum, not open string array.** Restricts to the fields the server actually handles and normalizes, preventing callers from requesting raw OFF fields that the output schema doesn't cover. The enum doubles as documentation of what's available.
@@ -542,6 +578,7 @@ All requests must include `fields=`. Without it, the response is ~200 keys and 5
 | NOVA group | `nova_groups_tags` | `4` |
 | Country | `countries_tags` | `en:france` |
 | Allergen | `allergens_tags` | `en:milk` |
+| Additive | `additives_tags` | `en:e322` |
 
 ### Response envelope
 
