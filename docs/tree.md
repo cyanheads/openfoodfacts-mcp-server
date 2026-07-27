@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-07-26 23:50:13
+Generated on: 2026-07-27 00:38:17
 
 ```text
 openfoodfacts-mcp-server/
@@ -23,6 +23,7 @@ openfoodfacts-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

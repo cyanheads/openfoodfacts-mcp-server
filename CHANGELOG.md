@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-07-26
+
+off_browse_taxonomy resolves search terms against the live Open Food Facts taxonomy instead of a 79-entry embedded list, and nova_groups tag IDs are now bare digits that round-trip into off_search_products.
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-07-26 · ⚠️ Breaking
 
 BREAKING: off_get_product drops the unreachable found field and makes product required. Nutriments now cover every upstream nutrient via additional_100g/additional_serving, per-serving figures carry serving_size, and format() reaches full parity with structuredContent.
