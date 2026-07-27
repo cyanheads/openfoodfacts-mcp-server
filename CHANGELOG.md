@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-07-26
+
+OFF_RATE_LIMIT_PRODUCT now defaults to 15/min, the per-IP ceiling Open Food Facts publishes for product reads, down from a default that permitted 6.6x that rate.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-07-26
 
 off_browse_taxonomy resolves search terms against the live Open Food Facts taxonomy instead of a 79-entry embedded list, and nova_groups tag IDs are now bare digits that round-trip into off_search_products.

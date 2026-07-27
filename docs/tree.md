@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-07-27 00:38:17
+Generated on: 2026-07-27 06:14:54
 
 ```text
 openfoodfacts-mcp-server/
@@ -152,6 +152,8 @@ openfoodfacts-mcp-server/
 │   │       └── taxonomy-service.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── mcp-server/
 │   │   └── tools/
 │   │       └── definitions/
