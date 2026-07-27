@@ -9,11 +9,11 @@ import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-ser
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
   description:
-    'Browse and search the canonical tag vocabulary for Open Food Facts filter facets. Returns tag IDs and display names for use as filter values in off_search_products. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Tag IDs use the "en:" prefix convention (e.g. "en:organic", "en:gluten-free", "en:milk"). Use these tag IDs as filter values, not plain English terms.',
+    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the live Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it lists only the offline sample this server ships, which is a small slice of every facet except NOVA groups and Nutri-Score grades. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:gluten-free", "en:milk"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural upstream ("kombucha" resolves to "en:kombuchas"), so use the returned id rather than constructing one.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
-    openWorldHint: false,
+    openWorldHint: true,
   },
 
   input: z.object({
@@ -28,13 +28,13 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
         'nutrition_grades',
       ])
       .describe(
-        '"categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" return the complete fixed vocabularies.',
+        '"categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" are closed vocabularies answered offline and returned complete; the other five are resolved against the live Open Food Facts taxonomy.',
       ),
     search: z
       .string()
       .optional()
       .describe(
-        'Case-insensitive substring filter against tag ID or display name. Example: "gluten" returns en:gluten, en:no-gluten. Omit to list all entries for the facet (may be large for categories).',
+        'Term to resolve. Matched case-insensitively as a substring of the tag ID or display name, against both the live Open Food Facts vocabulary and this server\'s offline sample. A single word works best ("hummus", not "hummus dip"). Omit only to see the offline sample — the live vocabulary cannot be listed without a term, so an unfiltered call is not a view of the full facet.',
       ),
     limit: z
       .number()
@@ -43,7 +43,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .max(100)
       .default(20)
       .describe(
-        'Maximum entries to return (1–100, default 20). The categories facet is broad; a search term narrows it to the relevant tags.',
+        'Maximum entries to return (1–100, default 20). There is no offset or page input: the upstream taxonomy endpoint serves only the first `limit` matches for a term and offers no cursor, so narrow the search term rather than paging.',
       ),
   }),
 
@@ -56,7 +56,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
             id: z
               .string()
               .describe(
-                'Canonical tag ID (e.g. "en:organic"). Use this value in off_search_products filter parameters.',
+                'Canonical tag ID (e.g. "en:organic"; bare "1"–"4" for NOVA groups, bare "a"–"e" for Nutri-Score grades). Pass this value through to the matching off_search_products filter parameter unchanged.',
               ),
             name: z.string().describe('Human-readable display name (e.g. "Organic").'),
             products: z
@@ -72,42 +72,58 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     total_in_facet: z
       .number()
       .optional()
-      .describe('Total entries in this facet before search filtering. Large for categories.'),
+      .describe(
+        'Total entries in this facet. Present only for nova_groups and nutrition_grades, whose vocabularies are closed and complete here. Absent for the live facets: the Open Food Facts taxonomy endpoint reports no match total and cannot be enumerated, so no figure would be a real one.',
+      ),
   }),
 
   enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Caveat about how this answer was produced — that the listing is the offline sample rather than the live vocabulary, that the live vocabulary was unreachable, or that nothing matched and why.',
+      ),
     truncated: z.boolean().optional().describe('True when more tags exist beyond the limit.'),
     shown: z.number().optional().describe('Number of tags returned.'),
     cap: z.number().optional().describe('The limit that was applied.'),
   },
 
-  handler(input, ctx) {
+  async handler(input, ctx) {
     const svc = getTaxonomyService();
-    const result = svc.search(
-      input.facet as Facet,
-      input.search && input.search.trim().length > 0 ? input.search.trim() : undefined,
-      input.limit,
-    );
+    // The service trims and treats a blank term as absent, so the raw input goes through as given.
+    const result = await svc.search(input.facet as Facet, input.search, input.limit, ctx);
 
     ctx.log.info('Taxonomy browsed', {
       facet: input.facet,
       search: input.search,
       returned: result.tags.length,
-      total: result.total_in_facet,
+      matched: result.matched_in_facet,
     });
 
     // Disclose truncation only when matching rows were dropped by the limit. Compare the
     // returned count against the filtered-match count, not the full facet size — otherwise a
     // filtered search (including a zero-match one) falsely reports truncation against the
     // pre-filter vocabulary total.
+    //
+    // `notice` is one slot, and ctx.enrich.truncated() writes it from `guidance`, so the service's
+    // caveat is routed through that argument when both apply rather than being emitted separately
+    // and silently overwritten. It is the more useful next move than the generic raise-the-limit
+    // default: on an unfiltered browse the answer is to pass a search term, not a larger cap.
     if (result.tags.length < result.matched_in_facet) {
-      ctx.enrich.truncated({ shown: result.tags.length, cap: input.limit });
+      ctx.enrich.truncated({
+        shown: result.tags.length,
+        cap: input.limit,
+        ...(result.notice && { guidance: result.notice }),
+      });
+    } else if (result.notice) {
+      ctx.enrich.notice(result.notice);
     }
 
     return {
       facet: result.facet,
       tags: result.tags,
-      total_in_facet: result.total_in_facet,
+      ...(result.total_in_facet !== undefined && { total_in_facet: result.total_in_facet }),
     };
   },
 
@@ -117,7 +133,9 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     ];
 
     if (result.tags.length === 0) {
-      lines.push('No matching tags found. Try a different search term.');
+      // No claim about the vocabulary is made here — whether nothing matched or the live lookup
+      // failed is the notice's to say, and it reaches this surface as a trailer either way.
+      lines.push('No tags returned for this query.');
       return [{ type: 'text' as const, text: lines.join('\n') }];
     }
 
@@ -128,7 +146,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     }
 
     lines.push(
-      '\n*Use the `id` values (e.g. "en:organic") as filter parameters in off_search_products.*',
+      '\n*Pass an `id` through to off_search_products exactly as shown — "en:organic" for most facets, bare "1"–"4" for NOVA groups, bare "a"–"e" for Nutri-Score grades.*',
     );
 
     return [{ type: 'text' as const, text: lines.join('\n') }];

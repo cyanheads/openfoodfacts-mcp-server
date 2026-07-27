@@ -1,9 +1,13 @@
 /**
- * @fileoverview Embedded taxonomy service for Open Food Facts tag vocabularies.
- * Returns curated tag IDs and display names for facets used in search filters.
- * No network calls — the OFF taxonomy endpoint returns 503 for anonymous bots.
+ * @fileoverview Taxonomy service for Open Food Facts tag vocabularies. Resolves a search term
+ * against the live search-a-licious autocomplete endpoint and merges the result with an embedded
+ * vocabulary, which also serves unfiltered browsing, the two fixed facets, and offline operation.
  * @module services/taxonomy/taxonomy-service
  */
+
+import type { Context } from '@cyanheads/mcp-ts-core';
+import type { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 export type TaxonomyEntry = {
   id: string;
@@ -24,6 +28,13 @@ export type Facet =
 /* Embedded vocabulary                                                         */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Offline sample of each facet, and the whole vocabulary for the two fixed facets. For the live
+ * facets this is a small, hand-maintained slice of a much larger upstream taxonomy — it is merged
+ * ahead of live suggestions rather than replaced by them, because the autocomplete endpoint matches
+ * on display names and answers an E-number query with unrelated E-numbers, so `additives` searches
+ * that resolve correctly here would regress on a live-only path.
+ */
 const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
   categories: [
     { id: 'en:beverages', name: 'Beverages' },
@@ -250,11 +261,19 @@ const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
     { id: 'en:turkey', name: 'Turkey' },
   ],
 
+  /**
+   * Bare digits, matching the bare grade letters `nutrition_grades` emits and the value
+   * `off_search_products` accepts for `nova_group`. The `en:`-prefixed form these once carried was
+   * not a valid filter value anywhere: the tool's own Zod enum rejects it outright, and while the
+   * tag backend normalizes `nova_groups_tags=en:1` to the same 136,019 matches as `=1`, the text
+   * backend does not — `nova_group:en:1` is live-verified answering zero hits flagged
+   * `is_count_exact: true`, a confident false "no such product" rather than an error.
+   */
   nova_groups: [
-    { id: 'en:1', name: 'NOVA 1 — Unprocessed or minimally processed foods' },
-    { id: 'en:2', name: 'NOVA 2 — Processed culinary ingredients' },
-    { id: 'en:3', name: 'NOVA 3 — Processed foods' },
-    { id: 'en:4', name: 'NOVA 4 — Ultra-processed food and drink products' },
+    { id: '1', name: 'NOVA 1 — Unprocessed or minimally processed foods' },
+    { id: '2', name: 'NOVA 2 — Processed culinary ingredients' },
+    { id: '3', name: 'NOVA 3 — Processed foods' },
+    { id: '4', name: 'NOVA 4 — Ultra-processed food and drink products' },
   ],
 
   nutrition_grades: [
@@ -270,38 +289,148 @@ const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
 /* Service                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * search-a-licious taxonomy name per facet. `nova_groups` and `nutrition_grades` have no live
+ * counterpart — the autocomplete endpoint serves no such taxonomy and answers HTTP 200 with an
+ * empty option list when named one — and both vocabularies are closed and complete above, so the
+ * embedded entries are the whole truth for them rather than a sample.
+ */
+const LIVE_TAXONOMY_NAME: Partial<Record<Facet, string>> = {
+  categories: 'category',
+  labels: 'label',
+  allergens: 'allergen',
+  additives: 'additive',
+  countries: 'country',
+};
+
+/** The facet's documented match rule: case-insensitive substring against tag ID or display name. */
+function matchesTerm(entry: TaxonomyEntry, term: string): boolean {
+  const needle = term.toLowerCase();
+  return entry.id.toLowerCase().includes(needle) || entry.name.toLowerCase().includes(needle);
+}
+
 export type TaxonomySearchResult = {
   facet: string;
   tags: TaxonomyEntry[];
-  /** Full facet size before any search filter — the vocabulary total. */
-  total_in_facet: number;
   /**
-   * Count of entries matching the search filter, before the `limit` cap.
-   * Equals `total_in_facet` when no search term is given. Drives the truncation
-   * decision so a filtered result is never reported as truncated against the
-   * full facet size.
+   * Full facet size before any search filter. Present only for the closed vocabularies, whose
+   * entries are enumerable here. The live facets have no knowable total — the autocomplete endpoint
+   * reports no match count and cannot be enumerated — and reporting the offline sample size as the
+   * facet total is what presented 79 entries as the size of the Open Food Facts category taxonomy.
+   */
+  total_in_facet?: number;
+  /**
+   * Count of entries matching the search term, before the `limit` cap. Drives the truncation
+   * decision so a filtered result is never reported as truncated against the full facet size.
    */
   matched_in_facet: number;
+  /**
+   * Agent-facing caveat about how this answer was produced — that the vocabulary listed is the
+   * offline sample, that the live vocabulary could not be reached, or that nothing matched. Absent
+   * when the live resolution answered normally.
+   */
+  notice?: string;
 };
 
 export class TaxonomyService {
-  /** Return tags for a given facet, optionally filtered by a substring search term. */
-  search(facet: Facet, search: string | undefined, limit: number): TaxonomySearchResult {
-    const all = TAXONOMY[facet];
-    const filtered =
-      search && search.trim().length > 0
-        ? all.filter(
-            (t) =>
-              t.id.toLowerCase().includes(search.toLowerCase()) ||
-              t.name.toLowerCase().includes(search.toLowerCase()),
-          )
-        : all;
+  constructor(private readonly off: OpenFoodFactsService) {}
+
+  /**
+   * Resolve tags for a facet. With a search term, the live Open Food Facts vocabulary is queried
+   * and its suggestions merged behind the embedded matches; without one, the embedded sample is
+   * listed, because the upstream endpoint suggests against a term and cannot enumerate a facet.
+   */
+  async search(
+    facet: Facet,
+    search: string | undefined,
+    limit: number,
+    ctx: Context,
+  ): Promise<TaxonomySearchResult> {
+    const embedded = TAXONOMY[facet];
+    const term = search?.trim();
+    const taxonomyName = LIVE_TAXONOMY_NAME[facet];
+
+    if (!taxonomyName) {
+      const matched = term ? embedded.filter((entry) => matchesTerm(entry, term)) : embedded;
+      return {
+        facet,
+        tags: matched.slice(0, limit),
+        total_in_facet: embedded.length,
+        matched_in_facet: matched.length,
+      };
+    }
+
+    if (!term) {
+      return {
+        facet,
+        tags: embedded.slice(0, limit),
+        matched_in_facet: embedded.length,
+        notice:
+          `This is this server's offline ${facet} sample (${embedded.length} entries), not the Open Food Facts ` +
+          `${facet} taxonomy, which is far larger and cannot be listed in full — pass a search term to resolve ` +
+          'one against the live vocabulary.',
+      };
+    }
+
+    const offline = embedded.filter((entry) => matchesTerm(entry, term));
+
+    /**
+     * The live call is the enrichment, not the answer of record: a caller asking for `en:organic`
+     * during an Open Food Facts outage is better served by the offline match plus a caveat than by
+     * a failure, and a caller whose term matches nothing offline needs to be told the vocabulary
+     * went unchecked rather than reading an empty list as "no such tag". Both are the failure this
+     * degradation exists to prevent, so the throw is absorbed here and reported in `notice`.
+     */
+    let live: TaxonomyEntry[];
+    try {
+      // One past the limit, so a full page can be told apart from an exactly-full one and reported
+      // as truncated. The endpoint offers no offset, so this is the only way to know more exist.
+      live = await this.off.suggestTaxonomy(taxonomyName, term, limit + 1, ctx);
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      ctx.log.warning('Live taxonomy resolution failed — falling back to the offline sample', {
+        facet,
+        term,
+        error: cause,
+      });
+      return {
+        facet,
+        tags: offline.slice(0, limit),
+        matched_in_facet: offline.length,
+        notice:
+          `The live Open Food Facts ${facet} vocabulary could not be reached ` +
+          `(${cause}). These ${offline.length} result(s) come ` +
+          `from this server's offline sample of ${embedded.length} entries, so a term the sample does not ` +
+          'cover reads as no match here even when the tag exists upstream. Retry for an authoritative answer.',
+      };
+    }
+
+    /**
+     * Held to the same substring rule the facet documents. Upstream matches whole words against
+     * display names and falls back to loosely-related suggestions when nothing matches — an
+     * E-number query returns a page of unrelated E-numbers — so unfiltered pass-through would
+     * answer `e330` with tags that do not contain it. Measured across ordinary terms (cheese,
+     * kombucha, olive oil, organic, tofu, …) this drops nothing and removes only that noise.
+     */
+    const seen = new Set(offline.map((entry) => entry.id));
+    const merged = [...offline];
+    for (const entry of live) {
+      if (!seen.has(entry.id) && matchesTerm(entry, term)) {
+        seen.add(entry.id);
+        merged.push(entry);
+      }
+    }
 
     return {
       facet,
-      tags: filtered.slice(0, limit),
-      total_in_facet: all.length,
-      matched_in_facet: filtered.length,
+      tags: merged.slice(0, limit),
+      matched_in_facet: merged.length,
+      ...(merged.length === 0 && {
+        notice:
+          `No ${facet} tag matched "${term}" in the Open Food Facts vocabulary. Matching is on whole words in ` +
+          'the tag name, so try a single simpler word (e.g. "hummus" rather than "hummus dip"); note also that ' +
+          'many category tags are plural upstream ("kombucha" resolves to en:kombuchas).',
+      }),
     };
   }
 }
@@ -311,7 +440,7 @@ export class TaxonomyService {
 let _service: TaxonomyService | undefined;
 
 export function initTaxonomyService(): void {
-  _service = new TaxonomyService();
+  _service = new TaxonomyService(getOpenFoodFactsService());
 }
 
 export function getTaxonomyService(): TaxonomyService {

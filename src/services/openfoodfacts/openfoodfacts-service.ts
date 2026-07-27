@@ -11,6 +11,7 @@ import type { RequestContext, RequestContextLike } from '@cyanheads/mcp-ts-core/
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import type {
+  RawAutocompleteResponse,
   RawProduct,
   RawProductResponse,
   RawSearchResponse,
@@ -224,8 +225,16 @@ const SEARCH_FIELDS =
 /**
  * Text search endpoint — search.openfoodfacts.org uses Elasticsearch and actually filters by the
  * query text. The /api/v2/search endpoint silently ignores search_terms and returns all products.
+ * The same host serves the taxonomy autocomplete used to resolve tag IDs.
  */
 const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
+
+/**
+ * Largest `size` the autocomplete endpoint honors. Live-verified: it returns exactly the requested
+ * option count up to 200 and caps below the request above that (500 answered 249), so a request is
+ * clamped here rather than sent and silently under-served.
+ */
+const MAX_AUTOCOMPLETE_SIZE = 200;
 
 /**
  * Reserved characters in search-a-licious's Lucene-style `q` syntax (field:value clauses, boolean
@@ -291,11 +300,16 @@ export class OpenFoodFactsService {
   private readonly baseUrl: string;
   private readonly productLimiter: RateLimiter;
   private readonly searchLimiter: RateLimiter;
+  private readonly taxonomyLimiter: RateLimiter;
 
   constructor(config: ServerConfig) {
     this.baseUrl = config.baseUrl;
     this.productLimiter = new RateLimiter(config.rateLimitProduct);
     this.searchLimiter = new RateLimiter(config.rateLimitSearch);
+    // Taxonomy resolution gets its own budget rather than sharing the search one: browsing the
+    // vocabulary to build a filter would otherwise spend the budget for the search that filter is
+    // for, and the two are answered by different endpoints with different costs upstream.
+    this.taxonomyLimiter = new RateLimiter(config.rateLimitTaxonomy);
   }
 
   /**
@@ -537,6 +551,57 @@ export class OpenFoodFactsService {
         operation: 'OFF:searchProductsByTags',
         context: ctx as RequestContextLike,
         baseDelayMs: 1_000,
+        signal: ctx.signal,
+      },
+    );
+  }
+
+  /**
+   * Resolve a term against a live Open Food Facts taxonomy through the search-a-licious
+   * autocomplete endpoint, returning its suggestions in upstream order. Ranking, filtering, and
+   * what to do when the call fails are the caller's to decide — this method only fetches.
+   *
+   * `size` caps the options returned and is the endpoint's only paging knob: it accepts no offset
+   * or cursor, and passing one is ignored rather than rejected, so there is no way to reach past
+   * the first `size` suggestions. The endpoint is a suggester over display names, not an
+   * enumerator — it reports no match total and answers an empty list for an empty term.
+   */
+  async suggestTaxonomy(
+    taxonomyName: string,
+    term: string,
+    size: number,
+    ctx: Context,
+  ): Promise<{ id: string; name: string }[]> {
+    this.taxonomyLimiter.check('taxonomy', ctx);
+
+    return await withRetry(
+      async () => {
+        const url = new URL(`${TEXT_SEARCH_BASE_URL}/autocomplete`);
+        url.searchParams.set('q', term);
+        url.searchParams.set('taxonomy_names', taxonomyName);
+        url.searchParams.set('size', String(Math.min(size, MAX_AUTOCOMPLETE_SIZE)));
+
+        ctx.log.debug('Resolving taxonomy term', { taxonomyName, term, url: url.toString() });
+
+        const data = await parseJsonBody<RawAutocompleteResponse>(
+          await this.fetchSearch(url.toString(), ctx, 'OFF:suggestTaxonomy', {
+            taxonomy_name: taxonomyName,
+            term,
+          }),
+          ctx,
+          { taxonomy_name: taxonomyName, term },
+        );
+
+        // An option missing either half is unusable as a filter value or a display name, so it is
+        // dropped rather than passed on with an invented placeholder.
+        return (data.options ?? []).flatMap((option) =>
+          option.id && option.text ? [{ id: option.id, name: option.text }] : [],
+        );
+      },
+      {
+        operation: `OFF:suggestTaxonomy:${taxonomyName}`,
+        context: ctx as RequestContextLike,
+        baseDelayMs: 500,
         signal: ctx.signal,
       },
     );

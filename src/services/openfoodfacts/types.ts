@@ -101,6 +101,27 @@ export type RawTextSearchHit = {
 };
 
 /**
+ * One suggestion from GET https://search.openfoodfacts.org/autocomplete — the live taxonomy
+ * resolver. `id` is the canonical tag ID (`en:hummus`) and `text` its display name; `taxonomy_name`
+ * echoes which vocabulary the suggestion came from, which matters only when several are requested
+ * at once. Typed optional per this file's convention that no upstream field is assumed present.
+ */
+export type RawTaxonomyOption = {
+  id?: string;
+  text?: string;
+  taxonomy_name?: string;
+};
+
+/**
+ * Response envelope from GET https://search.openfoodfacts.org/autocomplete. The endpoint is a
+ * suggester, not an enumerator: it reports no match total, accepts no offset or cursor, and answers
+ * HTTP 200 with an empty `options` list for an empty query or an unknown taxonomy name.
+ */
+export type RawAutocompleteResponse = {
+  options?: RawTaxonomyOption[];
+};
+
+/**
  * Search parameters shared by both search backends. A `query` (with or without tag filters) routes
  * to search.openfoodfacts.org, where any tag filters are folded into the Lucene `q`; tag filters
  * with no query route to /api/v2/search. `sort_by` applies only on the /api/v2/search path.

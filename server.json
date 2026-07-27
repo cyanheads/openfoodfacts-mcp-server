@@ -53,6 +53,13 @@
           "default": "10"
         },
         {
+          "name": "OFF_RATE_LIMIT_TAXONOMY",
+          "description": "Taxonomy resolution rate limit (requests/min). Applies to the live tag-vocabulary lookups off_browse_taxonomy makes; a spent budget falls back to the offline sample rather than failing.",
+          "format": "string",
+          "isRequired": false,
+          "default": "10"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -98,6 +105,13 @@
         {
           "name": "OFF_RATE_LIMIT_SEARCH",
           "description": "Search rate limit (requests/min).",
+          "format": "string",
+          "isRequired": false,
+          "default": "10"
+        },
+        {
+          "name": "OFF_RATE_LIMIT_TAXONOMY",
+          "description": "Taxonomy resolution rate limit (requests/min). Applies to the live tag-vocabulary lookups off_browse_taxonomy makes; a spent budget falls back to the offline sample rather than failing.",
           "format": "string",
           "isRequired": false,
           "default": "10"

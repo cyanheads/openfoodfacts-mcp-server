@@ -23,6 +23,12 @@ const ServerConfigSchema = z.object({
     .min(1)
     .default(10)
     .describe('Search rate limit (requests/min)'),
+  rateLimitTaxonomy: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .default(10)
+    .describe('Taxonomy resolution rate limit (requests/min)'),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -35,6 +41,7 @@ export function getServerConfig(): ServerConfig {
     baseUrl: 'OFF_BASE_URL',
     rateLimitProduct: 'OFF_RATE_LIMIT_PRODUCT',
     rateLimitSearch: 'OFF_RATE_LIMIT_SEARCH',
+    rateLimitTaxonomy: 'OFF_RATE_LIMIT_TAXONOMY',
   });
   return _config;
 }
