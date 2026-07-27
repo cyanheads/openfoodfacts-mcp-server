@@ -36,7 +36,7 @@ Four tools for working with [Open Food Facts](https://world.openfoodfacts.org/) 
 | `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, allergens, additives, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, and data completeness. |
 | `off_search_products` | Search by text query and/or structured tag filters (category, brand, label, allergen, additive, Nutri-Score grade, NOVA group, country). Returns summary rows with barcodes for follow-up lookups. |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy, macros, salt, Nutri-Score, NOVA, and Green-Score. |
-| `off_browse_taxonomy` | Browse and search the canonical tag vocabulary (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) for use as filter values in `off_search_products`. |
+| `off_browse_taxonomy` | Resolve a human term to the canonical tag ID (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) that `off_search_products` filters on, against the live Open Food Facts taxonomy. |
 
 ### `off_get_product`
 
@@ -82,13 +82,16 @@ Side-by-side nutrition and scoring comparison for 2–10 barcodes.
 
 ### `off_browse_taxonomy`
 
-Browse the canonical Open Food Facts tag vocabulary before building `off_search_products` filters.
+Resolve a human term to the canonical Open Food Facts tag ID before building `off_search_products` filters.
 
 - Facets: `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`
-- Optional `search` parameter: case-insensitive substring match against tag ID or display name (e.g., `"gluten"` → `en:gluten`, `en:no-gluten`, `en:no-added-gluten`)
-- Taxonomy is served from a curated in-process vocabulary — no live network call, so lookups are instant and offline
-- The categories facet is broad — pass a `search` term to narrow it to the relevant tags
-- `limit` controls results returned (1–100, default 20)
+- With a `search` term, the five open facets resolve against the live Open Food Facts taxonomy — tens of thousands of category tags, not a fixed local list. Matching is case-insensitive substring against tag ID or display name (e.g., `"gluten"` → `en:no-gluten`, `en:gluten-free`)
+- Upstream tags are often plural (`"kombucha"` → `en:kombuchas`) — pass the returned `id` through unchanged rather than constructing one
+- `nova_groups` and `nutrition_grades` are closed vocabularies answered offline and returned complete. Their IDs are bare (`1`–`4`, `a`–`e`), matching what `off_search_products` accepts
+- Live results are merged behind an in-process sample that also serves offline operation. If Open Food Facts is unreachable or the taxonomy budget is spent, the tool answers from that sample and says so rather than failing — an empty result is never presented as an authoritative "no such tag"
+- Omitting `search` lists only the offline sample. The upstream taxonomy endpoint suggests against a term and cannot enumerate a facet, so an unfiltered call is not a view of the full vocabulary and reports no facet total
+- `limit` controls results returned (1–100, default 20). There is no offset or page input — the upstream endpoint offers no cursor, so narrow the term instead
+- Taxonomy lookups carry their own ~10 requests/min client-side budget, separate from the search budget
 
 ---
 
@@ -106,10 +109,10 @@ Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp
 Open Food Facts-specific:
 
 - No API key required — the identifying `User-Agent` header (required by OFF terms) is baked into the service layer
-- Token-bucket rate limiting per endpoint class: product reads (~100/min), search (~10/min). A local refusal says so — it never reports itself as an Open Food Facts rate limit
+- Token-bucket rate limiting per endpoint class: product reads (~100/min), search (~10/min), taxonomy resolution (~10/min). A local refusal says so — it never reports itself as an Open Food Facts rate limit
 - Automatic retry (3 attempts, 500ms base) for transient failures only — 5xx, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. A 4xx is never retried; the upstream's own explanation is surfaced instead
 - Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — the `_100g` and `_serving` variants of every nutrient on the record, with the macros as named fields and the rest in an open map that carries each nutrient's own unit (micronutrients are reported in grams, so calcium `0.071` is 71 mg)
-- Embedded tag taxonomy for `off_browse_taxonomy` — curated 200+ category subset, full allergen/label/additive vocabularies
+- Live tag resolution for `off_browse_taxonomy` against the Open Food Facts taxonomy, merged behind a small in-process sample that covers offline operation and is authoritative for E-number lookups, which the upstream suggester answers poorly
 
 Agent-friendly output:
 
@@ -240,6 +243,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OFF_BASE_URL` | Open Food Facts API base URL. Override for local testing against a mock server. | `https://world.openfoodfacts.org` |
 | `OFF_RATE_LIMIT_PRODUCT` | Product read rate limit (requests/min). | `100` |
 | `OFF_RATE_LIMIT_SEARCH` | Search rate limit (requests/min). | `10` |
+| `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy resolution rate limit (requests/min). A spent budget falls back to the offline sample rather than failing. | `10` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
@@ -292,7 +296,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/services/openfoodfacts` | Open Food Facts API client — HTTP, rate limiting, retry, field normalization. |
-| `src/services/taxonomy` | Embedded tag vocabulary service for `off_browse_taxonomy`. |
+| `src/services/taxonomy` | Tag vocabulary service for `off_browse_taxonomy` — live resolution, offline sample, merge and fallback policy. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide

@@ -9,7 +9,7 @@
 | `off_get_product` | Fetch a product by barcode (EAN-13/UPC). Returns name, brands, quantity, ingredients (raw text + parsed list), allergens, additives, Nutri-Score, NOVA group, Green-Score, nutriments per 100g and per serving, categories, labels, packaging, origins, image URL, and completeness signal. Missing fields mean "not yet entered in the database" — not that the attribute is absent from the real product. | `barcode` (string, required), `fields` (optional field subset) | `readOnlyHint: true` |
 | `off_search_products` | Search by keyword and/or structured tag filters. Returns summary rows with barcodes for follow-up lookups. Use when the barcode is unknown or to explore a category. Filters use canonical tag IDs (e.g. `en:organic`, `en:gluten-free`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. | `query` (text search), `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, `sort_by`, `page`, `page_size` | `readOnlyHint: true` |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 barcodes. Returns a normalized table of calories, fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA, and Green-Score. Designed for "which of these cereals is healthiest?" workflows. | `barcodes` (array of 2–10 EAN/UPC strings) | `readOnlyHint: true` |
-| `off_browse_taxonomy` | Look up canonical tag IDs for the common filter vocabularies: categories, labels, allergens, additives, countries, nova groups, nutrition grades. Returns a curated list of tag IDs and their display names for a given facet, optionally filtered by a search term. Use before `off_search_products` to build precise filter values. | `facet` (enum), `search` (optional filter term), `limit` | `readOnlyHint: true`, `openWorldHint: false` |
+| `off_browse_taxonomy` | Resolve a human term to the canonical tag ID for a filter facet: categories, labels, allergens, additives, countries, nova groups, nutrition grades. A search term resolves against the live Open Food Facts taxonomy, merged behind an in-process sample; omitting it lists that sample, which is all the upstream suggester can support. Use before `off_search_products` to build precise filter values. | `facet` (enum), `search` (optional term), `limit` | `readOnlyHint: true`, `openWorldHint: true` |
 
 ### Resources
 
@@ -35,7 +35,7 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 
 - No API key. Mandatory identifying `User-Agent` header: `openfoodfacts-mcp-server/<version> (casey@caseyjhand.com)` — baked into the service layer, not per-call.
 - Read-only — no write-back of product edits.
-- Per-endpoint rate limits: product reads ~100/min, search ~10/min. Rate limiting enforced in service layer.
+- Per-endpoint rate limits: product reads ~100/min, search ~10/min, taxonomy resolution ~10/min. Rate limiting enforced in service layer, one token bucket per class.
 - Field selection mandatory on every request — the product object is ~200 keys; always scope `fields=`.
 - Tag vocabulary, not free text — search filters use canonical tag IDs (`en:organic`, `en:gluten-free`).
 - Missing fields signal incomplete crowd-sourced data, not product attribute absence — surface this distinction explicitly in tool descriptions and output.
@@ -130,7 +130,22 @@ Separate backend (search-a-licious over Elasticsearch), reached whenever a reque
 
 ### Taxonomy endpoints
 
-`/labels.json`, `/categories.json`, `/facets/categories.json` — return HTTP 503 for anonymous bot requests (rate-limited, requires registered session). **Not usable.** Taxonomy for `off_browse_taxonomy` is implemented as an embedded curated vocabulary in the service layer using known canonical tag patterns, not via live taxonomy endpoint calls.
+`/labels.json`, `/categories.json`, `/facets/categories.json` on `world.openfoodfacts.org` return HTTP 503 for anonymous bot requests (rate-limited, requires registered session) — **not usable**. Two other surfaces are, both live-probed with this server's identifying User-Agent:
+
+**Autocomplete (`https://search.openfoodfacts.org/autocomplete`)** — the resolver `off_browse_taxonomy` uses.
+
+```
+GET /autocomplete?q=hummus&taxonomy_names=category&size=10
+{"took":1,"timed_out":false,"options":[{"id":"en:hummus","text":"Hummus","taxonomy_name":"category"}]}
+```
+
+- `taxonomy_names` accepts `category`, `label`, `allergen`, `additive`, `country`, `brand`, comma-separated. There is no `nova_group` or `nutrition_grade` taxonomy; naming one answers HTTP 200 with an empty `options` list, as does an unknown name or an empty `q`.
+- `size` caps the option count. Live-verified honored exactly up to 200; 500 answered 249. It is the **only** paging knob — `offset`, `from`, and `page` are accepted and silently ignored, all returning the same first page, so there is no way to reach past the first `size` suggestions.
+- No match total is reported. The endpoint is a suggester, not an enumerator: it cannot list a facet and cannot say how many tags matched.
+- Matching is against **display names**, not tag IDs, and falls back to loosely-related suggestions when nothing matches well. Ordinary words resolve cleanly (`hummus`→`en:hummus`, `tofu`→`en:tofu`, `gluten`→`en:no-gluten`), and note that category tags are frequently plural upstream: `kombucha` resolves to `en:kombuchas`, not `en:kombucha`. E-numbers do **not** resolve — `e322`, `e100`, and `e330` each return a page of unrelated E-numbers not containing the queried one.
+- Upstream `took` is 1–3 ms; wall-clock round trip from a US client is ~0.5–0.8 s.
+
+**Static dumps (`https://static.openfoodfacts.org/data/taxonomies/{categories,labels,allergens,additives,countries}.json`)** — HTTP 200, ~7.4 MB combined (4.6 MB / 1.2 MB / 10 KB / 906 KB / 722 KB). Not used: the payload would ship inside the npm package and the `.mcpb` bundle, needs build-time refresh tooling, and goes stale between releases. Entry counts, for scale against the in-process sample: categories 14,552 (sample 79), labels 3,037 (30), additives 683 (44), countries 268 (30), allergens 27 (27, at parity). Entries carry parent/child hierarchy and per-language names but no product count, so the tool's `products` output field stays empty under either backend.
 
 ---
 
@@ -422,7 +437,7 @@ No DataCanvas spill: a batch caps at 10 products, which is too small to warrant 
 
 ### `off_browse_taxonomy`
 
-**Description:** Browse and search the canonical tag vocabulary for Open Food Facts filter facets. Returns tag IDs and display names for use as filter values in `off_search_products`. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Tag IDs use the `en:` prefix convention (e.g. `en:organic`, `en:gluten-free`, `en:milk`).
+**Description:** Resolve a human term to the canonical Open Food Facts tag ID that `off_search_products` filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. A search term resolves against the live Open Food Facts taxonomy; omitting it lists only the in-process sample. Most tag IDs use the `en:` prefix (`en:organic`, `en:gluten-free`, `en:milk`); NOVA groups return bare `1`–`4` and Nutri-Score grades bare `a`–`e`.
 
 **Input schema:**
 
@@ -431,11 +446,11 @@ z.object({
   facet: z.enum([
     'categories', 'labels', 'allergens', 'additives', 'countries',
     'nova_groups', 'nutrition_grades',
-  ]).describe('Which vocabulary to browse. "categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" return the complete fixed vocabularies.'),
+  ]).describe('Which vocabulary to resolve against. "categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" are closed vocabularies answered offline and returned complete; the other five resolve against the live taxonomy.'),
   search: z.string().optional()
-    .describe('Filter term — case-insensitive substring match against tag ID or display name. Example: "gluten" returns en:gluten, en:no-gluten, en:no-added-gluten. Omit to list all entries for the facet (may be large for categories).'),
+    .describe('Term to resolve. Matched case-insensitively as a substring of the tag ID or display name, against both the live vocabulary and the offline sample. A single word works best ("hummus", not "hummus dip"). Omit only to see the offline sample.'),
   limit: z.number().int().min(1).max(100).default(20)
-    .describe('Maximum entries to return (1–100, default 20). The categories facet is broad; a search term narrows it to the relevant tags.'),
+    .describe('Maximum entries to return (1–100, default 20). No offset or page input — the upstream endpoint offers no cursor.'),
 })
 ```
 
@@ -443,17 +458,24 @@ z.object({
 
 ```ts
 z.object({
-  facet: z.string().describe('The facet that was browsed.'),
+  facet: z.string().describe('The facet that was queried.'),
   tags: z.array(z.object({
-    id: z.string().describe('Canonical tag ID (e.g. "en:organic"). Use this value in off_search_products filter parameters.'),
+    id: z.string().describe('Canonical tag ID (e.g. "en:organic"; bare "1"–"4" for NOVA groups, bare "a"–"e" for Nutri-Score grades). Pass through to off_search_products unchanged.'),
     name: z.string().describe('Human-readable display name (e.g. "Organic").'),
     products: z.number().optional().describe('Approximate count of products with this tag. Not available for all facets.'),
   })).describe('Matching tag entries.'),
-  total_in_facet: z.number().optional().describe('Total entries in this facet before search filtering. Large for categories (~200K).'),
+  total_in_facet: z.number().optional().describe('Total entries in this facet. Present only for nova_groups and nutrition_grades; the live facets have no knowable total.'),
 })
+
+enrichment: {
+  notice: z.string().optional().describe('Caveat about how the answer was produced — offline sample, unreachable live vocabulary, or no match.'),
+  truncated: z.boolean().optional(),
+  shown: z.number().optional(),
+  cap: z.number().optional(),
+}
 ```
 
-**Errors:** No domain failures — taxonomy is embedded. Invalid `facet` value is caught by Zod enum validation.
+**Errors:** No domain failures. Invalid `facet` is caught by Zod enum validation, and a live-resolution failure degrades to the offline sample with a `notice` naming the cause instead of aborting the call — see the design decision below for why no reason is declared.
 
 ---
 
@@ -462,7 +484,7 @@ z.object({
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
 | `openfoodfacts-service` | Open Food Facts API v2 (`world.openfoodfacts.org`) | `off_get_product`, `off_search_products`, `off_compare_products` |
-| `taxonomy-service` | Embedded curated vocabulary (no live API) | `off_browse_taxonomy` |
+| `taxonomy-service` | Live taxonomy autocomplete (via `openfoodfacts-service`) merged with an embedded sample | `off_browse_taxonomy` |
 
 ### `openfoodfacts-service`
 
@@ -480,7 +502,14 @@ z.object({
 
 ### `taxonomy-service`
 
-Embedded static JSON mapping `facet → [{id, name, products?}]` for the major OFF vocabularies. Categories uses a curated subset (~200 most-common tags) — not an exhaustive live dump. Labels, allergens, additives use substantially complete sets from the OFF taxonomy files. Filtered by substring match in the service layer. No network calls; `openWorldHint: false` is correct.
+Owns resolution policy for `off_browse_taxonomy`; transport lives in `openfoodfacts-service.suggestTaxonomy()`, which carries the same `fetchWithTimeout` / `withRetry` / contract-error plumbing as the product and search paths plus its own rate-limit tier.
+
+- **Facet routing.** `categories`, `labels`, `allergens`, `additives`, `countries` map to the upstream `category`/`label`/`allergen`/`additive`/`country` taxonomies. `nova_groups` and `nutrition_grades` have no upstream counterpart and are closed vocabularies, so they are answered entirely from the embedded map and are the only facets that report `total_in_facet`.
+- **Embedded sample.** A static `facet → [{id, name}]` map: 79 categories, 30 labels, 27 allergens, 44 additives, 30 countries, 4 NOVA groups, 5 Nutri-Score grades. For the five live facets this is a small slice (categories is 79 against 14,552 upstream), used for unfiltered listing, offline fallback, and as the first-ranked half of a merge.
+- **With a search term.** The embedded matches and the live suggestions are merged, embedded first, deduplicated by tag ID, then capped at `limit`. Upstream is asked for `limit + 1` so a full page can be distinguished from an exactly-full one and reported as truncated — the endpoint has no offset, so that is the only available signal that more exist.
+- **Live suggestions are held to the facet's documented substring rule.** Upstream matches display names and degrades to loosely-related suggestions rather than returning nothing, so unfiltered pass-through would answer `e330` with E-numbers that do not contain it. Applying the same `id`/`name` substring predicate used for the embedded half drops that noise; measured across ordinary terms (cheese, kombucha, olive oil, organic, tofu, yoghurt, …) it drops nothing else.
+- **Without a search term.** The embedded sample only, plus a `notice` saying so. The upstream endpoint suggests against a term and answers an empty list for an empty query — it cannot enumerate a facet.
+- **On failure.** The throw is absorbed and the offline matches returned with a `notice` naming the cause. `openWorldHint: true`.
 
 ---
 
@@ -491,6 +520,7 @@ Embedded static JSON mapping `facet → [{id, name, products?}]` for the major O
 | `OFF_BASE_URL` | No | Base URL override. Default: `https://world.openfoodfacts.org`. Useful for testing against a mock server. |
 | `OFF_RATE_LIMIT_PRODUCT` | No | Product read rate limit (requests/min). Default: `100`. |
 | `OFF_RATE_LIMIT_SEARCH` | No | Search rate limit (requests/min). Default: `10`. |
+| `OFF_RATE_LIMIT_TAXONOMY` | No | Taxonomy resolution rate limit (requests/min). Default: `10`. A spent budget falls back to the offline sample rather than failing. |
 
 No API key. The identifying User-Agent is derived in the service layer from `package.json` name/version and a static contact address.
 
@@ -498,9 +528,9 @@ No API key. The identifying User-Agent is derived in the service layer from `pac
 
 ## Implementation Order
 
-1. **Config** — `src/config/server-config.ts` with `OFF_BASE_URL`, `OFF_RATE_LIMIT_PRODUCT`, `OFF_RATE_LIMIT_SEARCH`.
-2. **Taxonomy service** — `src/services/taxonomy/taxonomy-service.ts` + embedded vocabulary JSON. No network. Implement first because it has no deps and provides the vocabulary needed to validate design decisions.
-3. **OpenFoodFacts service** — `src/services/openfoodfacts/openfoodfacts-service.ts` with `getProduct()` and `searchProducts()`. Validate against real API.
+1. **Config** — `src/config/server-config.ts` with `OFF_BASE_URL`, `OFF_RATE_LIMIT_PRODUCT`, `OFF_RATE_LIMIT_SEARCH`, `OFF_RATE_LIMIT_TAXONOMY`.
+2. **OpenFoodFacts service** — `src/services/openfoodfacts/openfoodfacts-service.ts` with `getProduct()`, `searchProducts()`, and `suggestTaxonomy()`. Validate against real API. Implement before the taxonomy service, which depends on it for transport.
+3. **Taxonomy service** — `src/services/taxonomy/taxonomy-service.ts` + the embedded sample. Merge, fallback, and facet-routing policy over `suggestTaxonomy()`.
 4. **`off_get_product`** — primary tool, single-product lookup with field normalization.
 5. **`off_search_products`** — search with composed tag filters.
 6. **`off_compare_products`** — parallel fetch + normalization + per-barcode failure reporting.
@@ -517,7 +547,17 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 
 **No prompts.** The domain is data retrieval; no recurring analysis frameworks benefit from a prompt template.
 
-**Taxonomy is embedded, not live.** The OFF taxonomy API (`/labels.json`, `/categories.json`) returns 503 for anonymous bot clients at current traffic levels. Embedding a curated vocabulary is the only reliable path. The tradeoff is that very new tags won't appear, but the 200 most-used category tags, all 14 major allergens, and the full label/certification vocabulary are stable.
+**Taxonomy resolution is live, with the embedded sample kept as a merge partner rather than replaced.** The `world.openfoodfacts.org` taxonomy endpoints do return 503 to anonymous bots, but `search.openfoodfacts.org/autocomplete` does not, and the embedded-only design it justified had made the tool's advertised purpose unreachable: the sample holds 79 categories against 14,552 upstream, so ordinary foods (hummus, tofu, kombucha, pizzas) answered "no matching tags" for tags that filter thousands of products. Live resolution over a static mirror because a mirror puts ~7.4 MB into the npm package and `.mcpb` bundle, needs build-time refresh tooling, and goes stale between releases, while a suggestion costs about a kilobyte and always reflects the current vocabulary.
+
+The sample stays because live-only would regress two cases it answers correctly. The upstream suggester matches display names and returns loosely-related suggestions instead of nothing, so `e322` comes back as a page of unrelated E-numbers while the sample resolves it exactly; and an Open Food Facts outage would turn a working `en:organic` lookup into a failure. Merging embedded-first, deduplicated, keeps both, and holding live suggestions to the same substring rule the facet documents drops the suggester's noise without dropping real matches.
+
+**A failed live lookup degrades with a notice instead of raising a declared failure.** No `errors[]` contract is declared for this tool, because none of its reasons could fire: the throw from `suggestTaxonomy()` is absorbed in the taxonomy service and reported through `enrichment.notice`. Declaring a reason the handler cannot return advertises a state callers would branch on and never reach — the same argument that removed the `found` flag from `off_get_product`. The degradation is not silent: the notice reaches `structuredContent` and `content[]` alike, names the cause, and says the offline sample may not cover a tag that exists upstream, so an empty result is never read as an authoritative "no such tag". This is the specific failure the tool had, and returning nothing with a raised error would reintroduce it for the callers the sample can still serve.
+
+**`total_in_facet` is reported only for the closed vocabularies.** The autocomplete endpoint reports no match total and cannot be enumerated, so the live facets have no knowable total; the field is omitted rather than filled with the sample size. Returning `79` for categories is what presented a local sample as the size of the Open Food Facts category vocabulary.
+
+**No offset or page input.** The endpoint's `size` caps the option count and is its only paging knob — `offset`, `from`, and `page` are accepted and silently ignored, all returning the same first page. An offset input would therefore have to be a lie or a client-side slice of one fetch; narrowing the term is the honest instruction, and `limit + 1` is requested so genuine truncation is still disclosed.
+
+**NOVA group and Nutri-Score tag IDs are bare, not `en:`-prefixed.** `off_browse_taxonomy` emitted `en:1`–`en:4` while `off_search_products.nova_group` accepts `"1"`–`"4"`, so passing the advertised ID back was a hard validation failure. Fixing it at the source rather than relaxing the enum: upstream tolerance is not uniform, and normalizing on input would have to land before `buildTextSearchQuery`. On the tag backend both forms return the same 136,019 matches, but on the text backend `nova_group:en:1` is live-verified answering zero hits flagged `is_count_exact: true` — a confident false "no products" rather than an error. Bare digits also match the bare grade letters `nutrition_grades` already emitted.
 
 **`off_compare_products` keeps partial results in output, not errors.** When 3 of 5 barcodes resolve and 2 are not found, the caller gets a comparison table for the 3 found products plus a `not_found` list. Throwing when any product is missing would break "compare this grocery basket" workflows where some products are regional or recent.
 
@@ -557,7 +597,8 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 ## Known Limitations
 
 - **Crowd-sourced completeness varies widely by region.** French and Western European products are well-covered; products from other regions may be sparse or missing entirely.
-- **Taxonomy endpoint unavailable to bots.** `/labels.json` and `/categories.json` return 503 for anonymous bot clients. `off_browse_taxonomy` uses embedded vocabulary.
+- **The live taxonomy cannot be listed or paged.** `search.openfoodfacts.org/autocomplete` suggests against a term: it reports no match total, has no offset or cursor, and answers an empty list for an empty query. So `off_browse_taxonomy` reports no `total_in_facet` for the five live facets, exposes no offset input, and answers an unfiltered call from the in-process sample rather than the full vocabulary. The `world.openfoodfacts.org` taxonomy endpoints (`/labels.json`, `/categories.json`) remain 503 for anonymous bots and are unused.
+- **E-numbers do not resolve upstream.** The autocomplete suggester matches display names, and `e322`/`e100`/`e330` each return a page of unrelated E-numbers. The `additives` facet therefore leans on the 44-entry in-process sample for exact E-number lookups; an E-number outside it will not resolve, though its chemical name (`lecithin`, `aspartame`, `curcumin`) will.
 - **Search rate limit is strict (10/min).** Agents running rapid multi-search workflows will hit this. Surface the rate limit in service-layer error messaging and backoff.
 - **Barcode collisions exist.** A small number of barcodes map to multiple regional product variants. OFF returns the most-contributed variant; the tool doesn't attempt disambiguation.
 - **Eco-Score/Green-Score is often "unknown".** Requires packaging material data, origins, and transport data — typically incomplete. The tool returns the value as-is.
@@ -573,6 +614,8 @@ Each step is independently testable via `bun run devcheck` + `bun run rebuild`.
 |:---------|:-------|:-----------|
 | `/api/v2/product/{barcode}.json?fields=…` | GET | ~100/min |
 | `/api/v2/search?fields=…&page=…&page_size=…&{filters}` | GET | ~10/min |
+| `search.openfoodfacts.org/search?q=…&fields=…&page=…&page_size=…` | GET | ~10/min (search budget) |
+| `search.openfoodfacts.org/autocomplete?q=…&taxonomy_names=…&size=…` | GET | ~10/min (taxonomy budget) |
 
 ### Field selection
 

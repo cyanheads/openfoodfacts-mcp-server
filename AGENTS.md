@@ -178,7 +178,7 @@ src/
       openfoodfacts-service.ts          # Open Food Facts API client (HTTP, rate limiting, retry)
       types.ts                          # Domain types
     taxonomy/
-      taxonomy-service.ts               # Embedded tag vocabulary (categories, labels, allergens, etc.)
+      taxonomy-service.ts               # Tag vocabulary — live resolution, offline sample, merge/fallback policy
   mcp-server/
     tools/definitions/
       get-product.tool.ts               # off_get_product
