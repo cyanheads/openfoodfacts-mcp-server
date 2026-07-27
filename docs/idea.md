@@ -7,7 +7,7 @@ Barcode-to-label for 3M+ food products worldwide via Open Food Facts — ingredi
 | **Status** | Pre-build design · scaffolded on `@cyanheads/mcp-ts-core@0.9.16` |
 | **Category** | external-data |
 | **Auth** | none (identifying User-Agent required) |
-| **API cost** | free, open data (ODbL); ~100 req/min product reads, ~10 req/min search |
+| **API cost** | free, open data (ODbL); 15 req/min/IP product reads, 10 req/min/IP search |
 | **Pattern** | deep single-source |
 | **Complexity** | low |
 | **Composes with** | `usda-mcp-server`, `openfda-mcp-server` |
@@ -59,7 +59,7 @@ Key fields: `product_name`, `brands`, `quantity`, `ingredients_text` + parsed `i
 - **Data is crowd-sourced** — completeness and accuracy vary. Surface completeness signals where present, and never imply a missing field means "absent from the product" — it means "not yet entered." Be explicit in tool descriptions.
 - **Computed scores carry caveats** — Nutri-Score, NOVA, Green-Score have regional formula versions and missing-data sensitivity. Return grade letters, not absolute truth.
 - **Identifying User-Agent is required** (`app-name/version (contact)`) — bake into the service layer. Read-only; no write-back of product edits.
-- **Per-endpoint rate limits** — product reads ~100/min, search ~10/min, facets ~2/min. Rate-limit search/facet paths more tightly than reads.
+- **Per-endpoint rate limits** — product reads ~15/min, search ~10/min, facets ~2/min. Rate-limit search/facet paths more tightly than reads.
 - DataCanvas fits large-category search and many-item comparison.
 
 ## Build Constraints

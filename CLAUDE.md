@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** openfoodfacts-mcp-server
-**Version:** 0.3.0
+**Version:** 0.3.1
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.0`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -79,7 +79,7 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
   baseUrl: z.string().default('https://world.openfoodfacts.org').describe('Open Food Facts API base URL'),
-  rateLimitProduct: z.coerce.number().int().min(1).default(100).describe('Product read rate limit (requests/min)'),
+  rateLimitProduct: z.coerce.number().int().min(1).default(15).describe('Product read rate limit (requests/min)'),
   rateLimitSearch: z.coerce.number().int().min(1).default(10).describe('Search rate limit (requests/min)'),
 });
 

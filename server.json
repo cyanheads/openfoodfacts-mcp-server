@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/openfoodfacts-mcp-server",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openfoodfacts-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -40,10 +40,10 @@
         },
         {
           "name": "OFF_RATE_LIMIT_PRODUCT",
-          "description": "Product read rate limit (requests/min).",
+          "description": "Product read rate limit (requests/min). Matches the 15 req/min/IP Open Food Facts documents for product reads.",
           "format": "string",
           "isRequired": false,
-          "default": "100"
+          "default": "15"
         },
         {
           "name": "OFF_RATE_LIMIT_SEARCH",
@@ -76,7 +76,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openfoodfacts-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -97,10 +97,10 @@
         },
         {
           "name": "OFF_RATE_LIMIT_PRODUCT",
-          "description": "Product read rate limit (requests/min).",
+          "description": "Product read rate limit (requests/min). Matches the 15 req/min/IP Open Food Facts documents for product reads.",
           "format": "string",
           "isRequired": false,
-          "default": "100"
+          "default": "15"
         },
         {
           "name": "OFF_RATE_LIMIT_SEARCH",

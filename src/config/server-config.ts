@@ -6,6 +6,18 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
+/**
+ * Rate-limit defaults sit at the per-IP ceilings Open Food Facts publishes, not above them: 15
+ * req/min for product reads (`GET /api/v2/product/…`) and 10 req/min for search
+ * (`GET /api/v2/search`). The documented consequence of exceeding either is an IP ban rather than a
+ * throttle, so there is no headroom to spend. A shared outbound IP needs a lower number than the
+ * published one — that is what the env vars are for, alongside operators running their own Product
+ * Opener instance who can raise them.
+ *
+ * The taxonomy tier is covered by neither published figure: it calls search.openfoodfacts.org
+ * (search-a-licious), a separate deployment the published limits do not name and for which no limit
+ * is documented. Its default matches the search tier as a conservative stand-in.
+ */
 const ServerConfigSchema = z.object({
   baseUrl: z
     .string()
@@ -15,7 +27,7 @@ const ServerConfigSchema = z.object({
     .number()
     .int()
     .min(1)
-    .default(100)
+    .default(15)
     .describe('Product read rate limit (requests/min)'),
   rateLimitSearch: z.coerce
     .number()

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -109,7 +109,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp
 Open Food Facts-specific:
 
 - No API key required — the identifying `User-Agent` header (required by OFF terms) is baked into the service layer
-- Token-bucket rate limiting per endpoint class: product reads (~100/min), search (~10/min), taxonomy resolution (~10/min). A local refusal says so — it never reports itself as an Open Food Facts rate limit
+- Token-bucket rate limiting per endpoint class: product reads (~15/min), search (~10/min), taxonomy resolution (~10/min). The product and search defaults are the per-IP ceilings Open Food Facts publishes; lower them on a shared outbound IP. A local refusal says so — it never reports itself as an Open Food Facts rate limit
 - Automatic retry (3 attempts, 500ms base) for transient failures only — 5xx, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. A 4xx is never retried; the upstream's own explanation is surfaced instead
 - Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — the `_100g` and `_serving` variants of every nutrient on the record, with the macros as named fields and the rest in an open map that carries each nutrient's own unit (micronutrients are reported in grams, so calcium `0.071` is 71 mg)
 - Live tag resolution for `off_browse_taxonomy` against the Open Food Facts taxonomy, merged behind a small in-process sample that covers offline operation and is authoritative for E-number lookups, which the upstream suggester answers poorly
@@ -241,7 +241,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | Variable | Description | Default |
 |:---------|:------------|:--------|
 | `OFF_BASE_URL` | Open Food Facts API base URL. Override for local testing against a mock server. | `https://world.openfoodfacts.org` |
-| `OFF_RATE_LIMIT_PRODUCT` | Product read rate limit (requests/min). | `100` |
+| `OFF_RATE_LIMIT_PRODUCT` | Product read rate limit (requests/min). Matches the 15 req/min/IP Open Food Facts documents for product reads. | `15` |
 | `OFF_RATE_LIMIT_SEARCH` | Search rate limit (requests/min). | `10` |
 | `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy resolution rate limit (requests/min). A spent budget falls back to the offline sample rather than failing. | `10` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |

@@ -35,7 +35,7 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 
 - No API key. Mandatory identifying `User-Agent` header: `openfoodfacts-mcp-server/<version> (casey@caseyjhand.com)` — baked into the service layer, not per-call.
 - Read-only — no write-back of product edits.
-- Per-endpoint rate limits: product reads ~100/min, search ~10/min, taxonomy resolution ~10/min. Rate limiting enforced in service layer, one token bucket per class.
+- Per-endpoint rate limits: product reads ~15/min, search ~10/min, taxonomy resolution ~10/min. Rate limiting enforced in service layer, one token bucket per class. The product and search figures are the per-IP ceilings Open Food Facts publishes; exceeding them is answered with an IP ban rather than a throttle, so the defaults sit at the published number and go lower — never higher — on a shared outbound IP.
 - Field selection mandatory on every request — the product object is ~200 keys; always scope `fields=`.
 - Tag vocabulary, not free text — search filters use canonical tag IDs (`en:organic`, `en:gluten-free`).
 - Missing fields signal incomplete crowd-sourced data, not product attribute absence — surface this distinction explicitly in tool descriptions and output.
@@ -494,7 +494,7 @@ enrichment: {
 - **Methods:**
   - `getProduct(barcode, fields)` → raw product object or `null` (status:0)
   - `searchProducts(params)` → `{count, count_is_exact, page, page_count, page_size, products[]}` (the `SearchResult` type — one shape from both backends)
-- **Rate limiting:** token bucket per endpoint class — product reads (100/min), search (10/min). A refusal is local, so it raises `rate_limited` (`RateLimited`) naming this server, not Open Food Facts, and carries the seconds until a slot frees.
+- **Rate limiting:** token bucket per endpoint class — product reads (15/min), search (10/min), taxonomy resolution (10/min). A refusal is local, so it raises `rate_limited` (`RateLimited`) naming this server, not Open Food Facts, and carries the seconds until a slot frees.
 - **Transport:** `fetchWithTimeout` at every call site, so HTTP status → error code, canonical `status`/`body` on `error.data`, `Retry-After` honoring, and distinct `Timeout` classification all come from the framework rather than a hand-rolled status ladder.
 - **Retry:** `withRetry` on the full fetch+parse pipeline. 3 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped code decides: 5xx, timeouts, and 429 retry; 4xx fails immediately.
 - **Parse failure:** HTML error pages (503 during high load) detected by content-type check → `upstream_error` (`ServiceUnavailable`, not `SerializationError`).
@@ -518,7 +518,7 @@ Owns resolution policy for `off_browse_taxonomy`; transport lives in `openfoodfa
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
 | `OFF_BASE_URL` | No | Base URL override. Default: `https://world.openfoodfacts.org`. Useful for testing against a mock server. |
-| `OFF_RATE_LIMIT_PRODUCT` | No | Product read rate limit (requests/min). Default: `100`. |
+| `OFF_RATE_LIMIT_PRODUCT` | No | Product read rate limit (requests/min). Default: `15`, the per-IP ceiling Open Food Facts documents for product reads. |
 | `OFF_RATE_LIMIT_SEARCH` | No | Search rate limit (requests/min). Default: `10`. |
 | `OFF_RATE_LIMIT_TAXONOMY` | No | Taxonomy resolution rate limit (requests/min). Default: `10`. A spent budget falls back to the offline sample rather than failing. |
 
@@ -610,12 +610,14 @@ The sample stays because live-only would regress two cases it answers correctly.
 
 ### Endpoints used
 
-| Endpoint | Method | Rate limit |
-|:---------|:-------|:-----------|
-| `/api/v2/product/{barcode}.json?fields=…` | GET | ~100/min |
+| Endpoint | Method | Local budget |
+|:---------|:-------|:-------------|
+| `/api/v2/product/{barcode}.json?fields=…` | GET | ~15/min |
 | `/api/v2/search?fields=…&page=…&page_size=…&{filters}` | GET | ~10/min |
 | `search.openfoodfacts.org/search?q=…&fields=…&page=…&page_size=…` | GET | ~10/min (search budget) |
 | `search.openfoodfacts.org/autocomplete?q=…&taxonomy_names=…&size=…` | GET | ~10/min (taxonomy budget) |
+
+Only the first two rows are governed by a published upstream limit. Open Food Facts documents 15 req/min/IP for `GET /api/v*/product` and 10 req/min/IP for `GET /api/v*/search`, both on `world.openfoodfacts.org`; the local budgets match. `search.openfoodfacts.org` is a separate deployment (search-a-licious) that the published limits do not name and for which no limit is documented, so its two rows are conservative local choices, not mirrors of an upstream figure. The text and tag search paths share one budget, so requests reaching the endpoint the documented 10/min covers stay within it regardless of how a query routes.
 
 ### Field selection
 
