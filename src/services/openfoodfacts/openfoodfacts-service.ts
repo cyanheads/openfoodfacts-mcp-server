@@ -7,8 +7,7 @@
 import { readFileSync } from 'node:fs';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError, rateLimited } from '@cyanheads/mcp-ts-core/errors';
-import type { RequestContext, RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import type {
   RawAutocompleteResponse,
@@ -149,20 +148,6 @@ async function parseJsonBody<T>(
     );
   }
   return JSON.parse(body) as T;
-}
-
-/**
- * Log bindings for the framework fetch helper. `RequestContext` is an open context bag and the
- * handler `Context` is not structurally assignable to it, so the correlation fields are projected
- * explicitly rather than cast through `unknown`.
- */
-function fetchLogContext(ctx: Context, operation: string): RequestContext {
-  return {
-    requestId: ctx.requestId,
-    tenantId: ctx.tenantId,
-    timestamp: new Date().toISOString(),
-    operation,
-  };
 }
 
 /**
@@ -328,7 +313,7 @@ export class OpenFoodFactsService {
       },
       {
         operation: `OFF:getProduct:${barcode}`,
-        context: ctx as RequestContextLike,
+        context: ctx,
         baseDelayMs: 500,
         signal: ctx.signal,
       },
@@ -354,7 +339,7 @@ export class OpenFoodFactsService {
       },
       {
         operation: `OFF:getProductFields:${barcode}`,
-        context: ctx as RequestContextLike,
+        context: ctx,
         baseDelayMs: 500,
         signal: ctx.signal,
       },
@@ -377,8 +362,12 @@ export class OpenFoodFactsService {
       response = await fetchWithTimeout(
         url,
         REQUEST_TIMEOUT_MS,
-        fetchLogContext(ctx, 'OFF:product'),
-        { signal: ctx.signal, headers: REQUEST_HEADERS, expectedStatuses: [404] },
+        withExtra(ctx, { upstreamOperation: 'OFF:product' }),
+        {
+          signal: ctx.signal,
+          headers: REQUEST_HEADERS,
+          expectedStatuses: [404],
+        },
       );
     } catch (error) {
       if (error instanceof McpError && error.code === JsonRpcErrorCode.NotFound) {
@@ -410,10 +399,15 @@ export class OpenFoodFactsService {
     data: Record<string, unknown>,
   ): Promise<Response> {
     try {
-      return await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchLogContext(ctx, operation), {
-        signal: ctx.signal,
-        headers: REQUEST_HEADERS,
-      });
+      return await fetchWithTimeout(
+        url,
+        REQUEST_TIMEOUT_MS,
+        withExtra(ctx, { upstreamOperation: operation }),
+        {
+          signal: ctx.signal,
+          headers: REQUEST_HEADERS,
+        },
+      );
     } catch (error) {
       throw toContractError(error, ctx, data);
     }
@@ -503,7 +497,7 @@ export class OpenFoodFactsService {
       },
       {
         operation: 'OFF:searchProductsByText',
-        context: ctx as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1_000,
         signal: ctx.signal,
       },
@@ -549,7 +543,7 @@ export class OpenFoodFactsService {
       },
       {
         operation: 'OFF:searchProductsByTags',
-        context: ctx as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1_000,
         signal: ctx.signal,
       },
@@ -600,7 +594,7 @@ export class OpenFoodFactsService {
       },
       {
         operation: `OFF:suggestTaxonomy:${taxonomyName}`,
-        context: ctx as RequestContextLike,
+        context: ctx,
         baseDelayMs: 500,
         signal: ctx.signal,
       },

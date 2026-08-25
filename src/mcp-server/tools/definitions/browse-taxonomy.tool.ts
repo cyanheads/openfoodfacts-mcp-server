@@ -9,7 +9,7 @@ import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-ser
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
   description:
-    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the live Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it lists only the offline sample this server ships, which is a small slice of every facet except NOVA groups and Nutri-Score grades. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:gluten-free", "en:milk"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural upstream ("kombucha" resolves to "en:kombuchas"), so use the returned id rather than constructing one.',
+    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it returns only a small reference list for each facet except NOVA groups and Nutri-Score grades, which are complete. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:gluten-free", "en:milk"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural ("kombucha" resolves to "en:kombuchas"), so use the returned id rather than constructing one.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -28,13 +28,13 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
         'nutrition_grades',
       ])
       .describe(
-        '"categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" are closed vocabularies answered offline and returned complete; the other five are resolved against the live Open Food Facts taxonomy.',
+        '"categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" are closed vocabularies returned complete; the other five are resolved against the Open Food Facts taxonomy.',
       ),
     search: z
       .string()
       .optional()
       .describe(
-        'Term to resolve. Matched case-insensitively as a substring of the tag ID or display name, against both the live Open Food Facts vocabulary and this server\'s offline sample. A single word works best ("hummus", not "hummus dip"). Omit only to see the offline sample — the live vocabulary cannot be listed without a term, so an unfiltered call is not a view of the full facet.',
+        'Term to resolve. Matched case-insensitively as a substring of the tag ID or display name. A single word works best ("hummus", not "hummus dip"). Omit only to see a small reference list — Open Food Facts cannot list the full vocabulary without a term, so an unfiltered call is not a view of the full facet.',
       ),
     limit: z
       .number()
@@ -43,7 +43,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .max(100)
       .default(20)
       .describe(
-        'Maximum entries to return (1–100, default 20). There is no offset or page input: the upstream taxonomy endpoint serves only the first `limit` matches for a term and offers no cursor, so narrow the search term rather than paging.',
+        'Maximum entries to return (1–100, default 20). There is no offset or page input: Open Food Facts returns only the first `limit` matches for a term and offers no cursor, so narrow the search term rather than paging.',
       ),
   }),
 
@@ -73,7 +73,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .number()
       .optional()
       .describe(
-        'Total entries in this facet. Present only for nova_groups and nutrition_grades, whose vocabularies are closed and complete here. Absent for the live facets: the Open Food Facts taxonomy endpoint reports no match total and cannot be enumerated, so no figure would be a real one.',
+        'Total entries in this facet. Present only for nova_groups and nutrition_grades, whose vocabularies are closed and complete. Absent for the other facets: Open Food Facts reports no match total and cannot enumerate them, so no figure would be a real one.',
       ),
   }),
 
@@ -82,7 +82,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .string()
       .optional()
       .describe(
-        'Caveat about how this answer was produced — that the listing is the offline sample rather than the live vocabulary, that the live vocabulary was unreachable, or that nothing matched and why.',
+        'Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, that Open Food Facts was unreachable, or that nothing matched and why.',
       ),
     truncated: z.boolean().optional().describe('True when more tags exist beyond the limit.'),
     shown: z.number().optional().describe('Number of tags returned.'),

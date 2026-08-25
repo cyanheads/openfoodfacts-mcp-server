@@ -3,7 +3,6 @@
  * @module tests/mcp-server/tools/definitions/compare-products.tool.test
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { rateLimited, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,15 +16,27 @@ import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-
 
 const mockGetProductFields = vi.fn();
 
+/** Create the contract-bearing context wired by the production handler factory. */
+function createToolContext() {
+  return createMockContext({ errors: offCompareProductsTool.errors });
+}
+
+/** Return the first text block produced by the tool formatter. */
+function firstText(blocks: ReturnType<NonNullable<typeof offCompareProductsTool.format>>): string {
+  const block = blocks[0];
+  if (block?.type !== 'text') throw new Error('Expected the formatter to return text.');
+  return block.text;
+}
+
 describe('off_compare_products', () => {
-  let ctx: Context;
+  let ctx: ReturnType<typeof createToolContext>;
 
   beforeEach(() => {
     mockGetProductFields.mockReset();
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
       getProductFields: mockGetProductFields,
     } as never);
-    ctx = createMockContext();
+    ctx = createToolContext();
   });
 
   it('returns comparison rows for two found products', async () => {
@@ -134,7 +145,7 @@ describe('off_compare_products', () => {
     };
     const blocks = offCompareProductsTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('Nutella');
     expect(text).toContain('Peanut Butter');
     // nutriscore_grade values (not uppercased)
@@ -159,7 +170,7 @@ describe('off_compare_products', () => {
       succeeded: 1,
       not_found: [],
     };
-    const text = offCompareProductsTool.format!(output)[0].text;
+    const text = firstText(offCompareProductsTool.format!(output));
 
     expect(text).toContain('79%');
     expect(text).toContain('0.7875');
@@ -175,7 +186,7 @@ describe('off_compare_products', () => {
       not_found: ['0000000000000', '1111111111111'],
     };
     const blocks = offCompareProductsTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('0000000000000');
     expect(text.toLowerCase()).toContain('not found');
   });
@@ -363,7 +374,7 @@ describe('off_compare_products', () => {
         { barcode: '3333333333333', reason: 'upstream_error', error: 'Open Food Facts is down.' },
       ],
     });
-    const text = blocks[0].text as string;
+    const text = firstText(blocks);
 
     expect(text).toContain('not yet entered in Open Food Facts');
     expect(text).toContain('not checked, not confirmed missing');
@@ -425,7 +436,7 @@ describe('off_compare_products', () => {
       not_found: ['2222222222222'],
     };
     const blocks = offCompareProductsTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('N/A'); // absent nutrition rendered as N/A
     expect(text).not.toContain('undefined');
     expect(text).toContain('2222222222222'); // not_found barcode surfaced

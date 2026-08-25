@@ -50,6 +50,13 @@ function fetchedUrl(call = 0): URL {
   return new URL(vi.mocked(global.fetch).mock.calls[call]?.[0] as string);
 }
 
+/** Return the first text block produced by a tool formatter. */
+function firstText(blocks: ReturnType<NonNullable<typeof offBrowseTaxonomyTool.format>>): string {
+  const block = blocks[0];
+  if (block?.type !== 'text') throw new Error('Expected the formatter to return text.');
+  return block.text;
+}
+
 describe('off_browse_taxonomy', () => {
   let ctx: Context;
   const globalFetch = global.fetch;
@@ -144,7 +151,7 @@ describe('off_browse_taxonomy', () => {
     };
     const blocks = offBrowseTaxonomyTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('en:organic');
     expect(text).toContain('Organic');
     expect(text).toContain('en:fair-trade');
@@ -158,7 +165,7 @@ describe('off_browse_taxonomy', () => {
     // content[] as an enrichment trailer. format() asserting "no such tag" would restate the very
     // bug #14 fixed for the fallback case, where the vocabulary went unchecked.
     const output = { facet: 'categories', tags: [] };
-    const text = offBrowseTaxonomyTool.format!(output)[0].text;
+    const text = firstText(offBrowseTaxonomyTool.format!(output));
     expect(text.toLowerCase()).toContain('no tags returned');
     expect(text.toLowerCase()).not.toContain('try a different search term');
   });

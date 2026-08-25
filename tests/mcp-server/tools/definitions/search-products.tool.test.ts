@@ -3,7 +3,6 @@
  * @module tests/mcp-server/tools/definitions/search-products.tool.test
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -21,6 +20,28 @@ import {
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 const mockSearchProducts = vi.fn();
+
+/** Create the contract-bearing context wired by the production handler factory. */
+function createToolContext() {
+  return createMockContext({ errors: offSearchProductsTool.errors });
+}
+
+/** Return the first text block produced by the tool formatter. */
+function firstText(blocks: ReturnType<NonNullable<typeof offSearchProductsTool.format>>): string {
+  const block = blocks[0];
+  if (block?.type !== 'text') throw new Error('Expected the formatter to return text.');
+  return block.text;
+}
+
+/** Capture an expected handler rejection without widening it with the success type. */
+async function captureError(value: unknown | Promise<unknown>): Promise<unknown> {
+  try {
+    await value;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('Expected the handler to reject.');
+}
 
 /**
  * Stubs one service response, filling the envelope fields a case doesn't set. `count_is_exact`
@@ -42,14 +63,14 @@ function inputDescription(field: string): string {
 }
 
 describe('off_search_products', () => {
-  let ctx: Context;
+  let ctx: ReturnType<typeof createToolContext>;
 
   beforeEach(() => {
     mockSearchProducts.mockReset();
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
       searchProducts: mockSearchProducts,
     } as never);
-    ctx = createMockContext({ errors: offSearchProductsTool.errors });
+    ctx = createToolContext();
   });
 
   it('returns paginated results for a text query', async () => {
@@ -123,7 +144,7 @@ describe('off_search_products', () => {
       ctx,
     );
 
-    expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+    expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
       categories_tag: 'en:cheeses',
       labels_tag: 'en:organic',
     });
@@ -158,7 +179,7 @@ describe('off_search_products', () => {
       ctx,
     );
 
-    expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+    expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
       query: 'dark chocolate',
       labels_tag: 'en:organic',
       countries_tag: 'en:france',
@@ -185,7 +206,7 @@ describe('off_search_products', () => {
     };
     const blocks = offSearchProductsTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('3017620422003');
     expect(text).toContain('Nutella');
     expect(text).toContain('e'); // nutriscore_grade value (not uppercased)
@@ -195,7 +216,7 @@ describe('off_search_products', () => {
     const output = { total: 0, total_is_lower_bound: false, page: 1, page_count: 0, products: [] };
     const blocks = offSearchProductsTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text.toLowerCase()).toContain('no products');
   });
 
@@ -249,9 +270,9 @@ describe('off_search_products', () => {
   });
 
   it('carries a recovery hint naming the highest page this page_size can reach', async () => {
-    const error = await offSearchProductsTool
-      .handler({ query: 'chocolate', page: 900, page_size: 50 }, ctx)
-      .catch((e: unknown) => e as { data?: { recovery?: { hint?: string } } });
+    const error = (await captureError(
+      offSearchProductsTool.handler({ query: 'chocolate', page: 900, page_size: 50 }, ctx),
+    )) as { data?: { recovery?: { hint?: string } } };
 
     expect(error.data?.recovery?.hint).toContain('page 200');
   });
@@ -418,7 +439,7 @@ describe('off_search_products', () => {
       ],
     };
     const blocks = offSearchProductsTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('1234567890001');
     expect(text).not.toContain('undefined');
   });
@@ -439,7 +460,7 @@ describe('off_search_products', () => {
       ctx,
     );
 
-    expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+    expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
       categories_tag: 'en:cheeses',
       sort_by: 'unique_scans_n',
     });
@@ -459,8 +480,8 @@ describe('off_search_products', () => {
       ctx,
     );
 
-    const params = mockSearchProducts.mock.calls[0][0];
-    expect(params.sort_by).toBeUndefined();
+    const params = mockSearchProducts.mock.calls[0]?.[0];
+    expect(params?.sort_by).toBeUndefined();
   });
 
   it('passes sort_by even on text-query path (service ignores it)', async () => {
@@ -479,8 +500,8 @@ describe('off_search_products', () => {
       ctx,
     );
 
-    const params = mockSearchProducts.mock.calls[0][0];
-    expect(params.sort_by).toBe('popularity_key');
+    const params = mockSearchProducts.mock.calls[0]?.[0];
+    expect(params?.sort_by).toBe('popularity_key');
   });
 
   // ── ecoscore_grade in search results ──────────────────────────────────────
@@ -553,7 +574,7 @@ describe('off_search_products', () => {
       ],
     };
     const blocks = offSearchProductsTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('Green-Score: c');
   });
 
@@ -573,7 +594,7 @@ describe('off_search_products', () => {
       ],
     };
     const blocks = offSearchProductsTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).not.toContain('Green-Score');
   });
 
@@ -610,7 +631,7 @@ describe('off_search_products', () => {
         ctx,
       );
 
-      expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
         allergens_tag: 'en:milk',
         additives_tag: 'en:e322',
       });
@@ -653,7 +674,7 @@ describe('off_search_products', () => {
         ctx,
       );
 
-      expect(mockSearchProducts.mock.calls[0][0]).toMatchObject({
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
         query: 'chocolate',
         allergens_tag: 'en:milk',
       });
@@ -675,9 +696,12 @@ describe('off_search_products', () => {
     });
 
     it('names both working combinations in the additives rejection hint', async () => {
-      const error = await offSearchProductsTool
-        .handler({ query: 'chocolate', additives_tag: 'en:e322', page: 1, page_size: 20 }, ctx)
-        .catch((e: unknown) => e as { data?: { recovery?: { hint?: string } } });
+      const error = (await captureError(
+        offSearchProductsTool.handler(
+          { query: 'chocolate', additives_tag: 'en:e322', page: 1, page_size: 20 },
+          ctx,
+        ),
+      )) as { data?: { recovery?: { hint?: string } } };
 
       const hint = error.data?.recovery?.hint ?? '';
       expect(hint).toContain('Drop query');
@@ -793,7 +817,7 @@ describe('off_search_products', () => {
         products: [{ barcode: '1234567890001' }],
       };
 
-      const text = offSearchProductsTool.format!(output)[0].text;
+      const text = firstText(offSearchProductsTool.format!(output));
 
       expect(text).toContain('**10000+ total products**');
       expect(text).toContain('At least 10000 products match');
@@ -808,7 +832,7 @@ describe('off_search_products', () => {
         products: [{ barcode: '1234567890001' }],
       };
 
-      const text = offSearchProductsTool.format!(output)[0].text;
+      const text = firstText(offSearchProductsTool.format!(output));
 
       expect(text).toContain('**42 total products**');
       expect(text).not.toContain('+ total products');
@@ -835,7 +859,7 @@ describe('off_search_products', () => {
         products: [{ barcode: '1234567890001', product_name: 'Frozen Pizza', categories_tags }],
       };
 
-      const text = offSearchProductsTool.format!(output)[0].text;
+      const text = firstText(offSearchProductsTool.format!(output));
 
       for (const tag of categories_tags) expect(text).toContain(tag);
     });

@@ -16,6 +16,7 @@ vi.mock('@/config/server-config.js', () => ({
     baseUrl: 'https://world.openfoodfacts.org',
     rateLimitProduct: 100,
     rateLimitSearch: 10,
+    rateLimitTaxonomy: 100,
   })),
 }));
 
@@ -29,6 +30,7 @@ function makeService(): OpenFoodFactsService {
     baseUrl: 'https://world.openfoodfacts.org',
     rateLimitProduct: 100,
     rateLimitSearch: 100,
+    rateLimitTaxonomy: 100,
   });
 }
 
@@ -55,6 +57,16 @@ type McpErrorish = {
     recovery?: { hint?: string };
   };
 };
+
+/** Capture an expected service rejection without widening it with the success type. */
+async function captureError(value: Promise<unknown>): Promise<McpErrorish> {
+  try {
+    await value;
+  } catch (error) {
+    return error as McpErrorish;
+  }
+  throw new Error('Expected the service call to reject.');
+}
 
 describe('OpenFoodFactsService', () => {
   let svc: OpenFoodFactsService;
@@ -633,9 +645,7 @@ describe('OpenFoodFactsService', () => {
       const ctx = createMockContext({ errors: offGetProductTool.errors });
       global.fetch = vi.fn().mockRejectedValue(new TypeError('Unable to connect.'));
 
-      const error = await svc
-        .getProduct('3017620422003', ctx)
-        .catch((e: unknown) => e as McpErrorish);
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
 
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
       expect(error.data?.reason).toBe('upstream_error');
@@ -648,9 +658,7 @@ describe('OpenFoodFactsService', () => {
       const ctx = createMockContext({ errors: offGetProductTool.errors });
       global.fetch = vi.fn().mockResolvedValue(mockResponse('Internal Server Error', 503));
 
-      const error = await svc
-        .getProduct('3017620422003', ctx)
-        .catch((e: unknown) => e as McpErrorish);
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
 
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
       expect(error.data?.reason).toBe('upstream_error');
@@ -690,9 +698,7 @@ describe('OpenFoodFactsService', () => {
         nonJsonResponse('<!doctype html><html><body>busy</body></html>'),
       );
 
-      const error = await svc
-        .getProduct('3017620422003', ctx)
-        .catch((e: unknown) => e as McpErrorish);
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
 
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
       expect(error.data?.reason).toBe('upstream_error');
@@ -725,9 +731,7 @@ describe('OpenFoodFactsService', () => {
 
       vi.useFakeTimers();
       try {
-        const pending = svc
-          .getProduct('3017620422003', ctx)
-          .catch((e: unknown) => e as McpErrorish);
+        const pending = captureError(svc.getProduct('3017620422003', ctx));
         await vi.runAllTimersAsync();
         const error = await pending;
 
@@ -747,6 +751,7 @@ describe('OpenFoodFactsService', () => {
         baseUrl: 'https://world.openfoodfacts.org',
         rateLimitProduct: 1,
         rateLimitSearch: 1,
+        rateLimitTaxonomy: 1,
       });
       const ctx = createMockContext({ errors: offGetProductTool.errors });
       global.fetch = vi
@@ -754,9 +759,7 @@ describe('OpenFoodFactsService', () => {
         .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Nutella' } }));
 
       await limited.getProduct('3017620422003', ctx);
-      const error = await limited
-        .getProduct('7622210100146', ctx)
-        .catch((e: unknown) => e as McpErrorish);
+      const error = await captureError(limited.getProduct('7622210100146', ctx));
 
       expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
       expect(error.data?.reason).toBe('rate_limited');
@@ -782,9 +785,9 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(mockResponse(windowRejection, 400));
 
       const startedAt = Date.now();
-      const error = await svc
-        .searchProducts({ query: 'chocolate', page: 5001, page_size: 2 }, ctx)
-        .catch((e: unknown) => e as McpErrorish);
+      const error = await captureError(
+        svc.searchProducts({ query: 'chocolate', page: 5001, page_size: 2 }, ctx),
+      );
       const elapsedMs = Date.now() - startedAt;
 
       expect(global.fetch).toHaveBeenCalledOnce();
@@ -805,9 +808,9 @@ describe('OpenFoodFactsService', () => {
       const ctx = createMockContext({ errors: offSearchProductsTool.errors });
       global.fetch = vi.fn().mockResolvedValue(mockResponse(errorPage, 401));
 
-      const error = await svc
-        .searchProducts({ categories_tag: 'en:pizzas', page: 50, page_size: 5 }, ctx)
-        .catch((e: unknown) => e as McpErrorish);
+      const error = await captureError(
+        svc.searchProducts({ categories_tag: 'en:pizzas', page: 50, page_size: 5 }, ctx),
+      );
 
       expect(global.fetch).toHaveBeenCalledOnce();
       expect(error.data?.reason).toBe('upstream_rejected');

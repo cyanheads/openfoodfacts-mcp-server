@@ -52,7 +52,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches with no query — the text backend does not index additives, so combining the two is rejected instead of silently returning nothing.',
+        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches with no query — full-text searches cannot filter by additive, so combining the two is rejected instead of silently returning nothing.',
       ),
     nutrition_grade: z
       .enum(['a', 'b', 'c', 'd', 'e'])
@@ -178,7 +178,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'additives_filter_needs_tag_search',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'additives_tag was combined with a text query, which the text backend cannot filter on',
+      when: 'additives_tag was combined with a text query, which cannot filter by additive',
       retryable: false,
       recovery:
         'Drop query and search by tags alone to keep the additive filter, or drop additives_tag to keep the text query. Every other filter combines with a text query.',
@@ -186,7 +186,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'page_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: `A text search asks for page * page_size beyond the ${TEXT_SEARCH_RESULT_WINDOW}-result window the text backend serves`,
+      when: `A text search asks for page * page_size beyond the ${TEXT_SEARCH_RESULT_WINDOW}-result window Open Food Facts serves`,
       retryable: false,
       recovery:
         'Request an earlier page, or add filters so the products you need fall inside the first results rather than deep in the ranking.',
@@ -250,7 +250,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (isTextSearch && input.additives_tag?.trim()) {
       throw ctx.fail(
         'additives_filter_needs_tag_search',
-        'additives_tag filters only on searches with no text query — the text backend does not index additives, so pairing the two would match nothing regardless of the additive.',
+        'additives_tag filters only on searches with no text query — full-text searches cannot filter by additive, so pairing the two would match nothing regardless of the additive.',
         {
           additives_tag: input.additives_tag,
           ...ctx.recoveryFor('additives_filter_needs_tag_search'),
@@ -401,7 +401,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     ];
     if (result.total_is_lower_bound) {
       lines.push(
-        `*At least ${result.total} products match — the search backend stops counting there and does not report the true total. Add filters for an exact count.*`,
+        `*At least ${result.total} products match — Open Food Facts stops counting there and does not report the true total. Add filters for an exact count.*`,
       );
     }
     lines.push('');

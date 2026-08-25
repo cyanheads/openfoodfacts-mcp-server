@@ -3,7 +3,6 @@
  * @module tests/mcp-server/tools/definitions/get-product.tool.test
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,8 +16,30 @@ import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-
 const mockGetProduct = vi.fn();
 const mockGetProductFields = vi.fn();
 
+/** Create the contract-bearing context wired by the production handler factory. */
+function createToolContext() {
+  return createMockContext({ errors: offGetProductTool.errors });
+}
+
+/** Return the first text block produced by the tool formatter. */
+function firstText(blocks: ReturnType<NonNullable<typeof offGetProductTool.format>>): string {
+  const block = blocks[0];
+  if (block?.type !== 'text') throw new Error('Expected the formatter to return text.');
+  return block.text;
+}
+
+/** Capture an expected handler rejection without widening it with the success type. */
+async function captureError(value: unknown | Promise<unknown>): Promise<unknown> {
+  try {
+    await value;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('Expected the handler to reject.');
+}
+
 describe('off_get_product', () => {
-  let ctx: Context;
+  let ctx: ReturnType<typeof createToolContext>;
 
   beforeEach(() => {
     mockGetProduct.mockReset();
@@ -27,7 +48,7 @@ describe('off_get_product', () => {
       getProduct: mockGetProduct,
       getProductFields: mockGetProductFields,
     } as never);
-    ctx = createMockContext({ errors: offGetProductTool.errors });
+    ctx = createToolContext();
   });
 
   // ── error contract assertions ──────────────────────────────────────────────
@@ -37,9 +58,8 @@ describe('off_get_product', () => {
     // layer, but getProduct() returns null → handler throws ctx.fail('not_found').
     mockGetProduct.mockResolvedValue(null);
 
-    const err = await offGetProductTool.handler({ barcode: '0000000000001' }, ctx).catch((e) => e);
-    expect(err.data).toBeDefined();
-    expect(err.data.reason).toBe('not_found');
+    const err = await captureError(offGetProductTool.handler({ barcode: '0000000000001' }, ctx));
+    expect(err).toMatchObject({ data: { reason: 'not_found' } });
   });
 
   it('propagates upstream_error when service throws serviceUnavailable', async () => {
@@ -157,7 +177,7 @@ describe('off_get_product', () => {
     };
     const blocks = offGetProductTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('Nutella');
     expect(text).toContain('Nutri-Score'); // nutriscore_grade label
     expect(text).toContain('Eco-Score'); // ecoscore_grade label
@@ -199,7 +219,7 @@ describe('off_get_product', () => {
     };
     const blocks = offGetProductTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     expect(text).toContain('Sparse Product');
     expect(text).not.toContain('undefined');
   });
@@ -284,7 +304,7 @@ describe('off_get_product', () => {
     };
 
     const blocks = offGetProductTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
 
     // The requested subset is disclosed up front, carrying the field names.
     expect(text).toContain('Requested fields:');
@@ -308,7 +328,7 @@ describe('off_get_product', () => {
     };
 
     const blocks = offGetProductTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
 
     expect(text).toContain('**Nutrition:** Not available');
     expect(text).toContain('**Ingredients:** Not available');
@@ -360,7 +380,7 @@ describe('off_get_product', () => {
       },
     };
     const blocks = offGetProductTool.format!(output);
-    const text = blocks[0].text;
+    const text = firstText(blocks);
     // Should contain the caveat about absence not meaning allergen-free
     expect(text.toLowerCase()).toMatch(/allergen|absence/);
     expect(text.toLowerCase()).not.toContain('undefined');
@@ -441,7 +461,7 @@ describe('off_get_product', () => {
     const result = await offGetProductTool.handler({ barcode: '3017620422003' }, ctx);
 
     expect(result.product?.serving_quantity_unit).toBeUndefined();
-    const text = offGetProductTool.format!(result)[0].text;
+    const text = firstText(offGetProductTool.format!(result));
     expect(text).not.toContain('**Serving size:**');
   });
 
@@ -478,7 +498,7 @@ describe('off_get_product', () => {
         nutriments: { energy_kcal_serving: 0 },
       },
     };
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     expect(text).toContain('### Nutrition per serving (per 1 can (12 fl oz))');
     // The parsed quantity is unusable without its unit — this product's 354.882 is millilitres.
@@ -495,7 +515,7 @@ describe('off_get_product', () => {
         nutriments: { energy_kcal_serving: 80 },
       },
     };
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     expect(text).toContain('### Nutrition per serving');
     expect(text).toContain('Serving size not recorded');
@@ -640,7 +660,7 @@ describe('off_get_product', () => {
         serving_size: '28 g',
       },
     };
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     expect(text).toContain('calcium: 0.071 g');
     expect(text).toContain('energy: 2389 kJ');
@@ -655,7 +675,7 @@ describe('off_get_product', () => {
     const ingredients = Array.from({ length: 23 }, (_, i) => ({ text: `ingredient-${i + 1}` }));
     const output = { barcode: '5202336064700', product: { product_name: 'Parity', ingredients } };
 
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     for (const ing of ingredients) expect(text).toContain(ing.text);
     expect(text).not.toContain('more ingredients');
@@ -676,7 +696,7 @@ describe('off_get_product', () => {
       product: { product_name: 'Parity', categories_tags },
     };
 
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     for (const tag of categories_tags) expect(text).toContain(tag);
   });
@@ -694,7 +714,7 @@ describe('off_get_product', () => {
         ],
       },
     };
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     expect(text).toContain('vegan: maybe');
     expect(text).toContain('vegetarian: maybe');
@@ -707,7 +727,7 @@ describe('off_get_product', () => {
       barcode: '5202336064700',
       product: { product_name: 'Completeness', completeness: 0.7875 },
     };
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     expect(text).toContain('79%');
     expect(text).toContain('0.7875');
@@ -728,7 +748,7 @@ describe('off_get_product', () => {
         ],
       },
     };
-    const text = offGetProductTool.format!(output)[0].text;
+    const text = firstText(offGetProductTool.format!(output));
 
     expect(text).toContain('~56.85%');
     expect(text).toContain('~9.375%');
