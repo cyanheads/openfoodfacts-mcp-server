@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-08-24
+
+Adopt @cyanheads/mcp-ts-core ^0.12.3 with SDK v2, MCP 2026-07-28 compatibility, and strict rejection of unknown root input keys.
+
 ## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-07-26
 
 OFF_RATE_LIMIT_PRODUCT now defaults to 15/min, the per-IP ceiling Open Food Facts publishes for product reads, down from a default that permitted 6.6x that rate.
