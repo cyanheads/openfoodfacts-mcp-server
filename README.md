@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -27,20 +27,22 @@
 
 ---
 
-## Tools
+## Overview
 
-Four tools for working with [Open Food Facts](https://world.openfoodfacts.org/) — a free, crowd-sourced database of 3M+ packaged food products:
+Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged food products. Look up items by barcode, search by text and nutrition/allergen/label tags, compare products side-by-side, and resolve everyday terms to the canonical tag vocabulary from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:-----|:------------|
 | `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, allergens, additives, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, and data completeness. |
-| `off_search_products` | Search by text query and/or structured tag filters (category, brand, label, allergen, additive, Nutri-Score grade, NOVA group, country). Returns summary rows with barcodes for follow-up lookups. |
+| `off_search_products` | Search by text query, structured tag filters (category, brand, label, allergen, additive, Nutri-Score grade, NOVA group, country), and numeric per-100 g nutrient thresholds. Returns summary rows with barcodes for follow-up lookups. |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy, macros, salt, Nutri-Score, NOVA, and Green-Score. |
 | `off_browse_taxonomy` | Resolve a human term to the canonical tag ID (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) that `off_search_products` filters on, against the live Open Food Facts taxonomy. |
 
-### `off_get_product`
+## Capability reference
 
-Fetch a packaged food product by barcode (EAN-13 or UPC).
+### `off_get_product` <sub>tool</sub>
 
 - Accepts 8–14 digit barcodes (EAN-13, EAN-8, UPC-A, UPC-E)
 - Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags), all 14 major allergens as tag IDs, E-number additives, Nutri-Score a–e, NOVA 1–4, Green-Score/Eco-Score, every nutrient Open Food Facts holds per 100g and per serving, the serving size those per-serving figures are measured against, categories/labels/packaging/origins as canonical tag IDs, front image URL, and data completeness score (0–1)
@@ -50,61 +52,41 @@ Fetch a packaged food product by barcode (EAN-13 or UPC).
 
 ---
 
-### `off_search_products`
+### `off_search_products` <sub>tool</sub>
 
-Search Open Food Facts by text and/or structured tag filters.
-
-- Full-text search across product names, brands, and ingredients
-- Structured filters: `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag`
-- Text query and tag filters combine — a query with filters returns products that match the text *and* satisfy every filter (e.g., `query: "dark chocolate"` + `labels_tag: en:organic` + `countries_tag: en:france`)
-- All filter values are canonical tag IDs — use `off_browse_taxonomy` to resolve human terms (e.g., "organic" → `en:organic`). `brands_tag` takes a brand slug and matches it exactly; open-ended brand wording belongs in `query`
-- `additives_tag` filters only on searches with no text query — the text backend does not index additives, so pairing the two is rejected up front rather than returning an empty result set that looks like "no such product"
-- Pagination via `page` (1-based) and `page_size` (1–50, default 20)
-- `total` is exact on tag-only searches. Text searches stop counting at 10,000 matches, and when that ceiling is hit the response says so with `total_is_lower_bound: true` and renders the count as `10000+` — add filters for an exact figure
-- Searches carrying a text query serve only the first 10,000 results — a deeper `page * page_size` is rejected up front with the highest reachable page, not sent and retried. Tag-only searches publish no window, but deep pages are refused unpredictably, so narrowing the filters beats paging far in
-- Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — use `off_get_product` for full label data
-- Result counts reflect contributed products, not total products on the market
-- Search limited to ~10 requests/min by this server's own client-side budget, kept well inside what Open Food Facts asks of clients
+- Full-text `query` plus structured tag filters — `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag` — and numeric `nutrient_filters`, all combining as AND; all tag values are canonical IDs, resolved via `off_browse_taxonomy` (`brands_tag` matches an exact slug, not free text)
+- Numeric `nutrient_filters` express per-100 g thresholds over `energy-kcal`, `fat`, `saturated-fat`, `carbohydrates`, `sugars`, `fiber`, `proteins`, `salt`, and `sodium` — each a `{ nutrient, operator, value }` triple with `lt` / `lte` / `gt` / `gte`; pair two entries on one nutrient for a range. They AND with every other filter and are served by the text backend, so supplying one routes the search there even without `query`
+- `additives_tag` filters only on searches carrying neither `query` nor `nutrient_filters` — both route to a backend with no additives field, so the pairing is rejected up front rather than silently returning zero hits
+- Pagination via `page` (1-based) and `page_size` (1–50, default 20); text searches serve only the first 10,000 results (`page * page_size` beyond that is rejected), tag-only searches publish no window but refuse deep pages unpredictably
+- `total` is exact on tag-only searches; text searches stop counting at 10,000 and set `total_is_lower_bound: true` with the count rendered as `10000+`
+- The two paths read different indexes: a search carrying `query` is answered by a text index that lags the live database, and says so on both response surfaces; a tag-only search reads the live database. A recently contributed product can be missing from the first and present in the second
+- `sort_by` (`last_modified_t`, `unique_scans_n`, `created_t`, `popularity_key`) orders newest or highest first on both paths; omitting it leaves text searches relevance-ranked
+- A page past the end of a result set is reported as an exhausted page naming the deepest page that holds products, not as a zero-match search — the broaden-the-filters guidance appears only when nothing matched
+- Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — chain to `off_get_product` for full label data; counts reflect contributed products, not the market
+- Own client-side budget of ~10 requests/min, kept well inside what Open Food Facts asks of clients
 
 ---
 
-### `off_compare_products`
-
-Side-by-side nutrition and scoring comparison for 2–10 barcodes.
+### `off_compare_products` <sub>tool</sub>
 
 - Accepts 2–10 barcodes, compared in the order provided
-- Returns a normalized comparison table: energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score
-- Missing nutrition data is preserved as `null` — comparisons are not imputed or estimated
-- `not_found` list identifies barcodes with no contributor record (partial results are not an error)
-- `failed` list identifies barcodes whose fetch failed, with the per-barcode reason — kept separate from `not_found`, which claims the opposite. A failed barcode never blocks the rows that resolved
+- Returns a normalized comparison table: energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score; missing nutrition data is preserved as `null`, never imputed
+- `not_found` lists barcodes with no contributor record (not an error — the product may simply not be entered yet)
+- `failed` lists barcodes whose fetch itself failed, with a per-barcode reason — kept separate from `not_found`, and a failed barcode never blocks the rows that did resolve
 
 ---
 
-### `off_browse_taxonomy`
+### `off_browse_taxonomy` <sub>tool</sub>
 
-Resolve a human term to the canonical Open Food Facts tag ID before building `off_search_products` filters.
-
-- Facets: `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`
-- With a `search` term, the five open facets resolve against the live Open Food Facts taxonomy — tens of thousands of category tags, not a fixed local list. Matching is case-insensitive substring against tag ID or display name (e.g., `"gluten"` → `en:no-gluten`, `en:gluten-free`)
-- Upstream tags are often plural (`"kombucha"` → `en:kombuchas`) — pass the returned `id` through unchanged rather than constructing one
-- `nova_groups` and `nutrition_grades` are closed vocabularies answered offline and returned complete. Their IDs are bare (`1`–`4`, `a`–`e`), matching what `off_search_products` accepts
-- Live results are merged behind an in-process sample that also serves offline operation. If Open Food Facts is unreachable or the taxonomy budget is spent, the tool answers from that sample and says so rather than failing — an empty result is never presented as an authoritative "no such tag"
-- Omitting `search` lists only the offline sample. The upstream taxonomy endpoint suggests against a term and cannot enumerate a facet, so an unfiltered call is not a view of the full vocabulary and reports no facet total
-- `limit` controls results returned (1–100, default 20). There is no offset or page input — the upstream endpoint offers no cursor, so narrow the term instead
-- Taxonomy lookups carry their own ~10 requests/min client-side budget, separate from the search budget
-
----
+- Facets `categories`, `labels`, `allergens`, `additives`, `countries` resolve live against the Open Food Facts taxonomy (case-insensitive substring match on tag ID, display name, or a common synonym — "shellfish" resolves to `en:crustaceans`); upstream tags are often plural, so pass the returned `id` through unchanged
+- `nova_groups` and `nutrition_grades` are closed vocabularies, returned complete, with bare `"1"`–`"4"` / `"a"`–`"e"` ids
+- Live lookups fall back to a small in-process sample when Open Food Facts is unreachable or the budget is spent, and say so rather than failing; omitting `search` returns only that sample, since Open Food Facts can't enumerate a full facet — no `total_in_facet` is reported for the open facets
+- `limit` controls results (1–100, default 20); there is no offset or page — narrow the search term instead
+- Own client-side budget of ~10 requests/min, separate from the search budget
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool definitions — single file per tool, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Open Food Facts-specific:
 
@@ -117,9 +99,8 @@ Open Food Facts-specific:
 Agent-friendly output:
 
 - Per-serving nutrition always carries its denominator — `serving_size` as printed plus the parsed `serving_quantity`/`serving_quantity_unit`, and an explicit note when Open Food Facts has recorded none
-- Missing fields signal incomplete crowd-sourced data, not product attribute absence — surfaced in descriptions and format output
 - Computed scores (Nutri-Score, NOVA, Green-Score) returned as-is with regional caveat notes — not interpreted or normalized to health claims
-- `not_found` list in `off_compare_products` allows partial batch comparisons without request failure — and a barcode whose fetch failed lands in `failed` instead, so a transport error is never reported as "no contributor record"
+- Graceful partial failure — `off_compare_products` returns resolved rows even when others fail, splitting confirmed-missing barcodes into `not_found` and failed fetches into `failed`
 - Every failure carries a declared `reason` and a recovery hint on both client surfaces — timeouts, upstream outages, upstream rejections, and rate limits each resolve to their own error code and their own next step
 
 ## Getting started
@@ -253,8 +234,6 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 
-> **Attribution:** Open Food Facts data is released under the [Open Database License (ODbL) 1.0](https://opendatacommons.org/licenses/odbl/1.0/). Downstream use must cite [Open Food Facts](https://world.openfoodfacts.org/).
-
 ## Running the server
 
 ### Local development
@@ -308,9 +287,13 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 - Register new tools via the barrel in `src/mcp-server/tools/definitions/index.ts`
 - Wrap external API calls: validate raw → normalize to domain type → return output schema; never fabricate missing fields
 
+## Attribution
+
+Open Food Facts data is released under the [Open Database License (ODbL) 1.0](https://opendatacommons.org/licenses/odbl/1.0/). Downstream use must cite [Open Food Facts](https://world.openfoodfacts.org/).
+
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
