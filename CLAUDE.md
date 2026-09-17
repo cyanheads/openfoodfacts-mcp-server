@@ -196,6 +196,8 @@ src/
       types.ts                          # Domain types
     taxonomy/
       taxonomy-service.ts               # Tag vocabulary — live resolution, offline sample, merge/fallback policy
+  utils/
+    markdown.ts                         # Contextual Markdown escaping for crowd-sourced values in content[]
   mcp-server/
     tools/definitions/
       get-product.tool.ts               # off_get_product
