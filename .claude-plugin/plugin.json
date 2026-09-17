@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "openfoodfacts-mcp-server",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",

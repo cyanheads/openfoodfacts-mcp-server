@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-09-17
+
+Field-subset dependency expansion, three new product fields, escaped Markdown rendering, per-request rate-limit charging, and a trimmed error-data contract on off_get_product.
+
 ## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-09-17
 
 Canonical taxonomy IDs, numeric nutrient search filters, text-index freshness disclosure, and exhausted-page detection on off_search_products.
