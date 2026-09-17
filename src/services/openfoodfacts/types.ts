@@ -25,7 +25,15 @@ export type RawProduct = {
   ingredients_text?: string;
   ingredients?: RawIngredient[];
   allergens_tags?: string[];
+  /**
+   * Allergens the label declares the product may contain as traces. Distinct from
+   * `allergens_tags`: `["en:none"]` is a positive statement that the label declares no traces,
+   * while `[]` and an absent field both mean not yet entered.
+   */
+  traces_tags?: string[];
   additives_tags?: string[];
+  /** Product-level vegan, vegetarian, and palm-oil verdicts Open Food Facts computes itself. */
+  ingredients_analysis_tags?: string[];
   nutriscore_grade?: string;
   nova_group?: number;
   ecoscore_grade?: string;
@@ -45,6 +53,8 @@ export type RawProduct = {
   labels_tags?: string[];
   packaging_tags?: string[];
   origins_tags?: string[];
+  /** Countries the product is sold in — the values `off_search_products` accepts as `countries_tag`. */
+  countries_tags?: string[];
   image_url?: string;
   completeness?: number;
   data_quality_tags?: string[];

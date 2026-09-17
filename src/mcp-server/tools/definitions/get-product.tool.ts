@@ -7,6 +7,32 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import type { RawNutriments, RawProduct } from '@/services/openfoodfacts/types.js';
+import { mdCodeFence, mdInline, mdUrl } from '@/utils/markdown.js';
+
+/**
+ * Fields a requested field needs to be readable, fetched alongside it. Open Food Facts returns
+ * exactly the `fields=` list it is given, so a subset that names a value without its denominator
+ * gets figures nothing can interpret — per-serving nutrition with no serving size, a serving unit
+ * with no quantity to describe. Expanding the request is what keeps the response's own claim about
+ * why something is missing true: an absent value is absent upstream, never merely unasked-for.
+ */
+const FIELD_DEPENDENCIES: Record<string, readonly string[]> = {
+  nutriments: ['serving_size', 'serving_quantity', 'serving_quantity_unit'],
+  serving_quantity_unit: ['serving_quantity', 'serving_size'],
+  serving_quantity: ['serving_size'],
+};
+
+/**
+ * The caller's field subset plus every field those depend on, in request order with the additions
+ * appended. Deduplicated, so naming a dependency explicitly costs nothing.
+ */
+function expandFields(fields: readonly string[]): string[] {
+  const expanded = new Set(fields);
+  for (const field of fields) {
+    for (const dependency of FIELD_DEPENDENCIES[field] ?? []) expanded.add(dependency);
+  }
+  return [...expanded];
+}
 
 /** One nutrient from the open map: the figure plus the unit Open Food Facts reported it in. */
 type NutrimentEntry = { value: number; unit?: string };
@@ -130,8 +156,13 @@ function additionalLines(
   entries: Record<string, { value: number; unit?: string | undefined }>,
 ): string[] {
   return Object.entries(entries).map(
-    ([key, { value, unit }]) => `  - ${key}: ${value}${unit ? ` ${unit}` : ''}`,
+    ([key, { value, unit }]) => `  - ${mdInline(key)}: ${value}${unit ? ` ${mdInline(unit)}` : ''}`,
   );
+}
+
+/** Join a canonical tag list for display, escaping each value for the line it lands on. */
+function tagList(tags: string[]): string {
+  return tags.map(mdInline).join(', ');
 }
 
 /**
@@ -146,15 +177,16 @@ function servingSizeLine(
 ): string {
   const parsed =
     quantity !== undefined
-      ? ` (parsed: ${quantity}${unit ? ` ${unit}` : ' — unit not recorded'})`
+      ? ` (parsed: ${quantity}${unit ? ` ${mdInline(unit)}` : ' — unit not recorded'})`
       : '';
-  return `**Serving size:** ${servingSize ?? 'Not printed on the label'}${parsed}`;
+  const printed = servingSize === undefined ? 'Not printed on the label' : mdInline(servingSize);
+  return `**Serving size:** ${printed}${parsed}`;
 }
 
 export const offGetProductTool = tool('off_get_product', {
   title: 'Get Food Product by Barcode',
   description:
-    'Fetch a packaged food product by barcode (EAN-13 or UPC) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), allergens, additives, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Fetch a packaged food product by barcode (EAN-13 or UPC) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -174,7 +206,9 @@ export const offGetProductTool = tool('off_get_product', {
             'ingredients_text',
             'ingredients',
             'allergens_tags',
+            'traces_tags',
             'additives_tags',
+            'ingredients_analysis_tags',
             'nutriscore_grade',
             'nova_group',
             'ecoscore_grade',
@@ -186,6 +220,7 @@ export const offGetProductTool = tool('off_get_product', {
             'labels_tags',
             'packaging_tags',
             'origins_tags',
+            'countries_tags',
             'image_url',
             'completeness',
             'data_quality_tags',
@@ -194,7 +229,7 @@ export const offGetProductTool = tool('off_get_product', {
       )
       .optional()
       .describe(
-        'Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed.',
+        'Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed. A field that cannot be read on its own arrives with what it depends on: nutriments brings serving_size, serving_quantity, and serving_quantity_unit so per-serving figures carry their denominator, and serving_quantity_unit brings the quantity it describes. requested_fields echoes the full set that was fetched.',
       ),
   }),
 
@@ -247,10 +282,24 @@ export const offGetProductTool = tool('off_get_product', {
           .describe(
             'Canonical allergen tag IDs. Absence means not yet entered — not that the product is allergen-free.',
           ),
+        traces_tags: z
+          .array(z.string().describe('Canonical allergen tag ID (e.g. "en:nuts").'))
+          .optional()
+          .describe(
+            'Allergens the label says the product may contain as traces, from cross-contamination warnings. Distinct from allergens_tags, which carries allergens declared in the ingredients. ["en:none"] means the label states no traces; an empty array or an absent field means not yet entered, not trace-free. Values resolve through off_browse_taxonomy\'s allergens facet.',
+          ),
         additives_tags: z
           .array(z.string().describe('E-number additive tag ID (e.g. "en:e322", "en:e322i").'))
           .optional()
           .describe('E-number additive tag IDs. Absence means not yet entered.'),
+        ingredients_analysis_tags: z
+          .array(
+            z.string().describe('Analysis verdict tag (e.g. "en:non-vegan", "en:palm-oil-free").'),
+          )
+          .optional()
+          .describe(
+            'Product-level vegan, vegetarian, and palm-oil verdicts computed by Open Food Facts from the parsed ingredients. "maybe-" and "-status-unknown" values mean the ingredients could not settle it (e.g. "en:maybe-vegan").',
+          ),
         nutriscore_grade: z
           .string()
           .optional()
@@ -377,6 +426,12 @@ export const offGetProductTool = tool('off_get_product', {
           .array(z.string().describe('Ingredient origin tag ID (e.g. "en:france").'))
           .optional()
           .describe('Ingredient origin tag IDs. Frequently empty.'),
+        countries_tags: z
+          .array(z.string().describe('Canonical country tag ID (e.g. "en:france").'))
+          .optional()
+          .describe(
+            'Countries where the product is sold — the same values off_search_products accepts as countries_tag. Distinct from origins_tags, which is where the ingredients come from.',
+          ),
         image_url: z.string().optional().describe('Front image URL (CDN-hosted JPEG).'),
         completeness: z
           .number()
@@ -402,7 +457,7 @@ export const offGetProductTool = tool('off_get_product', {
       .array(z.string().describe('A field name from the requested subset.'))
       .optional()
       .describe(
-        'The field subset that was requested, when the caller passed `fields`. Absent means all standard fields were requested. Sections outside this subset are omitted because they were not requested — not because Open Food Facts lacks the data.',
+        'The field subset that was fetched, when the caller passed `fields` — the requested fields plus the ones they depend on, so every field that can appear in `product` is named here. Absent means all standard fields were requested. Sections outside this subset are omitted because they were not requested — not because Open Food Facts lacks the data.',
       ),
   }),
 
@@ -452,10 +507,11 @@ export const offGetProductTool = tool('off_get_product', {
     const svc = getOpenFoodFactsService();
     // When the caller requests a specific field subset, pass it to the service to scope the API
     // request. The service has a default full-field set; using getProductFields() overrides it.
-    const product =
-      input.fields && input.fields.length > 0
-        ? await svc.getProductFields(input.barcode, input.fields.join(','), ctx)
-        : await svc.getProduct(input.barcode, ctx);
+    // The subset is expanded first, so a requested field arrives with whatever it needs to be read.
+    const fields = input.fields && input.fields.length > 0 ? expandFields(input.fields) : undefined;
+    const product = fields
+      ? await svc.getProductFields(input.barcode, fields.join(','), ctx)
+      : await svc.getProduct(input.barcode, ctx);
 
     if (!product) {
       throw ctx.fail('not_found', `Barcode ${input.barcode} not found in Open Food Facts`, {
@@ -471,8 +527,10 @@ export const offGetProductTool = tool('off_get_product', {
     });
 
     // Thread the requested subset through so format() can distinguish "not requested" from
-    // "missing upstream data". A full request (no fields) leaves requested_fields absent.
-    const result = buildProductOutput(input.barcode, product, input.fields);
+    // "missing upstream data". The expanded list is what was asked of Open Food Facts, so it is
+    // what the caller is told: every field that can appear in `product` is named in it. A full
+    // request (no fields) leaves requested_fields absent.
+    const result = buildProductOutput(input.barcode, product, fields);
     return result;
   },
 
@@ -486,24 +544,29 @@ export const offGetProductTool = tool('off_get_product', {
     const notRequested = (field: string): boolean =>
       requested !== undefined && !requested.includes(field);
 
-    lines.push(`## ${p.product_name ?? 'Unknown product'}`);
+    // A name that was never fetched is not an unknown name. Saying so here is the same
+    // distinction the section lines below draw, applied to the one line that leads the response.
+    const missingName = notRequested('product_name')
+      ? 'Product name not requested'
+      : 'Unknown product';
+    lines.push(`## ${p.product_name === undefined ? missingName : mdInline(p.product_name)}`);
     lines.push(`**Barcode:** ${result.barcode}`);
     if (requested && requested.length > 0) {
       lines.push(
         `**Requested fields:** ${requested.join(', ')} — sections outside this subset were not requested (not missing from Open Food Facts).`,
       );
     }
-    if (p.brands) lines.push(`**Brand:** ${p.brands}`);
-    if (p.quantity) lines.push(`**Quantity:** ${p.quantity}`);
+    if (p.brands) lines.push(`**Brand:** ${mdInline(p.brands)}`);
+    if (p.quantity) lines.push(`**Quantity:** ${mdInline(p.quantity)}`);
     if (p.serving_size !== undefined || p.serving_quantity !== undefined) {
       lines.push(servingSizeLine(p.serving_size, p.serving_quantity, p.serving_quantity_unit));
     }
 
     // Scores
     const scores: string[] = [];
-    if (p.nutriscore_grade) scores.push(`Nutri-Score: ${p.nutriscore_grade}`);
+    if (p.nutriscore_grade) scores.push(`Nutri-Score: ${mdInline(p.nutriscore_grade)}`);
     if (p.nova_group !== undefined) scores.push(`NOVA: ${p.nova_group}`);
-    if (p.ecoscore_grade) scores.push(`Eco-Score: ${p.ecoscore_grade}`);
+    if (p.ecoscore_grade) scores.push(`Eco-Score: ${mdInline(p.ecoscore_grade)}`);
     if (scores.length > 0) lines.push(`**Scores:** ${scores.join(' | ')}`);
 
     // Nutrition
@@ -536,7 +599,7 @@ export const offGetProductTool = tool('off_get_product', {
         // here rather than left to the header line — bare per-serving numbers are unusable without
         // it, and its absence is stated outright instead of being silently omitted.
         lines.push(
-          `\n### Nutrition per serving${p.serving_size ? ` (per ${p.serving_size})` : ''}`,
+          `\n### Nutrition per serving${p.serving_size ? ` (per ${mdInline(p.serving_size)})` : ''}`,
         );
         if (p.serving_size === undefined) {
           lines.push(
@@ -558,9 +621,11 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push('\n**Nutrition:** Not available');
     }
 
-    // Ingredients — fenced to prevent crowd-sourced text from being interpreted as markdown/instructions
+    // Ingredients — fenced so contributor text cannot be read as markdown or as instructions. The
+    // fence is sized past the longest backtick run in the value, which a fixed ``` was not: a
+    // three-backtick run in the text closed the block and returned the rest to ordinary markdown.
     if (p.ingredients_text) {
-      lines.push(`\n### Ingredients\n\`\`\`\n${p.ingredients_text}\n\`\`\``);
+      lines.push(`\n### Ingredients\n${mdCodeFence(p.ingredients_text)}`);
     } else if (notRequested('ingredients_text')) {
       lines.push('\n**Ingredients:** Not requested');
     } else {
@@ -575,52 +640,70 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push('\n**Parsed ingredients:**');
       for (const ing of p.ingredients) {
         const attrs: string[] = [];
-        if (ing.id) attrs.push(`id: ${ing.id}`);
+        if (ing.id) attrs.push(`id: ${mdInline(ing.id)}`);
         // The estimate is rendered at full precision. Rounding to one decimal turned 56.85 into
         // "56.9" and 9.375 into "9.4" — the same unrecoverable loss as the completeness percentage,
         // since re-calling returns the same rounded text.
         if (ing.percent_estimate !== undefined) attrs.push(`~${ing.percent_estimate}%`);
-        if (ing.vegan) attrs.push(`vegan: ${ing.vegan}`);
-        if (ing.vegetarian) attrs.push(`vegetarian: ${ing.vegetarian}`);
-        lines.push(`- ${ing.text}${attrs.length > 0 ? ` (${attrs.join(', ')})` : ''}`);
+        if (ing.vegan) attrs.push(`vegan: ${mdInline(ing.vegan)}`);
+        if (ing.vegetarian) attrs.push(`vegetarian: ${mdInline(ing.vegetarian)}`);
+        lines.push(`- ${mdInline(ing.text)}${attrs.length > 0 ? ` (${attrs.join(', ')})` : ''}`);
       }
     }
 
     // Allergens
     if (p.allergens_tags && p.allergens_tags.length > 0) {
-      lines.push(`\n**Allergens:** ${p.allergens_tags.join(', ')}`);
+      lines.push(`\n**Allergens:** ${tagList(p.allergens_tags)}`);
     } else if (notRequested('allergens_tags')) {
       lines.push('\n**Allergens:** Not requested');
     } else {
       lines.push('\n**Allergens:** Not entered (absence does not mean allergen-free)');
     }
 
+    // Traces — the "may contain" half of the label, kept separate from the declared allergens
+    // above. The three upstream states carry three different claims and never collapse into one.
+    if (p.traces_tags?.length === 1 && p.traces_tags[0] === 'en:none') {
+      lines.push('**Traces:** Label states no traces');
+    } else if (p.traces_tags && p.traces_tags.length > 0) {
+      lines.push(`**Traces (may contain):** ${tagList(p.traces_tags)}`);
+    } else if (notRequested('traces_tags')) {
+      lines.push('**Traces:** Not requested');
+    } else {
+      lines.push('**Traces:** Not entered (absence does not mean trace-free)');
+    }
+
     // Additives
     if (p.additives_tags && p.additives_tags.length > 0) {
-      lines.push(`**Additives:** ${p.additives_tags.join(', ')}`);
+      lines.push(`**Additives:** ${tagList(p.additives_tags)}`);
     }
 
     // Data quality
     if (p.data_quality_tags && p.data_quality_tags.length > 0) {
-      lines.push(`**Data quality tags:** ${p.data_quality_tags.join(', ')}`);
+      lines.push(`**Data quality tags:** ${tagList(p.data_quality_tags)}`);
     }
 
     // Categories / labels
     if (p.categories_tags && p.categories_tags.length > 0) {
-      lines.push(`\n**Categories:** ${p.categories_tags.join(', ')}`);
+      lines.push(`\n**Categories:** ${tagList(p.categories_tags)}`);
     }
     if (p.labels_tags && p.labels_tags.length > 0) {
-      lines.push(`**Labels:** ${p.labels_tags.join(', ')}`);
+      lines.push(`**Labels:** ${tagList(p.labels_tags)}`);
     }
     if (p.packaging_tags && p.packaging_tags.length > 0) {
-      lines.push(`**Packaging:** ${p.packaging_tags.join(', ')}`);
+      lines.push(`**Packaging:** ${tagList(p.packaging_tags)}`);
     }
     if (p.origins_tags && p.origins_tags.length > 0) {
-      lines.push(`**Origins:** ${p.origins_tags.join(', ')}`);
+      lines.push(`**Origins:** ${tagList(p.origins_tags)}`);
+    }
+    if (p.countries_tags && p.countries_tags.length > 0) {
+      lines.push(`**Countries sold in:** ${tagList(p.countries_tags)}`);
+    }
+    if (p.ingredients_analysis_tags && p.ingredients_analysis_tags.length > 0) {
+      lines.push(`**Ingredients analysis:** ${tagList(p.ingredients_analysis_tags)}`);
     }
 
     // Image
-    if (p.image_url) lines.push(`\n**Image:** ${p.image_url}`);
+    if (p.image_url) lines.push(`\n**Image:** ${mdUrl(p.image_url)}`);
 
     // Completeness
     if (p.completeness !== undefined) {
@@ -649,7 +732,9 @@ type ProductOutput = {
     vegetarian?: string;
   }>;
   allergens_tags?: string[];
+  traces_tags?: string[];
   additives_tags?: string[];
+  ingredients_analysis_tags?: string[];
   nutriscore_grade?: string;
   nova_group?: number;
   ecoscore_grade?: string;
@@ -661,6 +746,7 @@ type ProductOutput = {
   labels_tags?: string[];
   packaging_tags?: string[];
   origins_tags?: string[];
+  countries_tags?: string[];
   image_url?: string;
   completeness?: number;
   data_quality_tags?: string[];
@@ -706,7 +792,14 @@ function buildProductOutput(
     }));
   }
   if (raw.allergens_tags) product.allergens_tags = raw.allergens_tags;
+  // An empty array is carried through rather than dropped: for traces it is Open Food Facts
+  // saying nothing has been entered, which is not the same claim as the ["en:none"] the label
+  // makes, and collapsing the two would turn "unknown" into "trace-free".
+  if (raw.traces_tags) product.traces_tags = raw.traces_tags;
   if (raw.additives_tags) product.additives_tags = raw.additives_tags;
+  if (raw.ingredients_analysis_tags) {
+    product.ingredients_analysis_tags = raw.ingredients_analysis_tags;
+  }
   if (raw.nutriscore_grade) product.nutriscore_grade = raw.nutriscore_grade;
   if (typeof raw.nova_group === 'number') product.nova_group = raw.nova_group;
   if (raw.ecoscore_grade) product.ecoscore_grade = raw.ecoscore_grade;
@@ -729,6 +822,7 @@ function buildProductOutput(
   if (raw.labels_tags) product.labels_tags = raw.labels_tags;
   if (raw.packaging_tags) product.packaging_tags = raw.packaging_tags;
   if (raw.origins_tags) product.origins_tags = raw.origins_tags;
+  if (raw.countries_tags) product.countries_tags = raw.countries_tags;
   if (raw.image_url) product.image_url = raw.image_url;
   if (typeof raw.completeness === 'number') product.completeness = raw.completeness;
   if (raw.data_quality_tags) product.data_quality_tags = raw.data_quality_tags;
