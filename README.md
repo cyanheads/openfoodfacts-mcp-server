@@ -35,7 +35,7 @@ Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged
 
 | Tool | Description |
 |:-----|:------------|
-| `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, allergens, additives, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, and data completeness. |
+| `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, declared and trace allergens, additives, the vegan/vegetarian/palm-oil analysis, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, countries of sale, and data completeness. |
 | `off_search_products` | Search by text query, structured tag filters (category, brand, label, allergen, additive, Nutri-Score grade, NOVA group, country), and numeric per-100 g nutrient thresholds. Returns summary rows with barcodes for follow-up lookups. |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy, macros, salt, Nutri-Score, NOVA, and Green-Score. |
 | `off_browse_taxonomy` | Resolve a human term to the canonical tag ID (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) that `off_search_products` filters on, against the live Open Food Facts taxonomy. |
@@ -45,8 +45,10 @@ Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged
 ### `off_get_product` <sub>tool</sub>
 
 - Accepts 8–14 digit barcodes (EAN-13, EAN-8, UPC-A, UPC-E)
-- Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags), all 14 major allergens as tag IDs, E-number additives, Nutri-Score a–e, NOVA 1–4, Green-Score/Eco-Score, every nutrient Open Food Facts holds per 100g and per serving, the serving size those per-serving figures are measured against, categories/labels/packaging/origins as canonical tag IDs, front image URL, and data completeness score (0–1)
-- Optional `fields` parameter restricts the response to a subset (e.g., scores only, or nutrition only)
+- Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags), all 14 major allergens as tag IDs, E-number additives, Nutri-Score a–e, NOVA 1–4, Green-Score/Eco-Score, every nutrient Open Food Facts holds per 100g and per serving, the serving size those per-serving figures are measured against, categories/labels/packaging/origins/countries of sale as canonical tag IDs, front image URL, and data completeness score (0–1)
+- `traces_tags` carries the "may contain" allergen warning separately from the declared `allergens_tags`; `["en:none"]` is the label stating no traces, while an empty array means not yet entered — never trace-free
+- `ingredients_analysis_tags` carries the vegan, vegetarian, and palm-oil verdicts Open Food Facts computes itself, including its "maybe" states, rather than leaving the per-ingredient flags to be aggregated by the caller
+- Optional `fields` parameter restricts the response to a subset (e.g., scores only, or nutrition only); a field that cannot be read on its own arrives with what it depends on — `nutriments` brings the serving size its per-serving figures are measured against — and `requested_fields` echoes the full set that was fetched
 - Open Food Facts is crowd-sourced — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product
 - A barcode no contributor has recorded raises the `not_found` error carrying a recovery hint — it is never returned as an empty result
 
@@ -91,8 +93,8 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Open Food Facts-specific:
 
 - No API key required — the identifying `User-Agent` header (required by OFF terms) is baked into the service layer
-- Token-bucket rate limiting per endpoint class: product reads (~15/min), search (~10/min), taxonomy resolution (~10/min). The product and search defaults are the per-IP ceilings Open Food Facts publishes; lower them on a shared outbound IP. A local refusal says so — it never reports itself as an Open Food Facts rate limit
-- Automatic retry (3 attempts, 500ms base) for transient failures only — 5xx, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. A 4xx is never retried; the upstream's own explanation is surfaced instead
+- Token-bucket rate limiting per endpoint class: product reads (~15/min), search (~10/min), taxonomy resolution (~10/min). The product and search defaults are the per-IP ceilings Open Food Facts publishes; lower them on a shared outbound IP. Budgets count upstream requests, so a retried request spends its own slot and a budget exhausted mid-retry surfaces as `rate_limited` rather than sending. A local refusal says so — it never reports itself as an Open Food Facts rate limit
+- Automatic retry (4 attempts, 500ms base) for transient failures only — 5xx, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. A 4xx is never retried; the upstream's own explanation is surfaced instead
 - Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — the `_100g` and `_serving` variants of every nutrient on the record, with the macros as named fields and the rest in an open map that carries each nutrient's own unit (micronutrients are reported in grams, so calcium `0.071` is 71 mg)
 - Live tag resolution for `off_browse_taxonomy` against the Open Food Facts taxonomy, merged behind a small in-process sample that covers offline operation and is authoritative for E-number lookups, which the upstream suggester answers poorly
 

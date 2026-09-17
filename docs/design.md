@@ -6,7 +6,7 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `off_get_product` | Fetch a product by barcode (EAN-13/UPC). Returns name, brands, quantity, ingredients (raw text + parsed list), allergens, additives, Nutri-Score, NOVA group, Green-Score, nutriments per 100g and per serving, categories, labels, packaging, origins, image URL, and completeness signal. Missing fields mean "not yet entered in the database" — not that the attribute is absent from the real product. | `barcode` (string, required), `fields` (optional field subset) | `readOnlyHint: true` |
+| `off_get_product` | Fetch a product by barcode (EAN-13/UPC). Returns name, brands, quantity, ingredients (raw text + parsed list), declared and trace allergens, additives, ingredient analysis, Nutri-Score, NOVA group, Green-Score, nutriments per 100g and per serving, categories, labels, packaging, origins, countries of sale, image URL, and completeness signal. Missing fields mean "not yet entered in the database" — not that the attribute is absent from the real product. | `barcode` (string, required), `fields` (optional field subset) | `readOnlyHint: true` |
 | `off_search_products` | Search by keyword, structured tag filters, and/or numeric per-100 g nutrient thresholds. Returns summary rows with barcodes for follow-up lookups. Use when the barcode is unknown or to explore a category. Filters use canonical tag IDs (e.g. `en:organic`, `en:no-gluten`) — use `off_browse_taxonomy` to resolve human terms to tag IDs. | `query` (text search), `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrient_filters`, `nutrition_grade`, `nova_group`, `countries_tag`, `sort_by`, `page`, `page_size` | `readOnlyHint: true` |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 barcodes. Returns a normalized table of calories, fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA, and Green-Score. Designed for "which of these cereals is healthiest?" workflows. | `barcodes` (array of 2–10 EAN/UPC strings) | `readOnlyHint: true` |
 | `off_browse_taxonomy` | Resolve a human term to the canonical tag ID for a filter facet: categories, labels, allergens, additives, countries, nova groups, nutrition grades. A search term resolves against the live Open Food Facts taxonomy, merged behind an in-process sample; omitting it lists that sample, which is all the upstream suggester can support. Use before `off_search_products` to build precise filter values. | `facet` (enum), `search` (optional term), `limit` | `readOnlyHint: true`, `openWorldHint: true` |
@@ -35,7 +35,7 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 
 - No API key. Mandatory identifying `User-Agent` header: `openfoodfacts-mcp-server/<version> (casey@caseyjhand.com)` — baked into the service layer, not per-call.
 - Read-only — no write-back of product edits.
-- Per-endpoint rate limits: product reads ~15/min, search ~10/min, taxonomy resolution ~10/min. Rate limiting enforced in service layer, one token bucket per class. The product and search figures are the per-IP ceilings Open Food Facts publishes; exceeding them is answered with an IP ban rather than a throttle, so the defaults sit at the published number and go lower — never higher — on a shared outbound IP.
+- Per-endpoint rate limits: product reads ~15/min, search ~10/min, taxonomy resolution ~10/min. Rate limiting enforced in service layer, one token bucket per class, counted in upstream HTTP requests rather than tool calls — the slot is charged per attempt inside the retry boundary, so a retried request spends its own. The product and search figures are the per-IP ceilings Open Food Facts publishes; exceeding them is answered with an IP ban rather than a throttle, so the defaults sit at the published number and go lower — never higher — on a shared outbound IP.
 - Field selection mandatory on every request — the product object is ~200 keys; always scope `fields=`.
 - Tag vocabulary, not free text — search filters use canonical tag IDs (`en:organic`, `en:no-gluten`).
 - Missing fields signal incomplete crowd-sourced data, not product attribute absence — surface this distinction explicitly in tool descriptions and output.
@@ -80,7 +80,9 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 
 **Nutriments shape:** flat key-value map. Each nutrient has up to four variants: `{key}`, `{key}_100g`, `{key}_unit`, `{key}_value`, `{key}_serving` (when serving data present), `{key}_modifier` (e.g. `~` for approximate). The `_100g` variant is the canonical per-100g figure. Keys use hyphens: `energy-kcal`, `saturated-fat`, `added-sugars`.
 
-**Fields confirmed in full product object:** `product_name`, `brands`, `quantity`, `ingredients_text`, `allergens_tags` (array, `en:milk` format), `additives_tags` (array, `en:e322` format), `nutriscore_grade` (a–e or absent), `nova_group` (1–4 integer or absent), `ecoscore_grade` (a–e or `unknown`), `categories_tags` (array), `labels_tags` (array), `packaging_tags` (array), `origins_tags` (array, often empty), `image_url`, `completeness` (0–1 float), `data_quality_tags` (crowd-sourced QA flags).
+**Fields confirmed in full product object:** `product_name`, `brands`, `quantity`, `ingredients_text`, `allergens_tags` (array, `en:milk` format), `traces_tags` (array, same format — `["en:none"]` declares no traces, `[]` is not-yet-entered), `additives_tags` (array, `en:e322` format), `ingredients_analysis_tags` (array, `en:vegan` / `en:maybe-vegan` / `en:palm-oil-free` format), `nutriscore_grade` (a–e or absent), `nova_group` (1–4 integer or absent), `ecoscore_grade` (a–e or `unknown`), `categories_tags` (array), `labels_tags` (array), `packaging_tags` (array), `origins_tags` (array, often empty), `countries_tags` (array, the values `off_search_products` filters on as `countries_tag`), `image_url`, `completeness` (0–1 float), `data_quality_tags` (crowd-sourced QA flags).
+
+**Field subsets are expanded to their dependencies.** The API returns exactly the `fields=` list it is given, so `off_get_product` adds what a requested field needs to be readable before sending: `nutriments` brings `serving_size`, `serving_quantity`, and `serving_quantity_unit` — the combined request is honored, verified on barcode 0028400157827 — and `serving_quantity_unit` brings the quantity it describes, without which the unit says nothing. `requested_fields` echoes the expanded set, so a field present in `product` is always one the response says it asked for and the "not requested" wording can never contradict the payload.
 
 **Missing barcode response (status:0):** Returns HTTP 200, JSON `{"code":"00000001","status":0,"status_verbose":"no code or invalid code"}`. NOT a 404. Must check `status` field, not HTTP status.
 
@@ -155,7 +157,7 @@ GET /autocomplete?q=hummus&taxonomy_names=category&size=10
 
 ### `off_get_product`
 
-**Description:** Fetch a packaged food product by barcode (EAN-13 or UPC). Returns the product's name, brand, quantity, ingredients (raw text and parsed list), allergens, additives, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, image URL, and data completeness. Open Food Facts is crowd-sourced — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings.
+**Description:** Fetch a packaged food product by barcode (EAN-13 or UPC). Returns the product's name, brand, quantity, ingredients (raw text and parsed list), declared and trace allergens, additives, the vegan/vegetarian/palm-oil analysis, countries of sale, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, image URL, and data completeness. Open Food Facts is crowd-sourced — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings.
 
 **Input schema:**
 
@@ -166,11 +168,13 @@ z.object({
     .describe('EAN-13 or UPC barcode (8–14 digits). The primary key for Open Food Facts. Example: "3017620422003" (Nutella FR).'),
   fields: z.array(z.enum([
     'product_name', 'brands', 'quantity', 'ingredients_text', 'ingredients',
-    'allergens_tags', 'additives_tags', 'nutriscore_grade', 'nova_group',
-    'ecoscore_grade', 'nutriments', 'categories_tags', 'labels_tags',
-    'packaging_tags', 'origins_tags', 'image_url', 'completeness', 'data_quality_tags',
+    'allergens_tags', 'traces_tags', 'additives_tags', 'ingredients_analysis_tags',
+    'nutriscore_grade', 'nova_group', 'ecoscore_grade', 'nutriments',
+    'serving_size', 'serving_quantity', 'serving_quantity_unit',
+    'categories_tags', 'labels_tags', 'packaging_tags', 'origins_tags',
+    'countries_tags', 'image_url', 'completeness', 'data_quality_tags',
   ])).optional()
-    .describe('Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed.'),
+    .describe('Subset of fields to return. Omitting returns all standard fields. A field that cannot be read on its own arrives with what it depends on, and requested_fields echoes the expanded set.'),
 })
 ```
 
@@ -192,7 +196,9 @@ z.object({
       vegetarian: z.string().optional().describe('"yes", "no", or "maybe".'),
     })).optional().describe('Parsed ingredient list. Absent when not yet parsed by contributors.'),
     allergens_tags: z.array(z.string()).optional().describe('Canonical allergen tag IDs (e.g. "en:milk", "en:gluten"). Absence means not yet entered, not allergen-free.'),
+    traces_tags: z.array(z.string()).optional().describe('Allergens the label warns the product may contain as traces. ["en:none"] declares no traces; an empty or absent array means not yet entered, not trace-free.'),
     additives_tags: z.array(z.string()).optional().describe('E-number additive tag IDs (e.g. "en:e322", "en:e322i"). Absence means not yet entered.'),
+    ingredients_analysis_tags: z.array(z.string()).optional().describe('Product-level vegan, vegetarian, and palm-oil verdicts Open Food Facts computes from the parsed ingredients (e.g. "en:maybe-vegan", "en:palm-oil-free").'),
     nutriscore_grade: z.string().optional().describe('Nutri-Score letter (a–e, lowercase). Regional formula variants exist; "a" is highest quality. Absent when not enough nutrition data to compute.'),
     nova_group: z.number().optional().describe('NOVA food processing class (1=unprocessed, 2=culinary ingredients, 3=processed, 4=ultra-processed). Absent when not enough data.'),
     ecoscore_grade: z.string().optional().describe('Green-Score/Eco-Score environmental impact letter (a–e, or "unknown"). Highly variable — depends on packaging, origins, and transport data completeness.'),
@@ -219,6 +225,7 @@ z.object({
     labels_tags: z.array(z.string()).optional().describe('Label/certification tag IDs (e.g. "en:organic", "en:no-gluten").'),
     packaging_tags: z.array(z.string()).optional().describe('Packaging material tag IDs.'),
     origins_tags: z.array(z.string()).optional().describe('Ingredient origin tag IDs. Frequently empty.'),
+    countries_tags: z.array(z.string()).optional().describe('Countries the product is sold in — the values off_search_products accepts as countries_tag. Distinct from origins_tags.'),
     image_url: z.string().optional().describe('Front image URL (CDN-hosted JPEG).'),
     completeness: z.number().optional().describe('Data completeness score from 0–1. Below 0.5 indicates many fields are missing.'),
     data_quality_tags: z.array(z.string()).optional().describe('Crowd-sourced data quality flags (e.g. "en:nutrition-completed", "en:ingredients-completed-at-least-for-one-language").'),
@@ -506,8 +513,8 @@ enrichment: {
   - `getProduct(barcode, fields)` → raw product object or `null` (status:0)
   - `searchProducts(params)` → `{count, count_is_exact, page, page_count, page_size, products[]}` (the `SearchResult` type — one shape from both backends)
 - **Rate limiting:** token bucket per endpoint class — product reads (15/min), search (10/min), taxonomy resolution (10/min). A refusal is local, so it raises `rate_limited` (`RateLimited`) naming this server, not Open Food Facts, and carries the seconds until a slot frees.
-- **Transport:** `fetchWithTimeout` at every call site, so HTTP status → error code, canonical `status`/`body` on `error.data`, `Retry-After` honoring, and distinct `Timeout` classification all come from the framework rather than a hand-rolled status ladder.
-- **Retry:** `withRetry` on the full fetch+parse pipeline. 3 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped code decides: 5xx, timeouts, and 429 retry; 4xx fails immediately.
+- **Transport:** `fetchWithTimeout` at every call site, so HTTP status → error code, canonical `status`/`body` on the framework's fetch error (the public contract republishes a selected subset of it — see the error-contract allowlist below), `Retry-After` honoring, and distinct `Timeout` classification all come from the framework rather than a hand-rolled status ladder.
+- **Retry:** `withRetry` on the full fetch+parse pipeline. 4 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped code decides: 5xx, timeouts, and 429 retry; 4xx fails immediately.
 - **Parse failure:** HTML error pages (503 during high load) detected by content-type check → `upstream_error` (`ServiceUnavailable`, not `SerializationError`).
 - **Missing barcode:** `status:0` in a 200 response, or an HTTP 404, → `null` from the service; the handler calls `ctx.fail('not_found', ...)`. `null` is reserved for this case alone.
 
@@ -577,6 +584,12 @@ The sample stays because live-only would regress two cases it answers correctly.
 **Failures leave the service already carrying their contract `reason` and recovery hint.** Handlers stay pure — the service passes `{ reason, ...ctx.recoveryFor(reason) }` on every throw, so `data.reason` and `data.recovery.hint` reach both client surfaces with no handler-side try/catch. Reasons resolve from the error's `JsonRpcErrorCode`, never from message text.
 
 **Every upstream 4xx is `upstream_rejected` and non-retryable.** A request the upstream refuses will be refused again, so retrying only aims more traffic at a backend already saying no. `data.status` disambiguates which 4xx it was, and the upstream's own `detail` is surfaced in the message.
+
+**`content[]` is escaped per context; `structuredContent` stays raw.** Open Food Facts is contributor-edited, so every product name, ingredient string, brand, grade, and tag ID rendered into the text surface sits outside this server's trust boundary — and the metacharacters are already in real records (`lécithines [SOJA)` on barcode 3017620422003). Interpolated straight into Markdown, such a value changes the structure of the document rather than being displayed in it, so text the server presents as data can present itself as instructions to the reading agent. `src/utils/markdown.ts` holds one escaper per context — inline value, table cell, code fence, inline code span, bare URL — and every formatter routes untrusted values through the one for the site they land on. Line-break handling is the load-bearing part everywhere, since it is the only character that opens a new block, which is why it applies even to values that look harmless. Raw values belong in `structuredContent` and are never escaped there: a parity test asserts the escaped rendering and the raw structured value together. `ctx.enrich` notices are out of scope in the opposite direction — an enrichment string reaches both surfaces as the same value, so escaping one would break that parity, and the fix there is to keep untrusted text out of notice prose.
+
+**Budgets count upstream requests, not logical operations.** Each limiter charges a slot per attempt from inside the retry boundary, so the configured per-minute number is the number of requests Open Food Facts can see from this server. Charging once per call let the framework's four-attempt default fund four requests per slot — a ten-barcode comparison against a failing upstream sent 40 product reads against a published ceiling of 15/min, and the limiter recorded ten. When a budget runs out mid-sequence the retries stop and the caller gets the declared `rate_limited` failure with a `retryAfter` computed from the oldest timestamp still in the window. That refusal stays `retryable: true` on the wire — waiting and retrying is the right move for the caller — so it opts out of `withRetry` by type instead: it is its own error class, and the retry predicate fails fast on it. Reading `data.retryable` there instead would have flipped the flag the caller depends on, and leaving it in the transient set would have made the handler sleep the whole window and try again rather than returning.
+
+**The public error contract publishes an allowlist, never the fetch error's whole `data`.** `error.data` carries `status`, `retryAfter` when the upstream sent one, `retryAttempts`, `operation`, the per-call context of the tool that failed (`barcode`, or `page`/`page_size`, or `taxonomy_name`/`term`), plus the `reason`, `retryable`, and `recovery.hint` added at the throw site. The framework's fetch helper attaches more than that — it captures the response body as both `body` and its legacy alias `responseBody`, and adds `statusCode`, `statusText`, and `errorSource` — and spreading it put two copies of a rendered Open Food Facts error page into `structuredContent.error.data`, more than half the bytes of the failure, while `content[]` carried one summary sentence. Selecting here keeps the two surfaces saying the same thing and keeps provider markup off both: the upstream's own explanation still reaches the message, as search-a-licious's `detail` string, a summary of a rendered page, or a bounded plain-text snippet with its markup stripped.
 
 **The text backend's 10,000-result window is enforced before the request.** `search.openfoodfacts.org` rejects `page * page_size > 10000` with an HTTP 400. Checking it in the handler turns a four-attempt backoff ending in a retryable-looking outage into a validation failure naming the highest reachable page. Scoped to the text path — `/api/v2/search` publishes no equivalent ceiling and its deep pages fail unpredictably rather than at a fixed bound, so truncation guidance there warns instead of promising a reachable page count.
 
