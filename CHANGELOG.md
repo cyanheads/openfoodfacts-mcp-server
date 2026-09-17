@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-09-17
+
+Canonical taxonomy IDs, numeric nutrient search filters, text-index freshness disclosure, and exhausted-page detection on off_search_products.
+
 ## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-08-24
 
 Adopt @cyanheads/mcp-ts-core ^0.12.3 with SDK v2, MCP 2026-07-28 compatibility, and strict rejection of unknown root input keys.
