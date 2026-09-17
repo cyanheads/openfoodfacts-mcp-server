@@ -10,6 +10,7 @@ import { JsonRpcErrorCode, McpError, rateLimited } from '@cyanheads/mcp-ts-core/
 import { fetchWithTimeout, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import type {
+  NutrientOperator,
   RawAutocompleteResponse,
   RawProduct,
   RawProductResponse,
@@ -211,6 +212,12 @@ const SEARCH_FIELDS =
  * Text search endpoint — search.openfoodfacts.org uses Elasticsearch and actually filters by the
  * query text. The /api/v2/search endpoint silently ignores search_terms and returns all products.
  * The same host serves the taxonomy autocomplete used to resolve tag IDs.
+ *
+ * Its index is a snapshot that lags the live database, so this path and the tag-only path answer
+ * the same filters differently — live-verified with a category filter counting more products on
+ * /api/v2/search than here, and a barcode contributed after the cutoff absent from this index
+ * entirely. The endpoint publishes no index timestamp (`/health` reports only Redis and
+ * Elasticsearch connectivity), so the lag is disclosed to the caller rather than dated.
  */
 const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
 
@@ -235,6 +242,18 @@ const LUCENE_RESERVED_CHARS = /[+\-=&|><!(){}[\]^"~*?:\\/]/g;
 function escapeLuceneQueryText(text: string): string {
   return text.replace(LUCENE_RESERVED_CHARS, '\\$&');
 }
+
+/**
+ * Lucene range form per nutrient comparison. Live-verified against search-a-licious: square
+ * brackets parse to `gte`/`lte` and curly braces to `gt`/`lt`, with `*` as the open bound. The
+ * bounds are numbers the schema already validated, so nothing caller-authored reaches the syntax.
+ */
+const NUTRIENT_RANGE_FORMS: Record<NutrientOperator, (value: number) => string> = {
+  lt: (value) => `{* TO ${value}}`,
+  lte: (value) => `[* TO ${value}]`,
+  gt: (value) => `{${value} TO *}`,
+  gte: (value) => `[${value} TO *]`,
+};
 
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
 class RateLimiter {
@@ -422,12 +441,21 @@ export class OpenFoodFactsService {
    *   Any tag filters are folded into the Lucene `q` alongside the free text, so combined results
    *   are both text-relevant and filtered. The /api/v2/search endpoint silently ignores free text,
    *   so it cannot serve a text query.
-   * - Tag filters only (no query): /api/v2/search (structured facet filtering).
+   * - `nutrient_filters` present: search.openfoodfacts.org, with or without free text. The
+   *   comparisons compile to Lucene range clauses only this backend applies — /api/v2/search
+   *   documents the equivalent parameters and ignores them, live-verified returning an identical
+   *   unfiltered count for two mutually exclusive thresholds, so honoring them there would report
+   *   an unfiltered result set under a nutrient constraint.
+   * - Tag filters only: /api/v2/search (structured facet filtering).
+   *
+   * The two backends differ in freshness as well as in envelope: the text index is a snapshot that
+   * lags the live database, while /api/v2/search reads it directly. The tool discloses which one
+   * answered rather than presenting the two as interchangeable.
    */
   searchProducts(params: SearchParams, ctx: Context): Promise<SearchResult> {
     this.searchLimiter.check('search', ctx);
 
-    return params.query
+    return params.query || params.nutrient_filters?.length
       ? this.searchProductsByText(params, ctx)
       : this.searchProductsByTags(params, ctx);
   }
@@ -440,23 +468,26 @@ export class OpenFoodFactsService {
   private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
+        const page = params.page ?? 1;
+        const pageSize = params.page_size ?? 20;
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/search`);
         url.searchParams.set('q', this.buildTextSearchQuery(params));
         url.searchParams.set('fields', SEARCH_FIELDS);
-        url.searchParams.set('page', String(params.page ?? 1));
-        url.searchParams.set('page_size', String(params.page_size ?? 20));
+        url.searchParams.set('page', String(page));
+        url.searchParams.set('page_size', String(pageSize));
+        // search-a-licious sorts on a bare field name ascending and on a `-` prefix descending,
+        // and rejects an unknown field with HTTP 400. /api/v2/search reads the same bare value as
+        // descending, so the prefix is what keeps one enum value meaning one thing on both paths.
+        if (params.sort_by) url.searchParams.set('sort_by', `-${params.sort_by}`);
 
         ctx.log.debug('Text-searching products', { query: params.query, url: url.toString() });
 
         const response = await this.fetchSearch(url.toString(), ctx, 'OFF:searchProductsByText', {
-          page: params.page ?? 1,
-          page_size: params.page_size ?? 20,
+          page,
+          page_size: pageSize,
         });
 
-        const data = await parseJsonBody<RawTextSearchResponse>(response, ctx, {
-          page: params.page ?? 1,
-        });
-        const pageSize = params.page_size ?? 20;
+        const data = await parseJsonBody<RawTextSearchResponse>(response, ctx, { page });
 
         ctx.log.debug('Text search response received', {
           count: data.count,
@@ -618,6 +649,10 @@ export class OpenFoodFactsService {
    * does not exist and returns zero hits with no error — live-verified across several E-numbers
    * that match hundreds of thousands of products on the tag path. The tool rejects that
    * combination up front rather than sending a filter that silently empties the result set.
+   *
+   * Nutrient constraints become nested range clauses under the `nutriments.` prefix, which is not
+   * optional: a clause naming a bare `sugars_100g` answers HTTP 200 with zero hits and no error —
+   * the same silent-empty failure `additives_tag` has to be refused for.
    */
   private buildTextSearchQuery(params: SearchParams): string {
     const clauses: string[] = [];
@@ -628,6 +663,11 @@ export class OpenFoodFactsService {
     if (params.nutrition_grade) clauses.push(`nutriscore_grade:${params.nutrition_grade}`);
     if (params.nova_group) clauses.push(`nova_group:${params.nova_group}`);
     if (params.countries_tag) clauses.push(`countries_tags:"${params.countries_tag}"`);
+    for (const filter of params.nutrient_filters ?? []) {
+      clauses.push(
+        `nutriments.${filter.nutrient}_100g:${NUTRIENT_RANGE_FORMS[filter.operator](filter.value)}`,
+      );
+    }
     if (params.query) clauses.push(escapeLuceneQueryText(params.query));
     return clauses.join(' ');
   }

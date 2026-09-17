@@ -1,6 +1,7 @@
 /**
- * @fileoverview Raw API response types for the Open Food Facts API v2.
- * All fields are optional — OFF is crowd-sourced and real payloads are sparse.
+ * @fileoverview Raw API response types for the Open Food Facts API v2, plus the closed vocabularies
+ * the search parameters draw on.
+ * All response fields are optional — OFF is crowd-sourced and real payloads are sparse.
  * @module services/openfoodfacts/types
  */
 
@@ -122,9 +123,41 @@ export type RawAutocompleteResponse = {
 };
 
 /**
- * Search parameters shared by both search backends. A `query` (with or without tag filters) routes
- * to search.openfoodfacts.org, where any tag filters are folded into the Lucene `q`; tag filters
- * with no query route to /api/v2/search. `sort_by` applies only on the /api/v2/search path.
+ * Nutrients the text index carries as numeric per-100 g fields, under `nutriments.<name>_100g`.
+ * Closed because the index answers a clause naming an unindexed field with HTTP 200 and zero hits
+ * rather than an error: every name here was live-verified to return matches, and the per-serving
+ * variants were verified not to, so only the per-100 g basis is offered.
+ */
+export const NUTRIENT_FIELDS = [
+  'energy-kcal',
+  'fat',
+  'saturated-fat',
+  'carbohydrates',
+  'sugars',
+  'fiber',
+  'proteins',
+  'salt',
+  'sodium',
+] as const;
+
+/** Comparisons a nutrient constraint may express, each mapping to one Lucene range form. */
+export const NUTRIENT_OPERATORS = ['lt', 'lte', 'gt', 'gte'] as const;
+
+export type NutrientField = (typeof NUTRIENT_FIELDS)[number];
+export type NutrientOperator = (typeof NUTRIENT_OPERATORS)[number];
+
+/** One numeric constraint on a per-100 g nutrient value. */
+export type NutrientFilter = {
+  nutrient: NutrientField;
+  operator: NutrientOperator;
+  value: number;
+};
+
+/**
+ * Search parameters shared by both search backends. A `query` or a nutrient constraint (with or
+ * without tag filters) routes to search.openfoodfacts.org, where any tag filters are folded into
+ * the Lucene `q`; tag filters alone route to /api/v2/search. `sort_by` applies on both paths, in
+ * each one's spelling.
  */
 export type SearchParams = {
   query?: string;
@@ -141,7 +174,16 @@ export type SearchParams = {
   nutrition_grade?: string;
   nova_group?: string;
   countries_tag?: string;
-  /** Sort order — applied only on the tag-filter path (/api/v2/search). Ignored on text search. */
+  /**
+   * Numeric per-100 g nutrient constraints, ANDed with every other filter. Served only by the text
+   * backend — /api/v2/search documents the equivalent comparison parameters but ignores them, so a
+   * request carrying one routes to search.openfoodfacts.org whether or not it also carries `query`.
+   */
+  nutrient_filters?: NutrientFilter[];
+  /**
+   * Sort order, applied on both paths. /api/v2/search reads the bare value as descending;
+   * search-a-licious needs an explicit `-` prefix for the same order, which the text path adds.
+   */
   sort_by?: 'last_modified_t' | 'unique_scans_n' | 'created_t' | 'popularity_key';
   page?: number;
   page_size?: number;

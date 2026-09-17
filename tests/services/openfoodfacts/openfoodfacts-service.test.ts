@@ -322,8 +322,10 @@ describe('OpenFoodFactsService', () => {
       expect(fetchCall).toContain('api/v2/search');
     });
 
-    it('does not include sort_by in the text-search URL (endpoint ignores it)', async () => {
-      // search.openfoodfacts.org does not support server-side sort — verify it is not sent.
+    it('applies sort_by on the text-search URL with a descending prefix', async () => {
+      // GH issue #33: search.openfoodfacts.org does sort — it accepts sort_by, orders descending
+      // on a "-" prefix, and rejects an unknown field with HTTP 400. The prefix is what makes each
+      // enum value mean the same thing here as the bare value means on /api/v2/search.
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
@@ -342,7 +344,52 @@ describe('OpenFoodFactsService', () => {
 
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
       expect(fetchCall).toContain('search.openfoodfacts.org');
-      expect(fetchCall).not.toContain('sort_by');
+      expect(new URL(fetchCall).searchParams.get('sort_by')).toBe('-popularity_key');
+    });
+
+    it('sends every sort_by value on the text path, none skipped or special-cased', async () => {
+      const values = ['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'] as const;
+
+      for (const value of values) {
+        const ctx = createMockContext();
+        global.fetch = vi
+          .fn()
+          .mockResolvedValue(
+            mockResponse({ count: 1, page: 1, page_size: 20, page_count: 1, hits: [] }),
+          );
+
+        await svc.searchProducts(
+          { query: 'chocolate', sort_by: value, page: 1, page_size: 20 },
+          ctx,
+        );
+
+        const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+        expect(new URL(fetchCall).searchParams.get('sort_by')).toBe(`-${value}`);
+      }
+    });
+
+    it('sends no sort parameter on either path when sort_by is omitted', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_size: 20, page_count: 1, hits: [] }),
+        );
+      await svc.searchProducts({ query: 'chocolate', page: 1, page_size: 20 }, ctx);
+      expect(
+        new URL(vi.mocked(global.fetch).mock.calls[0]?.[0] as string).searchParams.get('sort_by'),
+      ).toBeNull();
+
+      const tagCtx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+      await svc.searchProducts({ categories_tag: 'en:cheeses', page: 1, page_size: 20 }, tagCtx);
+      expect(
+        new URL(vi.mocked(global.fetch).mock.calls[0]?.[0] as string).searchParams.get('sort_by'),
+      ).toBeNull();
     });
 
     it('includes ecoscore_grade in SEARCH_FIELDS for tag-filter requests', async () => {
@@ -483,6 +530,176 @@ describe('OpenFoodFactsService', () => {
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
       expect(fetchCall).toContain('search.openfoodfacts.org');
       expect(new URL(fetchCall).searchParams.get('q') ?? '').not.toContain('additives_tags');
+    });
+  });
+
+  // ── numeric nutrient filters (GH issue #28) ──────────────────────────────
+
+  describe('searchProducts — nutrient filters', () => {
+    /** Stub a text-search response and return the Lucene `q` the service built. */
+    async function queryFor(params: Record<string, unknown>): Promise<string> {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [],
+        }),
+      );
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, ctx);
+      const url = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      return new URL(url).searchParams.get('q') ?? '';
+    }
+
+    it('builds the bracket form the backend parses for each operator', async () => {
+      // Live-verified against search-a-licious: square brackets parse to gte/lte, curly braces to
+      // gt/lt, and `*` is an open bound. Every field reference needs the `nutriments.` prefix — a
+      // bare `sugars_100g` clause answers HTTP 200 with zero hits and no error.
+      const cases = [
+        { operator: 'lte', expected: 'nutriments.sugars_100g:[* TO 2]' },
+        { operator: 'lt', expected: 'nutriments.sugars_100g:{* TO 2}' },
+        { operator: 'gte', expected: 'nutriments.sugars_100g:[2 TO *]' },
+        { operator: 'gt', expected: 'nutriments.sugars_100g:{2 TO *}' },
+      ] as const;
+
+      for (const { operator, expected } of cases) {
+        const q = await queryFor({
+          nutrient_filters: [{ nutrient: 'sugars', operator, value: 2 }],
+        });
+        expect(q).toContain(expected);
+      }
+    });
+
+    it('routes a nutrient-only search to the text backend', async () => {
+      // /api/v2/search documents nutriment comparisons but ignores them — live-verified returning
+      // the identical unfiltered count for two mutually exclusive thresholds. Only the text
+      // backend applies them, so a nutrient constraint routes there with no free text.
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [],
+        }),
+      );
+
+      await svc.searchProducts(
+        {
+          categories_tag: 'en:breakfast-cereals',
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      expect(fetchCall).toContain('search.openfoodfacts.org');
+      expect(fetchCall).not.toContain('api/v2/search');
+    });
+
+    it('ANDs two constraints on different nutrients into one q', async () => {
+      const q = await queryFor({
+        categories_tag: 'en:breakfast-cereals',
+        nutrient_filters: [
+          { nutrient: 'sugars', operator: 'lt', value: 8 },
+          { nutrient: 'fiber', operator: 'gte', value: 6 },
+        ],
+      });
+
+      expect(q).toContain('nutriments.sugars_100g:{* TO 8}');
+      expect(q).toContain('nutriments.fiber_100g:[6 TO *]');
+      expect(q).toContain('categories_tags:"en:breakfast-cereals"');
+    });
+
+    it('combines a constraint with free text without escaping the clause', async () => {
+      const q = await queryFor({
+        query: 'granola',
+        nutrient_filters: [{ nutrient: 'saturated-fat', operator: 'lte', value: 2 }],
+      });
+
+      // Hyphenated field names need no escaping on this index — live-verified.
+      expect(q).toContain('nutriments.saturated-fat_100g:[* TO 2]');
+      expect(q).toContain('granola');
+    });
+
+    it('combines a constraint with tag filters', async () => {
+      const q = await queryFor({
+        labels_tag: 'en:organic',
+        countries_tag: 'en:france',
+        nutrient_filters: [{ nutrient: 'salt', operator: 'lt', value: 1 }],
+      });
+
+      expect(q).toContain('labels_tags:"en:organic"');
+      expect(q).toContain('countries_tags:"en:france"');
+      expect(q).toContain('nutriments.salt_100g:{* TO 1}');
+    });
+
+    it('carries every supported nutrient under its indexed field name', async () => {
+      const nutrients = [
+        'energy-kcal',
+        'fat',
+        'saturated-fat',
+        'carbohydrates',
+        'sugars',
+        'fiber',
+        'proteins',
+        'salt',
+        'sodium',
+      ] as const;
+
+      for (const nutrient of nutrients) {
+        const q = await queryFor({
+          nutrient_filters: [{ nutrient, operator: 'lte', value: 5 }],
+        });
+        expect(q).toContain(`nutriments.${nutrient}_100g:[* TO 5]`);
+      }
+    });
+
+    it('keeps a tag-only search with no nutrient constraint on /api/v2/search', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+
+      await svc.searchProducts({ categories_tag: 'en:spreads', page: 1, page_size: 20 }, ctx);
+
+      expect(vi.mocked(global.fetch).mock.calls[0]?.[0] as string).toContain('api/v2/search');
+    });
+
+    it('applies sort_by with the text prefix on a nutrient-only search', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [],
+        }),
+      );
+
+      await svc.searchProducts(
+        {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+          sort_by: 'unique_scans_n',
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      const url = new URL(vi.mocked(global.fetch).mock.calls[0]?.[0] as string);
+      expect(url.searchParams.get('sort_by')).toBe('-unique_scans_n');
     });
   });
 

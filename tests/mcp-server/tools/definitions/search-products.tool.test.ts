@@ -3,7 +3,7 @@
  * @module tests/mcp-server/tools/definitions/search-products.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Partial mock: only the service accessor is stubbed. TEXT_SEARCH_RESULT_WINDOW comes through from
@@ -52,6 +52,14 @@ function mockSearch(
   result: { count: number; products: unknown[] } & Record<string, unknown>,
 ): void {
   mockSearchProducts.mockResolvedValue({ count_is_exact: true, ...result });
+}
+
+/** Concatenates every text block of a `runToolContract` result — format() output plus trailer. */
+function contractText(result: { content?: { type: string; text?: string }[] }): string {
+  return (result.content ?? [])
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text ?? '')
+    .join('\n');
 }
 
 /** Reads a field's rendered `.describe()` text off the tool's advertised input schema. */
@@ -484,9 +492,9 @@ describe('off_search_products', () => {
     expect(params?.sort_by).toBeUndefined();
   });
 
-  it('passes sort_by even on text-query path (service ignores it)', async () => {
-    // The tool passes sort_by to the service regardless of path — the service is responsible
-    // for ignoring it on the text-search path. This keeps the tool layer simple.
+  it('passes sort_by on the text-query path, where the service now applies it', async () => {
+    // GH issue #33: the text backend sorts. The tool forwards the enum value unchanged on both
+    // paths; the service is what translates it to each backend's spelling.
     mockSearch({
       count: 2,
       page: 1,
@@ -502,6 +510,552 @@ describe('off_search_products', () => {
 
     const params = mockSearchProducts.mock.calls[0]?.[0];
     expect(params?.sort_by).toBe('popularity_key');
+  });
+
+  it('describes sort_by as ordering both search paths', () => {
+    // The stale wording told callers text searches ignore the option, which is what #33 fixed.
+    // Reading the advertised schema keeps the description from drifting back.
+    const description = inputDescription('sort_by');
+
+    expect(description).not.toMatch(/ignore this option/i);
+    expect(description).not.toMatch(/without a text query/i);
+    expect(description).toMatch(/newest|highest/i);
+  });
+
+  // ── numeric nutrient filters (GH issue #28) ───────────────────────────────
+
+  describe('nutrient filters', () => {
+    it('accepts a nutrient constraint as the only filter', async () => {
+      mockSearch({
+        count: 12,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      await offSearchProductsTool.handler(
+        {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      expect(mockSearchProducts).toHaveBeenCalledOnce();
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+      });
+    });
+
+    it('lists nutrient_filters in the no_filters recovery text', () => {
+      const recovery =
+        offSearchProductsTool.errors?.find((e) => e.reason === 'no_filters')?.recovery ?? '';
+
+      expect(recovery).toContain('nutrient_filters');
+    });
+
+    it('still refuses a request with no filter at all', async () => {
+      await expect(
+        offSearchProductsTool.handler({ nutrient_filters: [], page: 1, page_size: 20 }, ctx),
+      ).rejects.toMatchObject({ data: { reason: 'no_filters' } });
+    });
+
+    it('refuses additives_tag on a nutrient-only search, keyed on the routing decision', async () => {
+      // A nutrient constraint moves the search to the backend that has no additives_tags field,
+      // so the pairing matches nothing there just as it would alongside free text.
+      await expect(
+        offSearchProductsTool.handler(
+          {
+            additives_tag: 'en:e322',
+            nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+            page: 1,
+            page_size: 20,
+          },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        data: { reason: 'additives_filter_needs_tag_search', additives_tag: 'en:e322' },
+      });
+
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('names the nutrient filter as a cause in the additives rejection hint', async () => {
+      const error = (await captureError(
+        offSearchProductsTool.handler(
+          {
+            additives_tag: 'en:e322',
+            nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+            page: 1,
+            page_size: 20,
+          },
+          ctx,
+        ),
+      )) as { data?: { recovery?: { hint?: string } } };
+
+      expect(error.data?.recovery?.hint ?? '').toContain('nutrient_filters');
+    });
+
+    it('applies the text-search page window to a nutrient-only search', async () => {
+      await expect(
+        offSearchProductsTool.handler(
+          {
+            nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+            page: 5001,
+            page_size: 2,
+          },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        data: { reason: 'page_out_of_range', result_window: TEXT_SEARCH_RESULT_WINDOW },
+      });
+
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('echoes the nutrient constraints in the empty-result notice', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler(
+        {
+          categories_tag: 'en:breakfast-cereals',
+          nutrient_filters: [
+            { nutrient: 'sugars', operator: 'lt', value: 8 },
+            { nutrient: 'fiber', operator: 'gte', value: 6 },
+          ],
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toContain('category="en:breakfast-cereals"');
+      expect(notice).toContain('nutrient="sugars<8"');
+      expect(notice).toContain('nutrient="fiber>=6"');
+    });
+
+    it('inherits the text-index freshness disclosure on a nutrient-only search', async () => {
+      mockSearch({
+        count: 12,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      await offSearchProductsTool.handler(
+        {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      expect(String(getEnrichment(ctx).text_index_snapshot ?? '')).toMatch(/snapshot/i);
+    });
+
+    it('reports an exhausted page on a nutrient-filtered search', async () => {
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      await offSearchProductsTool.handler(
+        {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+          page: 5,
+          page_size: 50,
+        },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toMatch(/past the end/i);
+      expect(notice).toContain('163');
+    });
+
+    it('rejects a nutrient outside the verified per-100 g set at the schema', () => {
+      const parsed = offSearchProductsTool.input.safeParse({
+        nutrient_filters: [{ nutrient: 'cholesterol', operator: 'lt', value: 8 }],
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it('rejects an unsupported operator at the schema', () => {
+      const parsed = offSearchProductsTool.input.safeParse({
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'between', value: 8 }],
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it('rejects a non-numeric constraint value, so no caller text reaches the query', () => {
+      const parsed = offSearchProductsTool.input.safeParse({
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: '8 TO *] OR sugars:[0' }],
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it('describes the nutrient filter as per-100 g and text-backend served', () => {
+      const description = inputDescription('nutrient_filters');
+
+      expect(description).toMatch(/100\s?g/i);
+      expect(description).toMatch(/text/i);
+    });
+  });
+
+  // ── exhausted pages vs zero matches (GH issue #24) ────────────────────────
+
+  describe('exhausted pages', () => {
+    // Characterization — the two neighbouring cases this fix must leave alone.
+
+    it('keeps the broaden-and-check guidance when nothing matched at all', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler(
+        { categories_tag: 'en:xyzzy', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toContain('No products found');
+      expect(notice).toContain('off_browse_taxonomy');
+      expect(notice).toContain('Try broader terms');
+    });
+
+    it('leaves a partially filled last page unchanged', async () => {
+      mockSearch({
+        count: 25,
+        page: 5,
+        page_count: 3,
+        page_size: 5,
+        products: [{ code: '1234567890001' }],
+      });
+
+      await offSearchProductsTool.handler(
+        { categories_tag: 'en:pizzas', page: 5, page_size: 5 },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toContain('No further pages of matches exist.');
+      expect(notice).not.toMatch(/past the end/i);
+    });
+
+    it('renders the zero-match formatter text unchanged', () => {
+      const text = firstText(
+        offSearchProductsTool.format!({
+          total: 0,
+          total_is_lower_bound: false,
+          page: 1,
+          page_count: 0,
+          products: [],
+        }),
+      );
+
+      expect(text).toContain('**No products found**');
+      expect(text).toContain('off_browse_taxonomy');
+    });
+
+    // The defect: a page past the end of a large result set reported as a zero-match search.
+
+    it('describes an empty page past the end of a text result set as exhausted', async () => {
+      // page 1900 at page_size 3 asks for result 5,700 — inside the 10,000-result window, so the
+      // request is sent, answered HTTP 200 with an empty hit list, and must not read as no match.
+      mockSearch({ count: 5519, page: 1900, page_count: 0, page_size: 3, products: [] });
+
+      await offSearchProductsTool.handler({ query: 'hummus', page: 1900, page_size: 3 }, ctx);
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toMatch(/past the end/i);
+      expect(notice).toContain('1900');
+      expect(notice).toContain('5519');
+      // ceil(5519 / 3) = 1840, under the 3,333-page window bound at this page_size.
+      expect(notice).toContain('1840');
+      expect(notice).not.toContain('No products found');
+      expect(notice).not.toContain('Try broader terms');
+      expect(notice).not.toContain('off_browse_taxonomy');
+    });
+
+    it('describes an empty page past the end of a tag result set as exhausted', async () => {
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      await offSearchProductsTool.handler(
+        { categories_tag: 'en:hummus', countries_tag: 'en:netherlands', page: 5, page_size: 50 },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toMatch(/past the end/i);
+      expect(notice).toContain('163');
+      expect(notice).toContain('4'); // ceil(163 / 50)
+      expect(notice).not.toContain('Try broader terms');
+    });
+
+    it('never names a page the page_out_of_range pre-check would refuse', async () => {
+      // A huge text total implies far more pages than the window serves. Page 500 at page_size 20
+      // is the deepest request the pre-check lets through, so the page named must be that bound,
+      // not the 6,633 the match total implies — naming the latter sends the caller into the
+      // rejection the pre-check exists to prevent.
+      mockSearch({ count: 132_650, page: 500, page_count: 0, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler({ query: 'chocolate', page: 500, page_size: 20 }, ctx);
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toContain('500'); // floor(10000 / 20), not ceil(132650 / 20) = 6633
+      expect(notice).not.toContain('6633');
+    });
+
+    it('states that a clipped total yields no exact last page', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 400,
+        page_count: 0,
+        page_size: 25,
+        products: [],
+      });
+
+      await offSearchProductsTool.handler({ query: 'chocolate', page: 400, page_size: 25 }, ctx);
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toMatch(/no exact last page/i);
+      expect(notice).toContain('stopped counting');
+    });
+
+    it('returns the reachable last page as an output field on a counted search', async () => {
+      mockSearch({
+        count: 163,
+        page: 1,
+        page_count: 50,
+        page_size: 50,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await offSearchProductsTool.handler(
+        { categories_tag: 'en:hummus', page: 1, page_size: 50 },
+        ctx,
+      );
+
+      expect(result.last_page).toBe(4);
+    });
+
+    it('omits the last page when the total is a lower bound', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 1,
+        page_count: 20,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await offSearchProductsTool.handler(
+        { query: 'chocolate', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      expect(result.last_page).toBeUndefined();
+    });
+
+    it('formats an exhausted page as exhausted, preserving the total', () => {
+      const text = firstText(
+        offSearchProductsTool.format!({
+          total: 3,
+          total_is_lower_bound: false,
+          page: 2,
+          page_count: 0,
+          last_page: 1,
+          products: [],
+        }),
+      );
+
+      expect(text).toMatch(/past the end/i);
+      expect(text).toContain('3');
+      expect(text).toContain('page 1');
+      expect(text).not.toContain('No products found');
+      expect(text).not.toContain('off_browse_taxonomy');
+      expect(text).not.toMatch(/broaden/i);
+    });
+
+    it('formats an exhausted page with a clipped total using the lower-bound marker', () => {
+      const text = firstText(
+        offSearchProductsTool.format!({
+          total: 10_000,
+          total_is_lower_bound: true,
+          page: 400,
+          page_count: 0,
+          products: [],
+        }),
+      );
+
+      expect(text).toContain('10000+');
+      expect(text).toContain('At least 10000');
+      expect(text).toMatch(/no exact last page/i);
+    });
+
+    it('carries the exhausted-page case on both client surfaces', async () => {
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 5,
+        page_size: 50,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.total).toBe(163);
+      expect(String(structured.notice ?? '')).toMatch(/past the end/i);
+
+      const text = contractText(result);
+      expect(text).toMatch(/past the end/i);
+      expect(text).toContain('163');
+      expect(text).not.toContain('No products found');
+    });
+  });
+
+  // ── text-index freshness disclosure (GH issue #31) ────────────────────────
+
+  describe('text-index freshness', () => {
+    it('declares the snapshot property on a text search', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      await offSearchProductsTool.handler({ query: 'hummus', page: 1, page_size: 20 }, ctx);
+
+      const disclosure = String(getEnrichment(ctx).text_index_snapshot ?? '');
+      expect(disclosure).toMatch(/snapshot/i);
+      expect(disclosure).toMatch(/lags/i);
+      // No hard-coded index date: the endpoint publishes no index timestamp, so a literal date
+      // in a runtime string would be a claim nothing re-checks.
+      expect(disclosure).not.toMatch(/20\d\d/);
+    });
+
+    it('declares nothing of the kind on a tag-only search', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      await offSearchProductsTool.handler(
+        { categories_tag: 'en:hummus', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      expect(getEnrichment(ctx).text_index_snapshot).toBeUndefined();
+    });
+
+    it('carries the disclosure on both client surfaces', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001', product_name: 'Hummus' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'hummus',
+        page: 1,
+        page_size: 20,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(String(structured.text_index_snapshot ?? '')).toMatch(/snapshot/i);
+      expect(contractText(result)).toMatch(/snapshot/i);
+    });
+
+    it('leaves a tag-only response free of the disclosure on both surfaces', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001', product_name: 'Hummus' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(
+        (result.structuredContent as Record<string, unknown>).text_index_snapshot,
+      ).toBeUndefined();
+      expect(contractText(result)).not.toMatch(/snapshot/i);
+    });
+
+    it('does not claim nonexistence when a text search returns nothing', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler(
+        { query: 'zwarte knoflook hummus', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toMatch(/recently contributed/i);
+      // Names what does reach a product the index has not caught up to.
+      expect(notice).toMatch(/without query/i);
+      expect(notice).toContain('off_get_product');
+      expect(notice).not.toMatch(/no such product|does not exist|is not in the database/i);
+    });
+
+    it('keeps the recently-contributed caveat off a tag-only empty result', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler(
+        { categories_tag: 'en:nonexistent-category', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).not.toMatch(/recently contributed/i);
+      expect(notice).toMatch(/off_browse_taxonomy/);
+    });
+
+    it('states the freshness split in the tool and query descriptions', () => {
+      expect(offSearchProductsTool.description).toMatch(/snapshot/i);
+      expect(inputDescription('query')).toMatch(/snapshot/i);
+      expect(inputDescription('query')).toMatch(/lags/i);
+    });
+
+    it('does not overload total_is_lower_bound to signal staleness', async () => {
+      // #18 gave the flag one meaning — the backend stopped counting at its ceiling. A fresh,
+      // fully counted text search must leave it false even though the index lags.
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await offSearchProductsTool.handler(
+        { query: 'hummus', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      expect(result.total_is_lower_bound).toBe(false);
+    });
   });
 
   // ── ecoscore_grade in search results ──────────────────────────────────────
