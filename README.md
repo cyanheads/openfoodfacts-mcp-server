@@ -293,7 +293,9 @@ Open Food Facts data is released under the [Open Database License (ODbL) 1.0](ht
 
 ## Contributing
 
-Issues are welcome. Run checks and tests before submitting:
+Bugs, feature requests, and documentation gaps all belong in an issue — see [`CONTRIBUTING.md`](./.github/CONTRIBUTING.md) for the forms, what makes a report actionable, and how to tell a server bug from a framework one. Vulnerabilities go through [private disclosure](./.github/SECURITY.md), never a public issue.
+
+Working on the code? Both gates must be green:
 
 ```sh
 bun run devcheck
