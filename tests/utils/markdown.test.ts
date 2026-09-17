@@ -45,6 +45,13 @@ describe('mdTableCell', () => {
     expect(mdTableCell('*A* | `B`')).toBe('\\*A\\* \\| \\`B\\`');
   });
 
+  it('escapes a backslash before the pipe pass, so a value cannot re-open its own pipe', () => {
+    // Order is load-bearing: the inline pass doubles every backslash first, so the pipe escape it
+    // adds afterwards can never be neutralized by a backslash the value itself carried.
+    expect(mdTableCell('a\\|b')).toBe('a\\\\\\|b');
+    expect(mdTableCell('\\')).toBe('\\\\');
+  });
+
   it('leaves an ordinary cell untouched', () => {
     expect(mdTableCell('Nutella (Ferrero)')).toBe('Nutella (Ferrero)');
   });
