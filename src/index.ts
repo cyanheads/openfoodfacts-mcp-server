@@ -14,12 +14,8 @@ await createApp({
   title: 'openfoodfacts-mcp-server',
   tools: allToolDefinitions,
   instructions:
-    'Use the off_* tools to query Open Food Facts — a free, crowd-sourced global food product database covering 3M+ products. ' +
-    'Primary workflow: off_get_product for barcode lookup (EAN-13/UPC), off_search_products to find products by text or tags, ' +
-    'off_compare_products for side-by-side nutrition comparison, off_browse_taxonomy to resolve human terms to canonical tag IDs. ' +
-    'Data is crowd-sourced — missing fields mean "not yet entered," not that the attribute is absent. ' +
-    'Computed scores (Nutri-Score, NOVA, Green-Score) carry regional caveats. ' +
-    'No API key required. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Query Open Food Facts, a free crowd-sourced database of 3M+ packaged foods: off_get_product looks up one product by EAN-13/UPC barcode, off_search_products finds products by text or tag filters, off_compare_products puts several side by side on nutrition, and off_browse_taxonomy resolves a human term to the canonical tag ID the other tools filter on — so start there when you have a category or label rather than a barcode. Every field is contributor-entered, so a missing one means "not yet recorded" rather than absent, and the computed Nutri-Score, NOVA, and Green-Score grades carry regional caveats. No API key is required; the data is ODbL 1.0, so cite Open Food Facts wherever you pass it on.',
+  sessionMode: 'stateless',
   setup() {
     initOpenFoodFactsService();
     initTaxonomyService();
