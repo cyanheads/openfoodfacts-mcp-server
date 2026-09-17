@@ -16,6 +16,7 @@ import {
   type NutrientOperator,
   type SearchParams,
 } from '@/services/openfoodfacts/types.js';
+import { mdInline } from '@/utils/markdown.js';
 
 /** Comparison symbol per operator, for echoing a constraint back to the caller in the notice. */
 const NUTRIENT_OPERATOR_SYMBOLS: Record<NutrientOperator, string> = {
@@ -528,20 +529,24 @@ export const offSearchProductsTool = tool('off_search_products', {
     lines.push('');
 
     for (const p of result.products) {
-      lines.push(`### ${p.product_name ?? 'Unknown product'}`);
-      lines.push(`**Barcode:** ${p.barcode}`);
-      if (p.brands) lines.push(`**Brand:** ${p.brands}`);
+      // Every value on a result row comes from the upstream record, the barcode included — it is
+      // the record's own `code`, not the caller's input — so all of them are escaped.
+      lines.push(
+        `### ${p.product_name === undefined ? 'Unknown product' : mdInline(p.product_name)}`,
+      );
+      lines.push(`**Barcode:** ${mdInline(p.barcode)}`);
+      if (p.brands) lines.push(`**Brand:** ${mdInline(p.brands)}`);
 
       const scores: string[] = [];
-      if (p.nutriscore_grade) scores.push(`Nutri-Score: ${p.nutriscore_grade}`);
+      if (p.nutriscore_grade) scores.push(`Nutri-Score: ${mdInline(p.nutriscore_grade)}`);
       if (p.nova_group !== undefined) scores.push(`NOVA: ${p.nova_group}`);
-      if (p.ecoscore_grade) scores.push(`Green-Score: ${p.ecoscore_grade}`);
+      if (p.ecoscore_grade) scores.push(`Green-Score: ${mdInline(p.ecoscore_grade)}`);
       if (scores.length > 0) lines.push(`**Scores:** ${scores.join(' | ')}`);
 
       if (p.categories_tags && p.categories_tags.length > 0) {
         // Rendered in full — structuredContent already carries every tag, so slicing here only
         // left text-only clients with a short list they had no way to complete.
-        lines.push(`**Categories:** ${p.categories_tags.join(', ')}`);
+        lines.push(`**Categories:** ${p.categories_tags.map(mdInline).join(', ')}`);
       }
       lines.push('');
     }

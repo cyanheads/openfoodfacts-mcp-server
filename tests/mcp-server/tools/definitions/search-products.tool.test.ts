@@ -1417,5 +1417,72 @@ describe('off_search_products', () => {
 
       for (const tag of categories_tags) expect(text).toContain(tag);
     });
+
+    // ── #27: crowd-sourced row values render as data, not as structure ──────
+
+    it('renders a product_name carrying a fence and a heading as one heading line', () => {
+      const product_name = '```\n# INJECTED';
+      const output = {
+        total: 1,
+        total_is_lower_bound: false,
+        page: 1,
+        page_count: 1,
+        products: [{ barcode: '1234567890001', product_name }],
+      };
+
+      const text = firstText(offSearchProductsTool.format!(output));
+
+      expect(text.split('\n').filter((line) => line.startsWith('#'))).toHaveLength(1);
+      expect(output.products[0]?.product_name).toBe(product_name);
+    });
+
+    it('escapes the row values that come from the upstream record', () => {
+      // The barcode on this surface is the upstream record's `code`, not caller input.
+      const output = {
+        total: 1,
+        total_is_lower_bound: false,
+        page: 1,
+        page_count: 1,
+        products: [
+          {
+            barcode: '1234\n# not a heading',
+            product_name: 'Row',
+            brands: '*bold*',
+            nutriscore_grade: 'a_b',
+            categories_tags: ['en:x`y`'],
+          },
+        ],
+      };
+
+      const text = firstText(offSearchProductsTool.format!(output));
+
+      expect(text).toContain('\\*bold\\*');
+      expect(text).toContain('a\\_b');
+      expect(text).toContain('en:x\\`y\\`');
+      expect(text.split('\n').filter((line) => line.startsWith('#'))).toHaveLength(1);
+      expect(output.products[0]?.brands).toBe('*bold*');
+    });
+
+    it('adds no backslashes to ordinary rows', () => {
+      const text = firstText(
+        offSearchProductsTool.format!({
+          total: 1,
+          total_is_lower_bound: false,
+          page: 1,
+          page_count: 1,
+          products: [
+            {
+              barcode: '3017620422003',
+              product_name: 'Nutella',
+              brands: 'Ferrero',
+              nutriscore_grade: 'e',
+              categories_tags: ['en:organic'],
+            },
+          ],
+        }),
+      );
+
+      expect(text).not.toContain('\\');
+    });
   });
 });

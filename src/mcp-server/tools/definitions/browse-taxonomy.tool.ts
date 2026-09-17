@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import { mdInline, mdInlineCode } from '@/utils/markdown.js';
 
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
@@ -142,7 +143,9 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     for (const tag of result.tags) {
       const products =
         tag.products !== undefined ? ` (~${tag.products.toLocaleString()} products)` : '';
-      lines.push(`- \`${tag.id}\` — ${tag.name}${products}`);
+      // A backtick in a tag ID would close a single-backtick span and render the rest of the ID as
+      // prose, so the span's delimiter is sized past whatever the ID carries.
+      lines.push(`- ${mdInlineCode(tag.id)} — ${mdInline(tag.name)}${products}`);
     }
 
     lines.push(

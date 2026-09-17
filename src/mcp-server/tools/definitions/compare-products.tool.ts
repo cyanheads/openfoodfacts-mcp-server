@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import type { RawProduct } from '@/services/openfoodfacts/types.js';
+import { mdInline, mdTableCell } from '@/utils/markdown.js';
 
 /** Fields needed for comparison — narrower than full product fetch. */
 const COMPARE_FIELDS =
@@ -60,6 +61,43 @@ function describeFailure(barcode: string, error: unknown): FailedFetch {
     reason: 'upstream_error',
     error: error instanceof Error ? error.message : String(error),
   };
+}
+
+/**
+ * Reasons whose declared contract says a repeat of the same request can succeed. `upstream_rejected`
+ * is the one that cannot — the tool's own contract for it says the request will be refused again —
+ * so an all-rejected batch is never told to wait and retry.
+ */
+const RETRYABLE_REASONS = new Set(['upstream_error', 'upstream_timeout', 'rate_limited']);
+
+/**
+ * The closing line of a batch in which no barcode resolved to a product. The structured result
+ * already separates the two settlements — a fetch that failed taught nothing about its barcode,
+ * while a `not_found` barcode was answered for — so the text reads them off rather than flattening
+ * both into one "no products found" that fits neither.
+ */
+function zeroFoundSummary(notFound: string[], failed: FailedFetch[]): string {
+  const uncheckable = failed.length > 0;
+  const missing = notFound.length > 0;
+
+  if (uncheckable && missing) {
+    return (
+      `No barcode resolved to a product: Open Food Facts holds no contributor record for ${notFound.length} ` +
+      `of them, and ${failed.length} could not be checked at all because the fetch failed.`
+    );
+  }
+
+  if (uncheckable) {
+    const recovery = failed.some((f) => RETRYABLE_REASONS.has(f.reason))
+      ? 'Retry them once Open Food Facts is answering again.'
+      : 'Open Food Facts refused every request as formed, so check the barcode digits before sending them again.';
+    return `No barcode could be checked — every fetch failed, so nothing was learned about these products. ${recovery}`;
+  }
+
+  return (
+    'Open Food Facts answered for every barcode and holds no contributor record for any of them. ' +
+    'The products may exist without being entered yet — check the digits, or find them by name with off_search_products.'
+  );
 }
 
 /** Build a comparison row from a raw product. */
@@ -302,14 +340,16 @@ export const offCompareProductsTool = tool('off_compare_products', {
     if (result.failed && result.failed.length > 0) {
       lines.push('**Fetch failed** — these barcodes were not checked, not confirmed missing:');
       for (const f of result.failed) {
-        lines.push(`- ${f.barcode} (${f.reason}): ${f.error}`);
+        // The upstream's own explanation rides in `error`, so it is escaped like any other value
+        // this server did not author.
+        lines.push(`- ${f.barcode} (${f.reason}): ${mdInline(f.error)}`);
       }
       lines.push('');
     }
 
     const found = result.products.filter((p) => p.found);
     if (found.length === 0) {
-      lines.push('No products found. Try off_get_product on individual barcodes to verify.');
+      lines.push(zeroFoundSummary(result.not_found, result.failed ?? []));
       return [{ type: 'text' as const, text: lines.join('\n') }];
     }
 
@@ -318,8 +358,10 @@ export const offCompareProductsTool = tool('off_compare_products', {
     lines.push('| Product | Barcode | Found | Nutri-Score | NOVA | Eco-Score | Completeness |');
     lines.push('|:--------|:--------|:------|:------------|:-----|:----------|:-------------|');
     for (const p of result.products) {
+      // Product names and brands are contributor-edited: a bare pipe would add a column to this
+      // row and a line break would end it, so both are neutralized before the cell is written.
       const name = p.product_name
-        ? `${p.product_name}${p.brands ? ` (${p.brands})` : ''}`
+        ? `${mdTableCell(p.product_name)}${p.brands ? ` (${mdTableCell(p.brands)})` : ''}`
         : `Barcode ${p.barcode}`;
       // The exact scalar rides alongside the rounded percentage: 0.7875 and 0.79 both render as
       // "79%", and a text-only client has no second call that would recover the difference.
@@ -327,8 +369,10 @@ export const offCompareProductsTool = tool('off_compare_products', {
         p.completeness !== undefined
           ? `${Math.round(p.completeness * 100)}% (${p.completeness})`
           : 'N/A';
+      const grade = (value: string | undefined) =>
+        value === undefined ? 'N/A' : mdTableCell(value);
       lines.push(
-        `| ${name} | ${p.barcode} | ${p.found} | ${p.nutriscore_grade ?? 'N/A'} | ${p.nova_group ?? 'N/A'} | ${p.ecoscore_grade ?? 'N/A'} | ${completeness} |`,
+        `| ${name} | ${p.barcode} | ${p.found} | ${grade(p.nutriscore_grade)} | ${p.nova_group ?? 'N/A'} | ${grade(p.ecoscore_grade)} | ${completeness} |`,
       );
     }
 
@@ -341,7 +385,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
       '|:--------|:-------------|:--------|:-------------|:-----------|:---------|:------------|:----------|',
     );
     for (const p of found) {
-      const name = p.product_name ?? `Barcode ${p.barcode}`;
+      const name =
+        p.product_name === undefined ? `Barcode ${p.barcode}` : mdTableCell(p.product_name);
       const fmt = (v: number | undefined) => (v !== undefined ? String(v) : 'N/A');
       lines.push(
         `| ${name} | ${fmt(p.energy_kcal_100g)} | ${fmt(p.fat_100g)} | ${fmt(p.saturated_fat_100g)} | ${fmt(p.sugars_100g)} | ${fmt(p.salt_100g)} | ${fmt(p.proteins_100g)} | ${fmt(p.fiber_100g)} |`,
@@ -354,7 +399,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     );
     if (lowCompleteness.length > 0) {
       lines.push(
-        `\n*Low completeness (< 50%): ${lowCompleteness.map((p) => p.product_name ?? p.barcode).join(', ')} — many fields may be missing.*`,
+        `\n*Low completeness (< 50%): ${lowCompleteness.map((p) => mdInline(p.product_name ?? p.barcode)).join(', ')} — many fields may be missing.*`,
       );
     }
 

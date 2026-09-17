@@ -383,6 +383,204 @@ describe('off_compare_products', () => {
     expect(text).toContain('(1/3 found)');
   });
 
+  // ── #29: a zero-found batch reads off its settlement categories ───────────
+
+  it('says no barcode was checked when every fetch failed', () => {
+    // #29: the zero-found branch appended "No products found. Try off_get_product on individual
+    // barcodes to verify." after saying the barcodes were not checked — three settlements
+    // collapsed into one line that fits none of them.
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [],
+        succeeded: 0,
+        not_found: [],
+        failed: [
+          {
+            barcode: '3017620422003',
+            reason: 'upstream_error',
+            error: 'Open Food Facts is unavailable. (failed after 4 attempts).',
+          },
+          {
+            barcode: '7622210100146',
+            reason: 'upstream_error',
+            error: 'Open Food Facts is unavailable. (failed after 4 attempts).',
+          },
+        ],
+      }),
+    );
+
+    expect(text).not.toContain('No products found');
+    expect(text).not.toContain('off_get_product');
+    expect(text).toContain('No barcode could be checked');
+    // Retryable reasons — the recovery says to retry, and never that the products are missing.
+    expect(text).toContain('Retry');
+    expect(text).not.toMatch(/not yet entered|no contributor record/);
+  });
+
+  it('does not tell the caller to retry a batch Open Food Facts refused outright', () => {
+    // upstream_rejected is declared non-retryable — the request as formed is refused again.
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [],
+        succeeded: 0,
+        not_found: [],
+        failed: [
+          { barcode: '3017620422003', reason: 'upstream_rejected', error: 'Refused (HTTP 400).' },
+          { barcode: '7622210100146', reason: 'upstream_rejected', error: 'Refused (HTTP 400).' },
+        ],
+      }),
+    );
+
+    expect(text).not.toContain('No products found');
+    expect(text).not.toMatch(/\bRetry\b/i);
+    expect(text).toContain('No barcode could be checked');
+  });
+
+  it('states the absence of a contributor record when every barcode is not_found', () => {
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [
+          { barcode: '00000000000001', found: false },
+          { barcode: '00000000000002', found: false },
+        ],
+        succeeded: 0,
+        not_found: ['00000000000001', '00000000000002'],
+      }),
+    );
+
+    expect(text).not.toContain('No products found');
+    expect(text).toContain('no contributor record');
+    // Nothing may imply a fetch failed — Open Food Facts answered for every barcode.
+    expect(text).not.toMatch(/could not be checked|not checked|failed/i);
+  });
+
+  it('states both settlements separately when a zero-found batch mixes them', () => {
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [{ barcode: '00000000000001', found: false }],
+        succeeded: 0,
+        not_found: ['00000000000001'],
+        failed: [{ barcode: '3017620422003', reason: 'upstream_timeout', error: 'Timed out.' }],
+      }),
+    );
+
+    expect(text).not.toContain('No products found');
+    expect(text).toContain('no contributor record');
+    expect(text).toContain('could not be checked');
+  });
+
+  it('leaves a batch with at least one found row unchanged', () => {
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [
+          {
+            barcode: '3017620422003',
+            product_name: 'Nutella',
+            found: true,
+            nutriscore_grade: 'e',
+            completeness: 0.4,
+            energy_kcal_100g: 539,
+          },
+          { barcode: '00000000000001', found: false },
+        ],
+        succeeded: 1,
+        not_found: ['00000000000001'],
+        failed: [{ barcode: '7622210100146', reason: 'upstream_error', error: 'Down.' }],
+      }),
+    );
+
+    expect(text).toContain('### Scores');
+    expect(text).toContain('### Nutrition per 100g');
+    expect(text).toContain('Low completeness (< 50%)');
+    expect(text).toContain('**Not found:** 00000000000001');
+    expect(text).toContain('not checked, not confirmed missing');
+    expect(text).not.toContain('No barcode could be checked');
+  });
+
+  // ── #27: table cells cannot add columns or end their row ──────────────────
+
+  it('keeps a row whose values carry pipes and newlines inside its own columns', () => {
+    const output = {
+      products: [
+        {
+          barcode: '12345678',
+          product_name: 'A | B',
+          brands: 'C | D',
+          found: true,
+          nutriscore_grade: 'e|x',
+          energy_kcal_100g: 539,
+        },
+        {
+          barcode: '87654321',
+          product_name: 'Line\nBreak',
+          found: true,
+          energy_kcal_100g: 100,
+        },
+      ],
+      succeeded: 2,
+      not_found: [],
+    };
+    const lines = firstText(offCompareProductsTool.format!(output)).split('\n');
+    const pipes = (line: string): number => (line.match(/(?<!\\)\|/g) ?? []).length;
+
+    const scoresHeader = lines.findIndex((line) => line.startsWith('| Product | Barcode |'));
+    for (const row of lines.slice(scoresHeader, scoresHeader + 4)) {
+      expect(pipes(row)).toBe(pipes(lines[scoresHeader] as string));
+    }
+
+    const nutritionHeader = lines.findIndex((line) => line.startsWith('| Product | Energy'));
+    for (const row of lines.slice(nutritionHeader, nutritionHeader + 4)) {
+      expect(pipes(row)).toBe(pipes(lines[nutritionHeader] as string));
+    }
+
+    // structuredContent keeps the raw values.
+    expect(output.products[0]?.product_name).toBe('A | B');
+    expect(output.products[1]?.product_name).toBe('Line\nBreak');
+  });
+
+  it('escapes the failed bullet and the low-completeness line', () => {
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [
+          {
+            barcode: '12345678',
+            product_name: '*Low*',
+            found: true,
+            completeness: 0.2,
+            energy_kcal_100g: 1,
+          },
+        ],
+        succeeded: 1,
+        not_found: [],
+        failed: [{ barcode: '87654321', reason: 'upstream_rejected', error: 'Refused: <b>no</b>' }],
+      }),
+    );
+
+    expect(text).toContain('Refused: \\<b>no\\</b>');
+    expect(text).toContain('Low completeness (< 50%): \\*Low\\*');
+  });
+
+  it('adds no backslashes to ordinary rows', () => {
+    const text = firstText(
+      offCompareProductsTool.format!({
+        products: [
+          {
+            barcode: '3017620422003',
+            product_name: 'Nutella',
+            brands: 'Ferrero',
+            found: true,
+            nutriscore_grade: 'e',
+            energy_kcal_100g: 539,
+          },
+        ],
+        succeeded: 1,
+        not_found: [],
+      }),
+    );
+
+    expect(text).not.toContain('\\');
+  });
+
   // ── sparsity: missing nutrition fields ≠ zero ────────────────────────────
 
   it('preserves null nutrition fields without fabricating zeros for found products', async () => {

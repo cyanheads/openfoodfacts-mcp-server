@@ -708,6 +708,36 @@ describe('off_browse_taxonomy', () => {
     });
   });
 
+  // ── #27: a tag ID cannot close its own code span ─────────────────────────
+
+  describe('markdown escaping', () => {
+    it('keeps a tag ID carrying a backtick inside one code span', () => {
+      const tags = [{ id: 'en:x` — **pwned**, `en:y', name: 'Display `name`' }];
+      const text = firstText(offBrowseTaxonomyTool.format!({ facet: 'categories', tags }));
+      const bullet = text.split('\n').find((line) => line.startsWith('- ')) as string;
+
+      // The whole ID sits between one pair of delimiters, so nothing after it is prose.
+      const delimiter = /^- (`+)/.exec(bullet)?.[1] as string;
+      expect(delimiter.length).toBeGreaterThan(1);
+      expect(bullet).toContain(`${delimiter} en:x\` — **pwned**, \`en:y `);
+      expect(bullet).toContain('Display \\`name\\`');
+      // structuredContent is untouched.
+      expect(tags[0]?.id).toBe('en:x` — **pwned**, `en:y');
+    });
+
+    it('adds no backslashes or extra delimiters to ordinary tags', () => {
+      const text = firstText(
+        offBrowseTaxonomyTool.format!({
+          facet: 'labels',
+          tags: [{ id: 'en:organic', name: 'Organic', products: 1234 }],
+        }),
+      );
+
+      expect(text).toContain('- `en:organic` — Organic (~1,234 products)');
+      expect(text).not.toContain('\\');
+    });
+  });
+
   it('throws when taxonomy service is not initialized', () => {
     // After beforeEach calls initTaxonomyService(), the service is initialized.
     expect(() => getTaxonomyService()).not.toThrow();
