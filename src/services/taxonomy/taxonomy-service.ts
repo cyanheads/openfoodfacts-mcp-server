@@ -15,6 +15,16 @@ export type TaxonomyEntry = {
   products?: number;
 };
 
+/**
+ * An embedded entry plus the human-friendly terms it must stay searchable under. Several canonical
+ * tag IDs are not the word a caller reaches for — `en:crustaceans` for "shellfish",
+ * `en:no-gluten` for "gluten free", `en:biscuits` for "cookies" — and the canonical ID is the one
+ * thing that cannot be traded away, because it is what `off_search_products` filters on. Aliases
+ * are matched like the ID and display name and never leave the service: they widen what resolves,
+ * not what is handed to the caller.
+ */
+type EmbeddedEntry = TaxonomyEntry & { aliases?: readonly string[] };
+
 export type Facet =
   | 'categories'
   | 'labels'
@@ -34,8 +44,14 @@ export type Facet =
  * ahead of live suggestions rather than replaced by them, because the autocomplete endpoint matches
  * on display names and answers an E-number query with unrelated E-numbers, so `additives` searches
  * that resolve correctly here would regress on a live-only path.
+ *
+ * Every ID here is a top-level key in the published taxonomy dumps
+ * (https://static.openfoodfacts.org/data/taxonomies/). A synonym or singular form is not an error
+ * anywhere on the way out — it is a filter that matches nothing and reports the zero as exact — so
+ * a term with no canonical key is left out rather than approximated, and the human word it was
+ * carrying moves to `aliases` on the entry that does have one.
  */
-const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
+const TAXONOMY: Record<Facet, EmbeddedEntry[]> = {
   categories: [
     { id: 'en:beverages', name: 'Beverages' },
     { id: 'en:breakfast-cereals', name: 'Breakfast cereals' },
@@ -44,18 +60,16 @@ const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
     { id: 'en:candies', name: 'Candies' },
     { id: 'en:cereals-and-potatoes', name: 'Cereals and potatoes' },
     { id: 'en:cheeses', name: 'Cheeses' },
-    { id: 'en:chips-and-crisps', name: 'Chips and crisps' },
-    { id: 'en:chocolate-bars', name: 'Chocolate bars' },
     { id: 'en:chocolates', name: 'Chocolates' },
-    { id: 'en:cocoa-and-chocolate-products', name: 'Cocoa and chocolate products' },
-    { id: 'en:coffee', name: 'Coffee' },
+    { id: 'en:cocoa-and-its-products', name: 'Cocoa and its products' },
+    { id: 'en:coffees', name: 'Coffees' },
     { id: 'en:condiments', name: 'Condiments' },
-    { id: 'en:cookies', name: 'Cookies' },
+    { id: 'en:biscuits', name: 'Biscuits', aliases: ['cookies'] },
     { id: 'en:dairy-desserts', name: 'Dairy desserts' },
     { id: 'en:dried-fruits', name: 'Dried fruits' },
     { id: 'en:energy-drinks', name: 'Energy drinks' },
     { id: 'en:fermented-milk-products', name: 'Fermented milk products' },
-    { id: 'en:fish', name: 'Fish' },
+    { id: 'en:fishes', name: 'Fishes' },
     { id: 'en:fruit-juices', name: 'Fruit juices' },
     { id: 'en:fruits-and-vegetables-based-foods', name: 'Fruits and vegetables based foods' },
     { id: 'en:ice-creams', name: 'Ice creams' },
@@ -63,17 +77,19 @@ const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
     { id: 'en:legumes', name: 'Legumes' },
     { id: 'en:margarines', name: 'Margarines' },
     { id: 'en:meats', name: 'Meats' },
-    { id: 'en:milk', name: 'Milk' },
+    { id: 'en:milks', name: 'Milks' },
     { id: 'en:mineral-waters', name: 'Mineral waters' },
-    { id: 'en:mixed-salads', name: 'Mixed salads' },
     { id: 'en:nuts', name: 'Nuts' },
-    { id: 'en:oils', name: 'Oils' },
-    { id: 'en:pasta', name: 'Pasta' },
+    { id: 'en:vegetable-oils', name: 'Vegetable oils' },
+    { id: 'en:pastas', name: 'Pastas' },
     { id: 'en:pastries', name: 'Pastries' },
-    { id: 'en:plant-based-milks', name: 'Plant-based milks' },
-    { id: 'en:prepared-meals', name: 'Prepared meals' },
-    { id: 'en:processed-meats', name: 'Processed meats' },
-    { id: 'en:rice', name: 'Rice' },
+    {
+      id: 'en:plant-based-milk-alternatives',
+      name: 'Plant-based milk alternatives',
+      aliases: ['plant-based milks'],
+    },
+    { id: 'en:meals', name: 'Meals', aliases: ['prepared meals'] },
+    { id: 'en:rices', name: 'Rices' },
     { id: 'en:sauces', name: 'Sauces' },
     { id: 'en:snacks', name: 'Snacks' },
     { id: 'en:soft-drinks', name: 'Soft drinks' },
@@ -81,104 +97,97 @@ const TAXONOMY: Record<Facet, TaxonomyEntry[]> = {
     { id: 'en:spreads', name: 'Spreads' },
     { id: 'en:sugars', name: 'Sugars' },
     { id: 'en:sweetened-beverages', name: 'Sweetened beverages' },
-    { id: 'en:tea', name: 'Tea' },
     { id: 'en:vegetables', name: 'Vegetables' },
     { id: 'en:waters', name: 'Waters' },
     { id: 'en:wines', name: 'Wines' },
     { id: 'en:yogurts', name: 'Yogurts' },
     { id: 'en:baby-foods', name: 'Baby foods' },
-    { id: 'en:cereals', name: 'Cereals' },
-    { id: 'en:crackers', name: 'Crackers' },
-    { id: 'en:dairy-products', name: 'Dairy products' },
+    { id: 'en:cereals-and-their-products', name: 'Cereals and their products' },
+    { id: 'en:dairies', name: 'Dairies', aliases: ['dairy products'] },
     { id: 'en:fats', name: 'Fats' },
-    { id: 'en:flavoured-waters', name: 'Flavoured waters' },
-    { id: 'en:flour', name: 'Flour' },
+    { id: 'en:flavored-waters', name: 'Flavored waters', aliases: ['flavoured waters'] },
+    { id: 'en:flours', name: 'Flours' },
     { id: 'en:fresh-cheeses', name: 'Fresh cheeses' },
-    { id: 'en:fruit-beverages', name: 'Fruit beverages' },
-    { id: 'en:honey', name: 'Honey' },
+    { id: 'en:fruit-based-beverages', name: 'Fruit-based beverages', aliases: ['fruit beverages'] },
+    { id: 'en:honeys', name: 'Honeys' },
     { id: 'en:ketchup', name: 'Ketchup' },
-    { id: 'en:muesli', name: 'Muesli' },
-    { id: 'en:mustard', name: 'Mustard' },
+    { id: 'en:mueslis', name: 'Mueslis' },
+    { id: 'en:mustards', name: 'Mustards' },
     { id: 'en:noodles', name: 'Noodles' },
     { id: 'en:olive-oils', name: 'Olive oils' },
     { id: 'en:plant-based-foods', name: 'Plant-based foods' },
-    { id: 'en:potato-chips', name: 'Potato chips' },
+    { id: 'en:potato-crisps', name: 'Potato crisps', aliases: ['potato chips'] },
     { id: 'en:protein-bars', name: 'Protein bars' },
-    { id: 'en:salted-snacks', name: 'Salted snacks' },
+    { id: 'en:salty-snacks', name: 'Salty snacks', aliases: ['salted snacks'] },
     { id: 'en:sandwiches', name: 'Sandwiches' },
     { id: 'en:seafood', name: 'Seafood' },
     { id: 'en:seeds', name: 'Seeds' },
-    { id: 'en:soy-beverages', name: 'Soy beverages' },
+    { id: 'en:soy-based-drinks', name: 'Soy-based drinks', aliases: ['soy beverages'] },
     { id: 'en:spices', name: 'Spices' },
     { id: 'en:sugar-substitutes', name: 'Sugar substitutes' },
     { id: 'en:sweet-snacks', name: 'Sweet snacks' },
     { id: 'en:teas', name: 'Teas' },
     { id: 'en:vinegars', name: 'Vinegars' },
     { id: 'en:whipped-creams', name: 'Whipped creams' },
-    { id: 'en:whole-wheat-breads', name: 'Whole wheat breads' },
+    { id: 'en:wholemeal-breads', name: 'Wholemeal breads', aliases: ['whole wheat breads'] },
   ],
 
   labels: [
-    { id: 'en:organic', name: 'Organic' },
+    { id: 'en:organic', name: 'Organic', aliases: ['bio'] },
     { id: 'en:fair-trade', name: 'Fair trade' },
-    { id: 'en:no-gluten', name: 'No gluten' },
-    { id: 'en:gluten-free', name: 'Gluten free' },
+    {
+      id: 'en:no-gluten',
+      name: 'No gluten',
+      aliases: ['gluten free', 'gluten-free', 'no gluten-containing ingredients'],
+    },
     { id: 'en:vegan', name: 'Vegan' },
     { id: 'en:vegetarian', name: 'Vegetarian' },
     { id: 'en:no-added-sugar', name: 'No added sugar' },
     { id: 'en:no-artificial-colors', name: 'No artificial colors' },
     { id: 'en:no-artificial-flavors', name: 'No artificial flavors' },
     { id: 'en:no-preservatives', name: 'No preservatives' },
-    { id: 'en:non-gmo', name: 'Non GMO' },
+    { id: 'en:no-gmos', name: 'No GMOs', aliases: ['non-GMO', 'non GMO'] },
     { id: 'en:kosher', name: 'Kosher' },
     { id: 'en:halal', name: 'Halal' },
-    { id: 'en:lactose-free', name: 'Lactose free' },
+    { id: 'en:no-lactose', name: 'No lactose', aliases: ['lactose free', 'lactose-free'] },
     { id: 'en:eu-organic', name: 'EU Organic' },
     { id: 'en:usda-organic', name: 'USDA Organic' },
     { id: 'en:rainforest-alliance', name: 'Rainforest Alliance' },
     { id: 'en:made-in-france', name: 'Made in France' },
-    { id: 'en:bio', name: 'Bio' },
     { id: 'en:whole-grain', name: 'Whole grain' },
     { id: 'en:low-fat', name: 'Low fat' },
     { id: 'en:low-sugar', name: 'Low sugar' },
     { id: 'en:low-sodium', name: 'Low sodium' },
-    { id: 'en:high-protein', name: 'High protein' },
-    { id: 'en:high-fiber', name: 'High fiber' },
-    { id: 'en:no-gluten-containing-ingredients', name: 'No gluten-containing ingredients' },
-    { id: 'en:palm-oil-free', name: 'Palm oil free' },
-    { id: 'en:without-palm-oil', name: 'Without palm oil' },
-    { id: 'en:fr-bio', name: 'FR Bio' },
+    { id: 'en:high-proteins', name: 'High proteins' },
+    { id: 'en:high-fibres', name: 'High fibres', aliases: ['high fiber', 'high-fiber'] },
+    {
+      id: 'en:no-palm-oil',
+      name: 'No palm oil',
+      aliases: ['palm oil free', 'palm-oil-free', 'without palm oil'],
+    },
     { id: 'en:made-in-germany', name: 'Made in Germany' },
   ],
 
+  /**
+   * The 14 allergens Open Food Facts recognizes as tags. Per-nut and per-grain terms (almonds,
+   * hazelnuts, wheat, rye, lactose, …) have no allergen key upstream — they are ingredients, not
+   * allergen tags — so they are absent rather than mapped onto a broader tag they do not mean.
+   */
   allergens: [
     { id: 'en:gluten', name: 'Gluten' },
     { id: 'en:milk', name: 'Milk' },
     { id: 'en:eggs', name: 'Eggs' },
     { id: 'en:fish', name: 'Fish' },
-    { id: 'en:shellfish', name: 'Shellfish (Crustaceans)' },
+    { id: 'en:crustaceans', name: 'Crustaceans', aliases: ['shellfish'] },
     { id: 'en:peanuts', name: 'Peanuts' },
     { id: 'en:soybeans', name: 'Soybeans' },
-    { id: 'en:tree-nuts', name: 'Tree nuts' },
     { id: 'en:celery', name: 'Celery' },
     { id: 'en:mustard', name: 'Mustard' },
     { id: 'en:sesame-seeds', name: 'Sesame seeds' },
     { id: 'en:sulphur-dioxide-and-sulphites', name: 'Sulphur dioxide and sulphites' },
     { id: 'en:lupin', name: 'Lupin' },
     { id: 'en:molluscs', name: 'Molluscs' },
-    { id: 'en:nuts', name: 'Nuts (general)' },
-    { id: 'en:wheat', name: 'Wheat' },
-    { id: 'en:rye', name: 'Rye' },
-    { id: 'en:barley', name: 'Barley' },
-    { id: 'en:oats', name: 'Oats' },
-    { id: 'en:lactose', name: 'Lactose' },
-    { id: 'en:almonds', name: 'Almonds' },
-    { id: 'en:cashews', name: 'Cashews' },
-    { id: 'en:walnuts', name: 'Walnuts' },
-    { id: 'en:hazelnuts', name: 'Hazelnuts' },
-    { id: 'en:pecans', name: 'Pecans' },
-    { id: 'en:pistachios', name: 'Pistachios' },
-    { id: 'en:brazil-nuts', name: 'Brazil nuts' },
+    { id: 'en:nuts', name: 'Nuts', aliases: ['tree nuts', 'tree-nuts'] },
   ],
 
   additives: [
@@ -303,11 +312,21 @@ const LIVE_TAXONOMY_NAME: Partial<Record<Facet, string>> = {
   countries: 'country',
 };
 
-/** The facet's documented match rule: case-insensitive substring against tag ID or display name. */
-function matchesTerm(entry: TaxonomyEntry, term: string): boolean {
+/**
+ * The facet's documented match rule: case-insensitive substring against tag ID, display name, or —
+ * for embedded entries — one of the human synonyms the canonical ID does not spell out.
+ */
+function matchesTerm(entry: EmbeddedEntry, term: string): boolean {
   const needle = term.toLowerCase();
-  return entry.id.toLowerCase().includes(needle) || entry.name.toLowerCase().includes(needle);
+  return (
+    entry.id.toLowerCase().includes(needle) ||
+    entry.name.toLowerCase().includes(needle) ||
+    (entry.aliases?.some((alias) => alias.toLowerCase().includes(needle)) ?? false)
+  );
 }
+
+/** Public projection: aliases widen what resolves, never what the caller is handed. */
+const toTag = ({ aliases: _aliases, ...tag }: EmbeddedEntry): TaxonomyEntry => tag;
 
 export type TaxonomySearchResult = {
   facet: string;
@@ -354,7 +373,7 @@ export class TaxonomyService {
       const matched = term ? embedded.filter((entry) => matchesTerm(entry, term)) : embedded;
       return {
         facet,
-        tags: matched.slice(0, limit),
+        tags: matched.slice(0, limit).map(toTag),
         total_in_facet: embedded.length,
         matched_in_facet: matched.length,
       };
@@ -363,7 +382,7 @@ export class TaxonomyService {
     if (!term) {
       return {
         facet,
-        tags: embedded.slice(0, limit),
+        tags: embedded.slice(0, limit).map(toTag),
         matched_in_facet: embedded.length,
         notice:
           `This is this server's offline ${facet} sample (${embedded.length} entries), not the Open Food Facts ` +
@@ -395,7 +414,7 @@ export class TaxonomyService {
       });
       return {
         facet,
-        tags: offline.slice(0, limit),
+        tags: offline.slice(0, limit).map(toTag),
         matched_in_facet: offline.length,
         notice:
           `The live Open Food Facts ${facet} vocabulary could not be reached ` +
@@ -413,7 +432,7 @@ export class TaxonomyService {
      * kombucha, olive oil, organic, tofu, …) this drops nothing and removes only that noise.
      */
     const seen = new Set(offline.map((entry) => entry.id));
-    const merged = [...offline];
+    const merged: TaxonomyEntry[] = offline.map(toTag);
     for (const entry of live) {
       if (!seen.has(entry.id) && matchesTerm(entry, term)) {
         seen.add(entry.id);

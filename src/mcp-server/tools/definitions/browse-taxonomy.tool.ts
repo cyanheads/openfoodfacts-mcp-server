@@ -9,7 +9,7 @@ import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-ser
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
   description:
-    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it returns only a small reference list for each facet except NOVA groups and Nutri-Score grades, which are complete. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:gluten-free", "en:milk"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural ("kombucha" resolves to "en:kombuchas"), so use the returned id rather than constructing one.',
+    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it returns only a small reference list for each facet except NOVA groups and Nutri-Score grades, which are complete. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:no-gluten", "en:crustaceans"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural ("kombucha" resolves to "en:kombuchas"), so use the returned id rather than constructing one.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -34,7 +34,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .string()
       .optional()
       .describe(
-        'Term to resolve. Matched case-insensitively as a substring of the tag ID or display name. A single word works best ("hummus", not "hummus dip"). Omit only to see a small reference list — Open Food Facts cannot list the full vocabulary without a term, so an unfiltered call is not a view of the full facet.',
+        'Term to resolve. Matched case-insensitively as a substring of the tag ID, the display name, or a common synonym of either ("shellfish" resolves to en:crustaceans, "gluten free" to en:no-gluten). A single word works best ("hummus", not "hummus dip"). Omit only to see a small reference list — Open Food Facts cannot list the full vocabulary without a term, so an unfiltered call is not a view of the full facet.',
       ),
     limit: z
       .number()

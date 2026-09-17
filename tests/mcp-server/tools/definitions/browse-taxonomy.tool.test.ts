@@ -24,7 +24,8 @@ vi.mock('@/config/server-config.js', () => ({
 
 import { offBrowseTaxonomyTool } from '@/mcp-server/tools/definitions/browse-taxonomy.tool.js';
 import { initOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import { initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import { getTaxonomyService, initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import { CANONICAL_TAG_IDS } from '../../../fixtures/canonical-tag-ids.js';
 
 /** One suggestion in the shape the autocomplete endpoint returns. */
 type Option = { id: string; text: string; taxonomy_name?: string };
@@ -608,9 +609,106 @@ describe('off_browse_taxonomy', () => {
     expect(byId.tags.some((t) => t.id === 'en:e322')).toBe(true);
   });
 
-  it('throws when taxonomy service is not initialized', async () => {
-    // Verify the accessor guard is present — accessing without init throws.
-    const { getTaxonomyService } = await import('@/services/taxonomy/taxonomy-service.js');
+  // ── GH issue #30: every embedded ID is a canonical, filterable key ─────────
+
+  describe('canonical tag IDs (GH issue #30)', () => {
+    const openFacets = ['categories', 'labels', 'allergens'] as const;
+
+    it.each(openFacets)(
+      '%s: an unfiltered browse returns only canonical keys, each once',
+      async (facet) => {
+        // A non-canonical ID is not an error anywhere — it is a filter that matches nothing and
+        // reports the zero as exact — so canonicality is pinned against the dump-derived fixture
+        // rather than left to a live call.
+        const result = await offBrowseTaxonomyTool.handler(
+          { facet, limit: 100 },
+          createMockContext(),
+        );
+        const ids = result.tags.map((t) => t.id);
+
+        expect(new Set(ids).size).toBe(ids.length);
+        expect(ids.toSorted()).toEqual([...CANONICAL_TAG_IDS[facet]]);
+      },
+    );
+
+    it.each(openFacets)(
+      '%s: format() renders exactly the IDs structuredContent carries',
+      async (facet) => {
+        const result = await offBrowseTaxonomyTool.handler(
+          { facet, limit: 100 },
+          createMockContext(),
+        );
+        const text = firstText(offBrowseTaxonomyTool.format!(result));
+
+        expect(result.tags.length).toBe(CANONICAL_TAG_IDS[facet].length);
+        for (const tag of result.tags) expect(text).toContain(`\`${tag.id}\``);
+      },
+    );
+
+    it('resolves "shellfish" to en:crustaceans and "tree nuts" to en:nuts', async () => {
+      // allergens_tags=en:shellfish matched 16 products against 11,611 for en:crustaceans; the
+      // human term has to keep reaching the entry now that the ID is the canonical one.
+      const shellfish = await offBrowseTaxonomyTool.handler(
+        { facet: 'allergens', search: 'shellfish', limit: 20 },
+        ctx,
+      );
+      expect(shellfish.tags.map((t) => t.id)).toEqual(['en:crustaceans']);
+
+      const treeNuts = await offBrowseTaxonomyTool.handler(
+        { facet: 'allergens', search: 'tree nuts', limit: 20 },
+        createMockContext(),
+      );
+      expect(treeNuts.tags.map((t) => t.id)).toEqual(['en:nuts']);
+    });
+
+    it('resolves the human terms through the service seam too', async () => {
+      const svc = getTaxonomyService();
+
+      const shellfish = await svc.search('allergens', 'shellfish', 20, ctx);
+      expect(shellfish.tags).toEqual([{ id: 'en:crustaceans', name: 'Crustaceans' }]);
+
+      const glutenFree = await svc.search('labels', 'gluten-free', 20, createMockContext());
+      expect(glutenFree.tags).toEqual([{ id: 'en:no-gluten', name: 'No gluten' }]);
+
+      const cookies = await svc.search('categories', 'cookies', 20, createMockContext());
+      expect(cookies.tags).toEqual([{ id: 'en:biscuits', name: 'Biscuits' }]);
+    });
+
+    it('collapses the synonym rows onto one entry per canonical key', async () => {
+      // en:gluten-free and en:no-gluten-containing-ingredients both resolve to en:no-gluten;
+      // en:palm-oil-free and en:without-palm-oil both to en:no-palm-oil. Each must appear once.
+      const gluten = await offBrowseTaxonomyTool.handler(
+        { facet: 'labels', search: 'gluten', limit: 20 },
+        ctx,
+      );
+      expect(gluten.tags.map((t) => t.id)).toEqual(['en:no-gluten']);
+
+      const palm = await offBrowseTaxonomyTool.handler(
+        { facet: 'labels', search: 'palm', limit: 20 },
+        createMockContext(),
+      );
+      expect(palm.tags.map((t) => t.id)).toEqual(['en:no-palm-oil']);
+    });
+
+    it('no longer serves the non-canonical IDs or the dropped entries', async () => {
+      const retired = {
+        allergens: ['en:shellfish', 'en:tree-nuts', 'en:wheat', 'en:lactose', 'en:almonds'],
+        labels: ['en:gluten-free', 'en:non-gmo', 'en:bio', 'en:fr-bio', 'en:palm-oil-free'],
+        categories: ['en:pasta', 'en:tea', 'en:cookies', 'en:mixed-salads', 'en:crackers'],
+      } as const;
+
+      for (const facet of openFacets) {
+        const result = await offBrowseTaxonomyTool.handler(
+          { facet, limit: 100 },
+          createMockContext(),
+        );
+        const ids = result.tags.map((t) => t.id);
+        for (const id of retired[facet]) expect(ids).not.toContain(id);
+      }
+    });
+  });
+
+  it('throws when taxonomy service is not initialized', () => {
     // After beforeEach calls initTaxonomyService(), the service is initialized.
     expect(() => getTaxonomyService()).not.toThrow();
   });
