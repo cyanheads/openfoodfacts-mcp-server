@@ -6,7 +6,7 @@
 
 import { readFileSync } from 'node:fs';
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode, McpError, rateLimited } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import type {
@@ -116,14 +116,52 @@ function upstreamDetail(body: unknown): string | undefined {
   if (typeof body !== 'string' || body.trim() === '') return;
   try {
     const parsed = JSON.parse(body) as { detail?: unknown };
-    if (typeof parsed.detail === 'string') return parsed.detail;
+    if (typeof parsed.detail === 'string') return plainTextDetail(parsed.detail);
   } catch {
     /* Not JSON (HTML error page, plain text) — fall through to the snippet. */
   }
   if (looksLikeHtml(body)) {
     return 'the upstream served a rendered error page rather than JSON, which usually means it is shedding load or refusing this client';
   }
-  return body.slice(0, 200);
+  return plainTextDetail(body);
+}
+
+/** Longest plain-text upstream snippet carried into an error message. */
+const PLAIN_TEXT_DETAIL_LIMIT = 200;
+
+/**
+ * Reduces a body that is neither JSON nor a recognized HTML document to a bounded plain-text
+ * snippet. Markup is dropped rather than truncated into: the message is rendered as Markdown on
+ * the text surface, and a body the HTML sniff did not match can still carry angle brackets that
+ * would land there as syntax. Returns `undefined` when nothing readable survives.
+ */
+function plainTextDetail(body: string): string | undefined {
+  const text = body
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, PLAIN_TEXT_DETAIL_LIMIT)
+    .trim();
+  return text === '' ? undefined : text;
+}
+
+/**
+ * Fields of a framework fetch error this service republishes on the public failure. An allowlist,
+ * not a filter: `fetchWithTimeout` is free to attach whatever diagnostics it needs — including the
+ * captured response body, twice — and the contract is what this server chooses to publish, not
+ * whatever happened to be on the error. Everything else the caller needs (`reason`, `retryable`,
+ * `recovery`, the per-call context) is added at the throw site.
+ */
+const PUBLISHED_ERROR_FIELDS = ['status', 'retryAfter', 'retryAttempts', 'operation'] as const;
+
+/** The published subset of a fetch error's data. */
+function publishedErrorData(data: Record<string, unknown> | undefined): Record<string, unknown> {
+  const published: Record<string, unknown> = {};
+  for (const field of PUBLISHED_ERROR_FIELDS) {
+    if (data?.[field] !== undefined) published[field] = data[field];
+  }
+  return published;
 }
 
 /**
@@ -194,15 +232,15 @@ function toContractError(error: unknown, ctx: Context, data: Record<string, unkn
     `${REASON_MESSAGES[reason]}${typeof status === 'number' ? ` (HTTP ${status})` : ''}` +
     `${detail ? `: ${detail}` : '.'}`;
 
-  return contractError(reason, message, ctx, { ...error.data, ...data }, error);
+  return contractError(reason, message, ctx, { ...publishedErrorData(error.data), ...data }, error);
 }
 
 /** Fields to request on every product fetch — scopes the ~200-key object to what we handle. */
 const PRODUCT_FIELDS =
-  'product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,additives_tags,' +
-  'nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,' +
-  'serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,image_url,' +
-  'completeness,data_quality_tags';
+  'product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,' +
+  'additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,' +
+  'nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,' +
+  'packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags';
 
 /** Fields to request on search results — summary rows for triage. Shared by both search paths. */
 const SEARCH_FIELDS =
@@ -255,6 +293,38 @@ const NUTRIENT_RANGE_FORMS: Record<NutrientOperator, (value: number) => string> 
   gte: (value) => `[${value} TO *]`,
 };
 
+/**
+ * This server's own budget refusal, raised before anything is sent. It is an ordinary
+ * `rate_limited` failure on the wire — retryable, carrying `retryAfter` — and a distinct type only
+ * so the retry boundary it is thrown inside can tell it apart from an upstream 429 and stop.
+ */
+class BudgetExhaustedError extends McpError {}
+
+/**
+ * Error codes the framework treats as transient, mirrored here because `withRetry` does not export
+ * them. Verified against `@cyanheads/mcp-ts-core` 0.13.3's `retry.js`; re-check on a framework bump.
+ */
+const TRANSIENT_CODES = new Set<JsonRpcErrorCode>([
+  JsonRpcErrorCode.ServiceUnavailable,
+  JsonRpcErrorCode.Timeout,
+  JsonRpcErrorCode.RateLimited,
+]);
+
+/**
+ * Retry predicate for every upstream call. It matches the framework default except that this
+ * server's own budget refusal fails fast: the refusal must stay `retryable: true` on the wire —
+ * waiting and retrying is exactly what the caller should do — and `withRetry` would otherwise read
+ * that flag plus its `retryAfter` and sleep out the whole window inside the handler instead of
+ * returning. Opting out by type keeps the two decisions independent.
+ */
+function isRetryableUpstreamFailure(error: unknown): boolean {
+  if (error instanceof BudgetExhaustedError) return false;
+  if (error instanceof McpError) {
+    return error.data?.retryable !== false && TRANSIENT_CODES.has(error.code);
+  }
+  return true;
+}
+
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
 class RateLimiter {
   private readonly windowMs = 60_000;
@@ -266,9 +336,12 @@ class RateLimiter {
   }
 
   /**
-   * Checks and records a request. Throws the declared `rate_limited` failure when this server's own
-   * per-minute budget is spent. The refusal is local — nothing was sent upstream — so the message
-   * names this server rather than Open Food Facts, and carries the wait until a slot frees.
+   * Checks and records one upstream request. Called per attempt from inside the retry boundary, so
+   * the configured per-minute number is the number of requests Open Food Facts can see from this
+   * server rather than the number of logical operations it was asked for. Throws the declared
+   * `rate_limited` failure when the budget is spent. The refusal is local — nothing was sent
+   * upstream — so the message names this server rather than Open Food Facts, and carries the wait
+   * until a slot frees.
    */
   check(endpoint: string, ctx: Context): void {
     const now = Date.now();
@@ -282,7 +355,8 @@ class RateLimiter {
         1,
         Math.ceil(((this.timestamps[0] ?? now) + this.windowMs - now) / 1000),
       );
-      throw rateLimited(
+      throw new BudgetExhaustedError(
+        JsonRpcErrorCode.RateLimited,
         `openfoodfacts-mcp-server declined this ${endpoint} request: its own client-side budget of ` +
           `${this.maxRequests} ${endpoint} requests/min is spent, so nothing was sent to Open Food ` +
           `Facts. A slot frees in about ${retryAfter}s.`,
@@ -322,10 +396,9 @@ export class OpenFoodFactsService {
    * The caller is responsible for surfacing the not-found condition via ctx.fail.
    */
   async getProduct(barcode: string, ctx: Context): Promise<RawProduct | null> {
-    this.productLimiter.check('product', ctx);
-
     return await withRetry(
       () => {
+        this.productLimiter.check('product', ctx);
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${PRODUCT_FIELDS}`;
         ctx.log.debug('Fetching product', { barcode, url });
         return this.fetchProduct(url, barcode, ctx);
@@ -335,6 +408,7 @@ export class OpenFoodFactsService {
         context: ctx,
         baseDelayMs: 500,
         signal: ctx.signal,
+        isTransient: isRetryableUpstreamFailure,
       },
     );
   }
@@ -348,10 +422,9 @@ export class OpenFoodFactsService {
     fields: string,
     ctx: Context,
   ): Promise<RawProduct | null> {
-    this.productLimiter.check('product', ctx);
-
     return await withRetry(
       () => {
+        this.productLimiter.check('product', ctx);
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${fields}`;
         ctx.log.debug('Fetching product fields', { barcode, fields });
         return this.fetchProduct(url, barcode, ctx);
@@ -361,6 +434,7 @@ export class OpenFoodFactsService {
         context: ctx,
         baseDelayMs: 500,
         signal: ctx.signal,
+        isTransient: isRetryableUpstreamFailure,
       },
     );
   }
@@ -453,8 +527,6 @@ export class OpenFoodFactsService {
    * answered rather than presenting the two as interchangeable.
    */
   searchProducts(params: SearchParams, ctx: Context): Promise<SearchResult> {
-    this.searchLimiter.check('search', ctx);
-
     return params.query || params.nutrient_filters?.length
       ? this.searchProductsByText(params, ctx)
       : this.searchProductsByTags(params, ctx);
@@ -468,6 +540,7 @@ export class OpenFoodFactsService {
   private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
+        this.searchLimiter.check('search', ctx);
         const page = params.page ?? 1;
         const pageSize = params.page_size ?? 20;
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/search`);
@@ -531,6 +604,7 @@ export class OpenFoodFactsService {
         context: ctx,
         baseDelayMs: 1_000,
         signal: ctx.signal,
+        isTransient: isRetryableUpstreamFailure,
       },
     );
   }
@@ -543,6 +617,7 @@ export class OpenFoodFactsService {
   private async searchProductsByTags(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
+        this.searchLimiter.check('search', ctx);
         const url = this.buildSearchUrl(params);
         ctx.log.debug('Searching products by tags', { params, url });
 
@@ -577,6 +652,7 @@ export class OpenFoodFactsService {
         context: ctx,
         baseDelayMs: 1_000,
         signal: ctx.signal,
+        isTransient: isRetryableUpstreamFailure,
       },
     );
   }
@@ -597,10 +673,9 @@ export class OpenFoodFactsService {
     size: number,
     ctx: Context,
   ): Promise<{ id: string; name: string }[]> {
-    this.taxonomyLimiter.check('taxonomy', ctx);
-
     return await withRetry(
       async () => {
+        this.taxonomyLimiter.check('taxonomy', ctx);
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/autocomplete`);
         url.searchParams.set('q', term);
         url.searchParams.set('taxonomy_names', taxonomyName);
@@ -628,6 +703,7 @@ export class OpenFoodFactsService {
         context: ctx,
         baseDelayMs: 500,
         signal: ctx.signal,
+        isTransient: isRetryableUpstreamFailure,
       },
     );
   }

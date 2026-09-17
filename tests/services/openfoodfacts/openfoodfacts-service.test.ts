@@ -20,9 +20,14 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
+import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
-import { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  initOpenFoodFactsService,
+  OpenFoodFactsService,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { getTaxonomyService, initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
 
 /** Build a minimal service instance with default test config. */
 function makeService(): OpenFoodFactsService {
@@ -962,6 +967,128 @@ describe('OpenFoodFactsService', () => {
       }
     });
 
+    // ── #26: the public failure publishes selected fields, not the fetch error's whole data ──
+
+    /** The load-shed page Open Food Facts serves instead of JSON when it is refusing traffic. */
+    const loadShedHtml =
+      '<!DOCTYPE html>\n<html lang="en">\n<head>\n<style>body { font-family: sans-serif; }</style>\n' +
+      '<title>Open Food Facts</title>\n</head>\n<body><h1>Service temporarily unavailable</h1></body>\n</html>';
+
+    it('publishes no upstream markup on an error whose body is a rendered page', async () => {
+      // #26: the fetch error's whole `data` was spread into the contract failure, so the captured
+      // page rode along twice — as `body` and its legacy alias `responseBody` — and made up more
+      // than half the bytes the caller received, while content[] carried one summary sentence.
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse(loadShedHtml, 503) as Response & Record<string, unknown>);
+
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
+      const data = (error.data ?? {}) as Record<string, unknown>;
+
+      expect(data).not.toHaveProperty('body');
+      expect(data).not.toHaveProperty('responseBody');
+      expect(data).not.toHaveProperty('statusCode');
+      expect(data).not.toHaveProperty('errorSource');
+      for (const value of Object.values(data)) {
+        const rendered = typeof value === 'string' ? value : JSON.stringify(value);
+        expect(rendered).not.toMatch(/<!DOCTYPE|<html|<style/i);
+      }
+      expect(error.message).not.toMatch(/<!DOCTYPE|<html|<style/i);
+    });
+
+    it('keeps the diagnostics the recovery hint refers to', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 503));
+
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
+      const data = (error.data ?? {}) as Record<string, unknown>;
+
+      expect(data.status).toBe(503);
+      expect(data.reason).toBe('upstream_error');
+      expect(data.retryable).toBe(true);
+      expect(data.barcode).toBe('3017620422003');
+      expect(data.retryAttempts).toBe(4);
+      expect((data.recovery as { hint?: string }).hint).toBe(
+        offGetProductTool.errors?.find((e) => e.reason === 'upstream_error')?.recovery,
+      );
+    });
+
+    it('keeps the per-call context of the search and taxonomy paths', async () => {
+      const searchCtx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 400));
+
+      const searchError = await captureError(
+        svc.searchProducts({ query: 'chocolate', page: 3, page_size: 25 }, searchCtx),
+      );
+      const searchData = (searchError.data ?? {}) as Record<string, unknown>;
+      expect(searchData.page).toBe(3);
+      expect(searchData.page_size).toBe(25);
+      expect(searchData).not.toHaveProperty('body');
+
+      const taxonomyCtx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 400));
+      const taxonomyError = await captureError(
+        svc.suggestTaxonomy('category', 'hummus', 10, taxonomyCtx),
+      );
+      const taxonomyData = (taxonomyError.data ?? {}) as Record<string, unknown>;
+      expect(taxonomyData.taxonomy_name).toBe('category');
+      expect(taxonomyData.term).toBe('hummus');
+      expect(taxonomyData).not.toHaveProperty('body');
+    });
+
+    it('bounds a non-JSON, non-HTML error body and strips its markup from the message', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      const body = `<b>upstream said</b> ${'nope '.repeat(100)}`;
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(body, 400));
+
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
+
+      expect(error.message).toContain('upstream said');
+      expect(error.message).not.toContain('<');
+      expect(error.message).not.toContain('>');
+      expect(error.message.length).toBeLessThan(300);
+    });
+
+    it('bounds a JSON detail string and strips its markup from the message', async () => {
+      // The JSON branch is the one search-a-licious actually answers with; a detail string is
+      // still upstream-authored text and lands in the taxonomy fallback notice unescaped.
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      const detail = `<b>rejected</b> ${'because '.repeat(60)}`;
+      global.fetch = vi.fn().mockResolvedValue(mockResponse({ detail }, 400));
+
+      const error = await captureError(svc.getProduct('3017620422003', ctx));
+
+      expect(error.message).toContain('rejected');
+      expect(error.message).not.toContain('<');
+      expect(error.message).not.toContain('>');
+      expect(error.message.length).toBeLessThan(300);
+    });
+
+    it('carries the cleaned message into the compare tool and the taxonomy fallback notice', async () => {
+      // Both surfaces interpolate the error message: off_compare_products into failed[].error and
+      // the taxonomy fallback into its notice. Neither may end up holding provider markup.
+      initOpenFoodFactsService();
+      const compareCtx = createMockContext({ errors: offCompareProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 400));
+
+      const compared = await offCompareProductsTool.handler(
+        { barcodes: ['3017620422003', '7622210100146'] },
+        compareCtx,
+      );
+      expect(compared.failed).toHaveLength(2);
+      for (const entry of compared.failed ?? []) {
+        expect(entry.error).not.toMatch(/<!DOCTYPE|<html|<style|</i);
+      }
+
+      initTaxonomyService();
+      const taxonomyCtx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 400));
+      const resolved = await getTaxonomyService().search('labels', 'organic', 10, taxonomyCtx);
+      expect(resolved.notice).toContain('could not be reached');
+      expect(resolved.notice).not.toMatch(/<!DOCTYPE|<html|<style|</i);
+    });
+
     it('refuses locally with rate_limited without contacting Open Food Facts', async () => {
       // The refusal is this server's own; the message must not attribute it to Open Food Facts.
       const limited = new OpenFoodFactsService({
@@ -985,6 +1112,188 @@ describe('OpenFoodFactsService', () => {
       expect(error.message).not.toMatch(/Open Food Facts rate limit/);
       // Only the first call reached the network.
       expect(global.fetch).toHaveBeenCalledOnce();
+    });
+  });
+
+  // ── #25: budgets are counted in upstream requests, retries included ──────
+
+  describe('rate limiting', () => {
+    /** A service whose product budget is the only one that matters for the test. */
+    function withProductBudget(rateLimitProduct: number): OpenFoodFactsService {
+      return new OpenFoodFactsService({
+        baseUrl: 'https://world.openfoodfacts.org',
+        rateLimitProduct,
+        rateLimitSearch: 100,
+        rateLimitTaxonomy: 100,
+      });
+    }
+
+    it('charges one slot per upstream request, retries included', async () => {
+      // #25: the check sat outside the retry boundary, so one charged slot funded four requests —
+      // a ten-barcode comparison sent 40 product reads against a published ceiling of 15/min.
+      const limited = withProductBudget(4);
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
+
+      await captureError(limited.getProduct('3017620422003', ctx));
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+
+      // The budget is now spent, so the next call is refused without sending anything.
+      const refused = await captureError(limited.getProduct('7622210100146', ctx));
+      expect(refused.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('stops retrying when the budget runs out mid-sequence', async () => {
+      const limited = withProductBudget(2);
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
+
+      const error = await captureError(limited.getProduct('3017620422003', ctx));
+
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data?.reason).toBe('rate_limited');
+      // Waiting and retrying is the right move for the caller, so the refusal stays retryable on
+      // the wire even though the retry boundary inside this server must not act on it.
+      expect(error.data?.retryable).toBe(true);
+      expect(error.data?.retryAfter).toBeGreaterThan(0);
+    });
+
+    it('returns the mid-sequence refusal without a further backoff sleep', async () => {
+      // A local refusal carrying retryAfter and retryable:true would otherwise be treated as a
+      // transient failure by withRetry, which honors data.retryAfter as its delay — the handler
+      // would sleep the full window and try again instead of returning.
+      const limited = withProductBudget(1);
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
+
+      const startedAt = Date.now();
+      const error = await captureError(limited.getProduct('3017620422003', ctx));
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      // One backoff, from the 503 that spent the budget — a retried refusal would add a second.
+      expect(elapsedMs).toBeLessThan(1_000);
+    });
+
+    it('refuses a spent budget with no delay at all', async () => {
+      const limited = withProductBudget(1);
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Nutella' } }));
+
+      await limited.getProduct('3017620422003', ctx);
+
+      const startedAt = Date.now();
+      await captureError(limited.getProduct('7622210100146', ctx));
+      expect(Date.now() - startedAt).toBeLessThan(100);
+    });
+
+    it('charges exactly one slot for a call that succeeds on its first attempt', async () => {
+      const limited = withProductBudget(2);
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Nutella' } }));
+
+      await limited.getProduct('3017620422003', ctx);
+      await limited.getProduct('7622210100146', ctx);
+      const refused = await captureError(limited.getProduct('0028400157827', ctx));
+
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(refused.code).toBe(JsonRpcErrorCode.RateLimited);
+    });
+
+    it('derives retryAfter from the oldest request still in the window', async () => {
+      // Two slots charged a second apart: the wait is measured from the older one, so it is
+      // already below the 60-second window a constant would report.
+      const limited = withProductBudget(2);
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Nutella' } }));
+
+      await limited.getProduct('3017620422003', ctx);
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await limited.getProduct('7622210100146', ctx);
+
+      const error = await captureError(limited.getProduct('0028400157827', ctx));
+
+      expect(error.data?.retryAfter).toBeLessThan(60);
+      expect(error.data?.retryAfter).toBeGreaterThan(55);
+    });
+
+    it('charges the search budget per attempt', async () => {
+      const limited = new OpenFoodFactsService({
+        baseUrl: 'https://world.openfoodfacts.org',
+        rateLimitProduct: 100,
+        rateLimitSearch: 2,
+        rateLimitTaxonomy: 100,
+      });
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
+
+      const error = await captureError(
+        limited.searchProducts({ query: 'chocolate', page: 1, page_size: 20 }, ctx),
+      );
+
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+    });
+
+    it('charges the taxonomy budget per attempt', async () => {
+      const limited = new OpenFoodFactsService({
+        baseUrl: 'https://world.openfoodfacts.org',
+        rateLimitProduct: 100,
+        rateLimitSearch: 100,
+        rateLimitTaxonomy: 2,
+      });
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
+
+      const error = await captureError(limited.suggestTaxonomy('category', 'hummus', 10, ctx));
+
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+    });
+
+    it('keeps a ten-barcode comparison inside the product budget', async () => {
+      // The whole batch runs in parallel, so the budget is what bounds the traffic Open Food Facts
+      // sees; the barcodes it could not fund come back in failed[] rather than silently unsent.
+      vi.doMock('@/config/server-config.js', () => ({
+        getServerConfig: vi.fn(() => ({
+          baseUrl: 'https://world.openfoodfacts.org',
+          rateLimitProduct: 4,
+          rateLimitSearch: 100,
+          rateLimitTaxonomy: 100,
+        })),
+      }));
+      vi.resetModules();
+      const { initOpenFoodFactsService: init } = await import(
+        '@/services/openfoodfacts/openfoodfacts-service.js'
+      );
+      const { offCompareProductsTool: compare } = await import(
+        '@/mcp-server/tools/definitions/compare-products.tool.js'
+      );
+      init();
+
+      const ctx = createMockContext({ errors: offCompareProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
+
+      const barcodes = Array.from({ length: 10 }, (_, i) => `000000000000${i}`.slice(-13));
+      const result = await compare.handler({ barcodes }, ctx as never);
+
+      expect(vi.mocked(global.fetch).mock.calls.length).toBeLessThanOrEqual(4);
+      expect(result.failed).toHaveLength(10);
+      expect(
+        result.failed?.filter((f) => f.reason === 'rate_limited').length,
+      ).toBeGreaterThanOrEqual(6);
+
+      vi.doUnmock('@/config/server-config.js');
+      vi.resetModules();
     });
   });
 
@@ -1096,6 +1405,25 @@ describe('OpenFoodFactsService', () => {
       // The whole nutriments object is still requested, so the open nutrient map costs no extra
       // upstream fields.
       expect(requested).toContain('nutriments');
+    });
+
+    it('asks for traces, ingredient analysis, and countries of sale (GH issue #32)', async () => {
+      // The default field list is what a full product fetch returns, so a field missing from it
+      // is invisible to every caller no matter what the output schema declares.
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ status: 1, product: { product_name: 'Test' } }));
+
+      await svc.getProduct('3046920022651', ctx);
+
+      const url = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
+      const requested = new URL(url).searchParams.get('fields')?.split(',') ?? [];
+      expect(requested).toContain('traces_tags');
+      expect(requested).toContain('ingredients_analysis_tags');
+      expect(requested).toContain('countries_tags');
+      // The declared-allergen field keeps its place alongside them.
+      expect(requested).toContain('allergens_tags');
     });
   });
 });

@@ -14,6 +14,12 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
  * published one — that is what the env vars are for, alongside operators running their own Product
  * Opener instance who can raise them.
  *
+ * Each number counts upstream HTTP requests, not tool calls: a slot is charged per attempt from
+ * inside the retry boundary, so a retried request spends its own slot and the configured figure is
+ * what Open Food Facts can actually see from this server. When a budget runs out mid-sequence the
+ * retries stop and the caller gets the declared `rate_limited` failure with the wait until a slot
+ * frees.
+ *
  * The taxonomy tier is covered by neither published figure: it calls search.openfoodfacts.org
  * (search-a-licious), a separate deployment the published limits do not name and for which no limit
  * is documented. Its default matches the search tier as a conservative stand-in.
