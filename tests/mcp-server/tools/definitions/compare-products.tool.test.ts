@@ -639,4 +639,16 @@ describe('off_compare_products', () => {
     expect(text).not.toContain('undefined');
     expect(text).toContain('2222222222222'); // not_found barcode surfaced
   });
+
+  it('describes the full Nutri-Score and Green-Score vocabularies (#43)', () => {
+    // Upstream sends "unknown" and "not-applicable" for both grades, and the Green-Score runs
+    // a-plus through f — all passed through as-is, so the descriptions have to name them.
+    const row = offCompareProductsTool.output.shape.products.element.shape;
+    for (const term of ['"unknown"', '"not-applicable"']) {
+      expect(row.nutriscore_grade.description).toContain(term);
+    }
+    for (const term of ['"a-plus"', '"f"', '"unknown"', '"not-applicable"']) {
+      expect(row.ecoscore_grade.description).toContain(term);
+    }
+  });
 });

@@ -173,7 +173,9 @@ export const offCompareProductsTool = tool('off_compare_products', {
             nutriscore_grade: z
               .string()
               .optional()
-              .describe('Nutri-Score letter (a–e). Absent when not computed.'),
+              .describe(
+                'Nutri-Score grade: "a" through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none.',
+              ),
             nova_group: z
               .number()
               .optional()
@@ -181,7 +183,9 @@ export const offCompareProductsTool = tool('off_compare_products', {
             ecoscore_grade: z
               .string()
               .optional()
-              .describe('Green-Score/Eco-Score (a–e or "unknown"). Often absent.'),
+              .describe(
+                'Green-Score (formerly Eco-Score) environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Often absent.',
+              ),
             energy_kcal_100g: z
               .number()
               .optional()
@@ -250,7 +254,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable — surfaced per barcode in failed[]',
+      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable — surfaced per barcode in failed[]',
       retryable: true,
       recovery:
         'Retry the barcodes listed in failed after a brief pause. Rows that already resolved are kept, so only the failures need repeating.',
@@ -266,7 +270,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Open Food Facts answers 4xx for a barcode — surfaced per barcode in failed[]',
+      when: 'Open Food Facts answers 4xx or 501 Not Implemented for a barcode — surfaced per barcode in failed[]',
       retryable: false,
       recovery:
         'Do not retry unchanged. Check the digits of the barcodes listed in failed, then look them up individually with off_get_product.',

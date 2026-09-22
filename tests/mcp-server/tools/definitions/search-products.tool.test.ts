@@ -1485,4 +1485,14 @@ describe('off_search_products', () => {
       expect(text).not.toContain('\\');
     });
   });
+
+  it('describes the full Nutri-Score and Green-Score vocabularies (#43)', () => {
+    const row = offSearchProductsTool.output.shape.products.element.shape;
+    for (const term of ['"unknown"', '"not-applicable"']) {
+      expect(row.nutriscore_grade.description).toContain(term);
+    }
+    for (const term of ['"a-plus"', '"f"', '"unknown"', '"not-applicable"']) {
+      expect(row.ecoscore_grade.description).toContain(term);
+    }
+  });
 });

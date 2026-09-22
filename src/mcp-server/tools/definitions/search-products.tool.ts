@@ -188,7 +188,9 @@ export const offSearchProductsTool = tool('off_search_products', {
             nutriscore_grade: z
               .string()
               .optional()
-              .describe('Nutri-Score letter (a–e). Absent when not computed.'),
+              .describe(
+                'Nutri-Score grade: "a" through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none.',
+              ),
             nova_group: z
               .number()
               .optional()
@@ -197,7 +199,7 @@ export const offSearchProductsTool = tool('off_search_products', {
               .string()
               .optional()
               .describe(
-                'Green-Score letter (a–e). Environmental impact indicator. Absent when not computed.',
+                'Green-Score environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none.',
               ),
             categories_tags: z
               .array(z.string().describe('Canonical category tag ID (e.g. "en:cheeses").'))
@@ -238,6 +240,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       reason: 'no_filters',
       code: JsonRpcErrorCode.ValidationError,
       when: 'No search query or filter was provided',
+      severity: 'warning',
       recovery:
         'Provide at least one of: query, categories_tag, brands_tag, labels_tag, allergens_tag, additives_tag, nutrient_filters, nutrition_grade, nova_group, or countries_tag.',
     },
@@ -246,6 +249,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'additives_tag was combined with a query or nutrient_filters, which route to a backend that cannot filter by additive',
       retryable: false,
+      severity: 'warning',
       recovery:
         'Drop query and nutrient_filters to search by tags alone and keep the additive filter, or drop additives_tag to keep them. Every other filter combines freely.',
     },
@@ -254,30 +258,34 @@ export const offSearchProductsTool = tool('off_search_products', {
       code: JsonRpcErrorCode.ValidationError,
       when: `A search the text backend serves asks for page * page_size beyond the ${TEXT_SEARCH_RESULT_WINDOW}-result window Open Food Facts offers`,
       retryable: false,
+      severity: 'warning',
       recovery:
         'Request an earlier page, or add filters so the products you need fall inside the first results rather than deep in the ranking.',
     },
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
       retryable: true,
+      thrownBy: 'service',
       recovery:
-        'Retry after a brief pause. The Open Food Facts service may be shedding load — narrow the filters if deep pages keep failing.',
+        'Retry after a brief pause — the Open Food Facts service may be shedding load. If it keeps failing, narrow the filters or try again later.',
     },
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       when: 'Open Food Facts did not answer within the request deadline',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry once with a smaller page_size. Broad unfiltered searches are the slowest for Open Food Facts to assemble.',
     },
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Open Food Facts answers 4xx — the request as formed will be refused again',
+      when: 'Open Food Facts answers 4xx, including the 401 it serves for a page too deep, or 501 Not Implemented — the request as formed will be refused again',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Do not retry. Read data.status and the upstream explanation in the message; reduce the page depth or correct the filter values.',
     },
@@ -286,6 +294,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       code: JsonRpcErrorCode.RateLimited,
       when: "This server's own per-minute search budget is spent, or Open Food Facts answers 429",
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Wait the seconds given in data.retryAfter, then retry. Searches carry a much smaller budget than product lookups.',
     },
