@@ -80,7 +80,7 @@ Attribution: data under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1.0
 
 **Nutriments shape:** flat key-value map. Each nutrient has up to four variants: `{key}`, `{key}_100g`, `{key}_unit`, `{key}_value`, `{key}_serving` (when serving data present), `{key}_modifier` (e.g. `~` for approximate). The `_100g` variant is the canonical per-100g figure. Keys use hyphens: `energy-kcal`, `saturated-fat`, `added-sugars`.
 
-**Fields confirmed in full product object:** `product_name`, `brands`, `quantity`, `ingredients_text`, `allergens_tags` (array, `en:milk` format), `traces_tags` (array, same format — `["en:none"]` declares no traces, `[]` is not-yet-entered), `additives_tags` (array, `en:e322` format), `ingredients_analysis_tags` (array, `en:vegan` / `en:maybe-vegan` / `en:palm-oil-free` format), `nutriscore_grade` (a–e or absent), `nova_group` (1–4 integer or absent), `ecoscore_grade` (a–e or `unknown`), `categories_tags` (array), `labels_tags` (array), `packaging_tags` (array), `origins_tags` (array, often empty), `countries_tags` (array, the values `off_search_products` filters on as `countries_tag`), `image_url`, `completeness` (0–1 float), `data_quality_tags` (crowd-sourced QA flags).
+**Fields confirmed in full product object:** `product_name`, `brands`, `quantity`, `ingredients_text`, `allergens_tags` (array, `en:milk` format), `traces_tags` (array, same format — `["en:none"]` declares no traces, `[]` is not-yet-entered), `additives_tags` (array, `en:e322` format), `ingredients_analysis_tags` (array, `en:vegan` / `en:maybe-vegan` / `en:palm-oil-free` format), `nutriscore_grade` (`a`–`e`, `unknown`, `not-applicable`, or absent), `nova_group` (1–4 integer or absent), `ecoscore_grade` (the Green-Score scale `a-plus`, `a`–`f`, plus `unknown` and `not-applicable` — seen live: `not-applicable` on 5449000000996, `f` on 5034660516170), `categories_tags` (array), `labels_tags` (array), `packaging_tags` (array), `origins_tags` (array, often empty), `countries_tags` (array, the values `off_search_products` filters on as `countries_tag`), `image_url`, `completeness` (0–1 float), `data_quality_tags` (crowd-sourced QA flags).
 
 **Field subsets are expanded to their dependencies.** The API returns exactly the `fields=` list it is given, so `off_get_product` adds what a requested field needs to be readable before sending: `nutriments` brings `serving_size`, `serving_quantity`, and `serving_quantity_unit` — the combined request is honored, verified on barcode 0028400157827 — and `serving_quantity_unit` brings the quantity it describes, without which the unit says nothing. `requested_fields` echoes the expanded set, so a field present in `product` is always one the response says it asked for and the "not requested" wording can never contradict the payload.
 
@@ -149,7 +149,7 @@ GET /autocomplete?q=hummus&taxonomy_names=category&size=10
 - Matching is against **display names**, not tag IDs, and falls back to loosely-related suggestions when nothing matches well. Ordinary words resolve cleanly (`hummus`→`en:hummus`, `tofu`→`en:tofu`, `gluten`→`en:no-gluten`), and note that category tags are frequently plural upstream: `kombucha` resolves to `en:kombuchas`, not `en:kombucha`. E-numbers do **not** resolve — `e322`, `e100`, and `e330` each return a page of unrelated E-numbers not containing the queried one.
 - Upstream `took` is 1–3 ms; wall-clock round trip from a US client is ~0.5–0.8 s.
 
-**Static dumps (`https://static.openfoodfacts.org/data/taxonomies/{categories,labels,allergens,additives,countries}.json`)** — HTTP 200, ~7.4 MB combined (4.6 MB / 1.2 MB / 10 KB / 906 KB / 722 KB). Not used: the payload would ship inside the npm package and the `.mcpb` bundle, needs build-time refresh tooling, and goes stale between releases. Entry counts, for scale against the in-process sample: categories 14,552 (sample 73), labels 3,037 (25), additives 683 (44), countries 268 (30), allergens 27 (14). They are still the authority on which IDs are canonical — every embedded ID is checked against them, pinned by `tests/fixtures/canonical-tag-ids.ts`. Entries carry parent/child hierarchy and per-language names but no product count, so the tool's `products` output field stays empty under either backend.
+**Static dumps (`https://static.openfoodfacts.org/data/taxonomies/{categories,labels,allergens,additives,countries}.json`)** — HTTP 200, ~7.4 MB combined (4.6 MB / 1.2 MB / 10 KB / 906 KB / 722 KB). Not used: the payload would ship inside the npm package and the `.mcpb` bundle, needs build-time refresh tooling, and goes stale between releases. Entry counts, for scale against the in-process sample: categories 14,552 (sample 73), labels 3,037 (25), additives 683 (44), countries 268 (30), allergens 27 (14). They are still the authority on which IDs are canonical — every embedded ID is checked against them, pinned by `tests/fixtures/canonical-tag-ids.ts`. Entries carry parent/child hierarchy and per-language names but no product count, and neither does the autocomplete endpoint, so the tool reports no per-tag count.
 
 ---
 
@@ -182,26 +182,32 @@ z.object({
 
 ```ts
 z.object({
-  barcode: z.string().describe('Barcode as returned by the API.'),
+  barcode: z.string().describe('The input barcode, echoed back unchanged. Open Food Facts can hold the record under another form of the same code (030000010402 resolves to the record stored as 0030000010402); that stored form is not reported.'),
   product: z.object({
     product_name: z.string().optional().describe('Product name. May be absent if not yet entered.'),
     brands: z.string().optional().describe('Brand name(s), comma-separated.'),
     quantity: z.string().optional().describe('Net quantity as printed on packaging (e.g. "400g").'),
     ingredients_text: z.string().optional().describe('Raw ingredients text from the label, in the source language.'),
+    // Every level carries the same entry fields; the tree is written out three levels deep.
     ingredients: z.array(z.object({
       id: z.string().optional().describe('Canonical ingredient ID.'),
       text: z.string().describe('Ingredient name.'),
-      percent_estimate: z.number().optional().describe('Estimated percentage of this ingredient.'),
+      percent_estimate: z.number().optional().describe('Estimated share of the whole product, in percent — on a sub-ingredient still a share of the whole product, not of its parent.'),
       vegan: z.string().optional().describe('"yes", "no", or "maybe".'),
       vegetarian: z.string().optional().describe('"yes", "no", or "maybe".'),
-    })).optional().describe('Parsed ingredient list. Absent when not yet parsed by contributors.'),
+      ingredients: z.array(/* level 2: same fields, plus */ z.object({
+        /* …entry fields… */
+        ingredients: z.array(/* level 3: same fields, no ingredients */).optional()
+          .describe('Sub-ingredients; anything nested deeper upstream is listed here too, right after the entry it belongs under.'),
+      })).optional().describe('Sub-ingredients of this entry, nested up to two more levels.'),
+    })).optional().describe('Parsed ingredient list, top level in label order, each entry carrying its sub-ingredients. Absent when not yet parsed by contributors.'),
     allergens_tags: z.array(z.string()).optional().describe('Canonical allergen tag IDs (e.g. "en:milk", "en:gluten"). Absence means not yet entered, not allergen-free.'),
     traces_tags: z.array(z.string()).optional().describe('Allergens the label warns the product may contain as traces. ["en:none"] declares no traces; an empty or absent array means not yet entered, not trace-free.'),
     additives_tags: z.array(z.string()).optional().describe('E-number additive tag IDs (e.g. "en:e322", "en:e322i"). Absence means not yet entered.'),
     ingredients_analysis_tags: z.array(z.string()).optional().describe('Product-level vegan, vegetarian, and palm-oil verdicts Open Food Facts computes from the parsed ingredients (e.g. "en:maybe-vegan", "en:palm-oil-free").'),
-    nutriscore_grade: z.string().optional().describe('Nutri-Score letter (a–e, lowercase). Regional formula variants exist; "a" is highest quality. Absent when not enough nutrition data to compute.'),
+    nutriscore_grade: z.string().optional().describe('Nutri-Score grade, lowercase: "a" (highest nutritional quality) through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none. Regional formula variants exist.'),
     nova_group: z.number().optional().describe('NOVA food processing class (1=unprocessed, 2=culinary ingredients, 3=processed, 4=ultra-processed). Absent when not enough data.'),
-    ecoscore_grade: z.string().optional().describe('Green-Score/Eco-Score environmental impact letter (a–e, or "unknown"). Highly variable — depends on packaging, origins, and transport data completeness.'),
+    ecoscore_grade: z.string().optional().describe('Green-Score (formerly Eco-Score) environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Highly variable — depends on packaging, origins, and transport data completeness.'),
     nutriments: z.object({
       energy_kcal_100g: z.number().optional().describe('Energy per 100g in kcal.'),
       fat_100g: z.number().optional().describe('Total fat per 100g in grams.'),
@@ -246,7 +252,7 @@ errors: [
   {
     reason: 'upstream_error',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
+    when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
     retryable: true,
     recovery: 'Retry after a brief pause. If it keeps failing, Open Food Facts is degraded — check the barcode again later.',
   },
@@ -260,7 +266,7 @@ errors: [
   {
     reason: 'upstream_rejected',
     code: JsonRpcErrorCode.InvalidParams,
-    when: 'Open Food Facts answers 4xx for something other than a missing barcode',
+    when: 'Open Food Facts answers 4xx for something other than a missing barcode, or 501 Not Implemented',
     retryable: false,
     recovery: 'Do not retry — the request will be refused again. Read data.status and the upstream explanation in the message, then correct the request.',
   },
@@ -334,9 +340,9 @@ z.object({
     barcode: z.string().describe('EAN/UPC barcode. Pass to off_get_product for full details.'),
     product_name: z.string().optional().describe('Product name. May be absent for incompletely entered products.'),
     brands: z.string().optional().describe('Brand name(s).'),
-    nutriscore_grade: z.string().optional().describe('Nutri-Score letter (a–e). Absent when not computed.'),
+    nutriscore_grade: z.string().optional().describe('Nutri-Score grade: "a" through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none.'),
     nova_group: z.number().optional().describe('NOVA processing class (1–4). Absent when not assigned.'),
-    ecoscore_grade: z.string().optional().describe('Green-Score letter (a–e). Environmental impact indicator. Absent when not computed.'),
+    ecoscore_grade: z.string().optional().describe('Green-Score environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none.'),
     categories_tags: z.array(z.string()).optional().describe('Category tag IDs.'),
   })).describe('Matching products. Use barcodes with off_get_product for full label data.'),
 })
@@ -369,9 +375,9 @@ errors: [
   {
     reason: 'upstream_error',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
+    when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
     retryable: true,
-    recovery: 'Retry after a brief pause. The Open Food Facts service may be shedding load — narrow the filters if deep pages keep failing.',
+    recovery: 'Retry after a brief pause — the Open Food Facts service may be shedding load. If it keeps failing, narrow the filters or try again later.',
   },
   {
     reason: 'upstream_timeout',
@@ -383,7 +389,7 @@ errors: [
   {
     reason: 'upstream_rejected',
     code: JsonRpcErrorCode.InvalidParams,
-    when: 'Open Food Facts answers 4xx — the request as formed will be refused again',
+    when: 'Open Food Facts answers 4xx, including the 401 it serves for a page too deep, or 501 Not Implemented — the request as formed will be refused again',
     retryable: false,
     recovery: 'Do not retry. Read data.status and the upstream explanation in the message; reduce the page depth or correct the filter values.',
   },
@@ -425,9 +431,9 @@ z.object({
     product_name: z.string().optional().describe('Product name.'),
     brands: z.string().optional().describe('Brand name(s).'),
     found: z.boolean().describe('False if the barcode has no contributor record.'),
-    nutriscore_grade: z.string().optional().describe('Nutri-Score (a–e).'),
+    nutriscore_grade: z.string().optional().describe('Nutri-Score grade: "a" through "e", "unknown", or "not-applicable".'),
     nova_group: z.number().optional().describe('NOVA class (1–4).'),
-    ecoscore_grade: z.string().optional().describe('Green-Score/Eco-Score (a–e or "unknown").'),
+    ecoscore_grade: z.string().optional().describe('Green-Score grade: "a-plus", then "a" through "f"; "unknown" or "not-applicable".'),
     energy_kcal_100g: z.number().optional().describe('Calories per 100g.'),
     fat_100g: z.number().optional().describe('Total fat per 100g (g).'),
     saturated_fat_100g: z.number().optional().describe('Saturated fat per 100g (g).'),
@@ -480,7 +486,6 @@ z.object({
   tags: z.array(z.object({
     id: z.string().describe('Canonical tag ID (e.g. "en:organic"; bare "1"–"4" for NOVA groups, bare "a"–"e" for Nutri-Score grades). Pass through to off_search_products unchanged.'),
     name: z.string().describe('Human-readable display name (e.g. "Organic").'),
-    products: z.number().optional().describe('Approximate count of products with this tag. Not available for all facets.'),
   })).describe('Matching tag entries.'),
   total_in_facet: z.number().optional().describe('Total entries in this facet. Present only for nova_groups and nutrition_grades; the live facets have no knowable total.'),
 })
@@ -514,7 +519,7 @@ enrichment: {
   - `searchProducts(params)` → `{count, count_is_exact, page, page_count, page_size, products[]}` (the `SearchResult` type — one shape from both backends)
 - **Rate limiting:** token bucket per endpoint class — product reads (15/min), search (10/min), taxonomy resolution (10/min). A refusal is local, so it raises `rate_limited` (`RateLimited`) naming this server, not Open Food Facts, and carries the seconds until a slot frees.
 - **Transport:** `fetchWithTimeout` at every call site, so HTTP status → error code, canonical `status`/`body` on the framework's fetch error (the public contract republishes a selected subset of it — see the error-contract allowlist below), `Retry-After` honoring, and distinct `Timeout` classification all come from the framework rather than a hand-rolled status ladder.
-- **Retry:** `withRetry` on the full fetch+parse pipeline. 4 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped code decides: 5xx, timeouts, and 429 retry; 4xx fails immediately.
+- **Retry:** `withRetry` on the full fetch+parse pipeline. 4 attempts, 500ms base delay (upstream is stateless; 5xx is transient). Classification runs *inside* the retry boundary so the mapped reason decides: a 5xx other than 501, timeouts, and 429 retry; a 4xx or a 501 fails immediately.
 - **Parse failure:** HTML error pages (503 during high load) detected by content-type check → `upstream_error` (`ServiceUnavailable`, not `SerializationError`).
 - **Missing barcode:** `status:0` in a 200 response, or an HTTP 404, → `null` from the service; the handler calls `ctx.fail('not_found', ...)`. `null` is reserved for this case alone.
 
@@ -524,7 +529,8 @@ Owns resolution policy for `off_browse_taxonomy`; transport lives in `openfoodfa
 
 - **Facet routing.** `categories`, `labels`, `allergens`, `additives`, `countries` map to the upstream `category`/`label`/`allergen`/`additive`/`country` taxonomies. `nova_groups` and `nutrition_grades` have no upstream counterpart and are closed vocabularies, so they are answered entirely from the embedded map and are the only facets that report `total_in_facet`.
 - **Embedded sample.** A static `facet → [{id, name, aliases?}]` map: 73 categories, 25 labels, 14 allergens, 44 additives, 30 countries, 4 NOVA groups, 5 Nutri-Score grades. For the five live facets this is a small slice (categories is 73 against 14,552 upstream), used for unfiltered listing, offline fallback, and as the first-ranked half of a merge. Every ID is a canonical key in the static dumps, because a synonym or singular form is not rejected anywhere downstream — it filters nothing and reports the zero as exact. A human term with no canonical key of its own (shellfish, cookies, gluten free) rides on `aliases`, which widen what a search resolves and never reach the caller; a term with no canonical key at all (mixed salads, chocolate bars, the per-nut allergens) is left out rather than approximated, and the live merge still resolves it.
-- **With a search term.** The embedded matches and the live suggestions are merged, embedded first, deduplicated by tag ID, then capped at `limit`. Upstream is asked for `limit + 1` so a full page can be distinguished from an exactly-full one and reported as truncated — the endpoint has no offset, so that is the only available signal that more exist.
+- **With a search term.** The embedded matches and the live suggestions are merged, embedded first, deduplicated by tag ID, then capped at `limit`. Upstream is asked for the most it honors (200), not `limit + 1`: it lists a term's compound tags ahead of the plain one, so a request sized to the limit never received the tag the term names. Anything past the limit is still reported as truncated — the endpoint has no offset, so that is the only available signal that more exist.
+- **The exact-term tag ranks first among the live suggestions.** After the substring gate, live entries whose ID is `en:<slug>`, `en:<slug>s`, or `en:<slug>es` (`<slug>` = the lowercased term, whitespace runs hyphenated) are stable-sorted ahead of the rest, which keep upstream order. Only an equal ID moves, so `en:red-lentils` is never promoted for "lentil"; the embedded block keeps its own order ahead of the live one.
 - **Live suggestions are held to the facet's documented substring rule.** Upstream matches display names and degrades to loosely-related suggestions rather than returning nothing, so unfiltered pass-through would answer `e330` with E-numbers that do not contain it. Applying the same `id`/`name` substring predicate used for the embedded half drops that noise; measured across ordinary terms (cheese, kombucha, olive oil, organic, tofu, yoghurt, …) it drops nothing else.
 - **Without a search term.** The embedded sample only, plus a `notice` saying so. The upstream endpoint suggests against a term and answers an empty list for an empty query — it cannot enumerate a facet.
 - **On failure.** The throw is absorbed and the offline matches returned with a `notice` naming the cause. `openWorldHint: true`.
@@ -573,7 +579,9 @@ The sample stays because live-only would regress two cases it answers correctly.
 
 **`total_in_facet` is reported only for the closed vocabularies.** The autocomplete endpoint reports no match total and cannot be enumerated, so the live facets have no knowable total; the field is omitted rather than filled with the sample size. Returning `79` for categories is what presented a local sample as the size of the Open Food Facts category vocabulary.
 
-**No offset or page input.** The endpoint's `size` caps the option count and is its only paging knob — `offset`, `from`, and `page` are accepted and silently ignored, all returning the same first page. An offset input would therefore have to be a lie or a client-side slice of one fetch; narrowing the term is the honest instruction, and `limit + 1` is requested so genuine truncation is still disclosed.
+**No offset or page input.** The endpoint's `size` caps the option count and is its only paging knob — `offset`, `from`, and `page` are accepted and silently ignored, all returning the same first page. An offset input would therefore have to be a lie or a client-side slice of one fetch; narrowing the term is the honest instruction, and more than `limit` suggestions are requested so genuine truncation is still disclosed.
+
+**The live suggestion pool is requested in full, and the exact-term tag ranked first.** Upstream orders a term's suggestions compounds-first: `lentil` answers eight `en:lentil-*` tags with `en:lentils` last, `chickpea` puts `en:chickpeas` fourth of four, and `cheese` puts `en:cheeses` 37th of 69. Sized to `limit + 1`, the request never received the plain tag at small limits, so reordering alone could not reach it; asking for 200 costs a few kilobytes and no extra request. The ranking is an exact equality on the hyphenated slug and its `s`/`es` plurals, stable and live-portion only, so no entry is added or dropped, a compound sharing a word keeps its place, and the hand-maintained embedded block is untouched. Terms whose plain tag upstream never suggests (`berry`, `tomato`) are unaffected.
 
 **NOVA group and Nutri-Score tag IDs are bare, not `en:`-prefixed.** `off_browse_taxonomy` emitted `en:1`–`en:4` while `off_search_products.nova_group` accepts `"1"`–`"4"`, so passing the advertised ID back was a hard validation failure. Fixing it at the source rather than relaxing the enum: upstream tolerance is not uniform, and normalizing on input would have to land before `buildTextSearchQuery`. On the tag backend both forms return the same 136,019 matches, but on the text backend `nova_group:en:1` is live-verified answering zero hits flagged `is_count_exact: true` — a confident false "no products" rather than an error. Bare digits also match the bare grade letters `nutrition_grades` already emitted.
 
@@ -583,7 +591,7 @@ The sample stays because live-only would regress two cases it answers correctly.
 
 **Failures leave the service already carrying their contract `reason` and recovery hint.** Handlers stay pure — the service passes `{ reason, ...ctx.recoveryFor(reason) }` on every throw, so `data.reason` and `data.recovery.hint` reach both client surfaces with no handler-side try/catch. Reasons resolve from the error's `JsonRpcErrorCode`, never from message text.
 
-**Every upstream 4xx is `upstream_rejected` and non-retryable.** A request the upstream refuses will be refused again, so retrying only aims more traffic at a backend already saying no. `data.status` disambiguates which 4xx it was, and the upstream's own `detail` is surfaced in the message.
+**The HTTP status decides retryability; the body only shapes the message.** Every upstream 4xx except 429 (`rate_limited`) and 408/425 (`upstream_timeout`), and any status the framework flags `data.retryable: false` — today only 501 Not Implemented — is `upstream_rejected`: non-retryable and sent once. A request the upstream refuses will be refused again, so retrying only aims more traffic at a backend already saying no. Every other 5xx, and an HTML page served with a 2xx, stays `upstream_error` and is retried. `data.status` disambiguates which status it was, and the upstream's own `detail` is surfaced in the message. A rendered error page is summarized according to the reason the status already settled: served with a refusal it reads as a refusal, and only with a retryable failure is it attributed to load. Product Opener answers every anonymous search page past 10 with a 401 and a rendered page, and blaming load there told the caller to wait out a refusal that cannot change. The 501 needs the flag read explicitly: it keeps the transient `ServiceUnavailable` code, and the published-field allowlist dropped the flag, so it was re-flagged retryable and sent four times.
 
 **`content[]` is escaped per context; `structuredContent` stays raw.** Open Food Facts is contributor-edited, so every product name, ingredient string, brand, grade, and tag ID rendered into the text surface sits outside this server's trust boundary — and the metacharacters are already in real records (`lécithines [SOJA)` on barcode 3017620422003). Interpolated straight into Markdown, such a value changes the structure of the document rather than being displayed in it, so text the server presents as data can present itself as instructions to the reading agent. `src/utils/markdown.ts` holds one escaper per context — inline value, table cell, code fence, inline code span, bare URL — and every formatter routes untrusted values through the one for the site they land on. Line-break handling is the load-bearing part everywhere, since it is the only character that opens a new block, which is why it applies even to values that look harmless. Raw values belong in `structuredContent` and are never escaped there: a parity test asserts the escaped rendering and the raw structured value together. `ctx.enrich` notices are out of scope in the opposite direction — an enrichment string reaches both surfaces as the same value, so escaping one would break that parity, and the fix there is to keep untrusted text out of notice prose.
 
@@ -593,7 +601,9 @@ The sample stays because live-only would regress two cases it answers correctly.
 
 **The text backend's 10,000-result window is enforced before the request.** `search.openfoodfacts.org` rejects `page * page_size > 10000` with an HTTP 400. Checking it in the handler turns a four-attempt backoff ending in a retryable-looking outage into a validation failure naming the highest reachable page. Scoped to the text path — `/api/v2/search` publishes no equivalent ceiling and its deep pages fail unpredictably rather than at a fixed bound, so truncation guidance there warns instead of promising a reachable page count.
 
-**`format()` renders what `structuredContent` carries — no formatter-local slicing.** The text surface previously capped parsed ingredients at 20 and category tags at 5 (3 in search), rendered completeness only as a rounded percentage, and dropped `vegan`/`vegetarian` when the value was `maybe`. None of it reduced the payload — the full arrays and exact scalars were already in `structuredContent` — so the caps bought nothing and left text-only clients (Claude Desktop) with a quietly incomplete record that no follow-up call could complete, since re-calling returns the same trimmed text. Two of the losses were silent misreadings rather than omissions: `79%` is indistinguishable from an exact `0.79` when the value is `0.7875`, and `maybe` is a real OFF verdict ("depends on sourcing") that rendered identically to no verdict at all. These are capped-*list* cases in name only; the honest fix is full parity, and the `fields` input already exists for callers who want a smaller response. Outline-on-overflow does not apply — it addresses one document-shaped record too large to inline, and a product record is neither document-shaped nor near the budget: the heaviest real payloads observed (55 parsed ingredients) serialize to roughly 9 KB of `structuredContent` and 7.5 KB of text against a 24 KB outline budget, and the `fields` input already gives a caller who wants less a way to ask for it.
+**`format()` renders what `structuredContent` carries — no formatter-local slicing.** The text surface previously capped parsed ingredients at 20 and category tags at 5 (3 in search), rendered completeness only as a rounded percentage, and dropped `vegan`/`vegetarian` when the value was `maybe`. None of it reduced the payload — the full arrays and exact scalars were already in `structuredContent` — so the caps bought nothing and left text-only clients (Claude Desktop) with a quietly incomplete record that no follow-up call could complete, since re-calling returns the same trimmed text. Two of the losses were silent misreadings rather than omissions: `79%` is indistinguishable from an exact `0.79` when the value is `0.7875`, and `maybe` is a real OFF verdict ("depends on sourcing") that rendered identically to no verdict at all. These are capped-*list* cases in name only; the honest fix is full parity, and the `fields` input already exists for callers who want a smaller response. Outline-on-overflow does not apply — it addresses one document-shaped record too large to inline, and a product record is neither document-shaped nor near the budget: the heaviest parsed-ingredient tree in a 616-product survey (5000159541374, 120 top-level and 179 total entries) measures 14.0 KB of `structuredContent` and 9.2 KB of text for the name and ingredients alone — roughly 18 KB and 13 KB with the rest of a full record — against a 24 KB outline budget, and the `fields` input already gives a caller who wants less a way to ask for it.
+
+**Sub-ingredients nest under their parent, written out three levels deep.** Open Food Facts nests them in `ingredients[].ingredients` (wheat flour under "cereal", palm oil under "vegetable oils", milk under cheddar under a seasoning), and a diet or allergy check often needs exactly those. Each entry carries its children as an `ingredients` array of the same entry shape, rendered indented under the parent in `content[]`; the top-level list keeps its length, order, and values. A nested `percent_estimate` is a share of the whole product, not of its parent — a parent's estimate equals the sum of its children's in 1,027 of 1,060 surveyed parents — so the schema says so, and a flattened list would double-count. The schema is inlined rather than self-referential, because a recursive Zod schema overflows the definition linter's stack and emits `$defs`/`$ref`; three levels is the deepest nesting observed (616 products: 228 flat, 321 two levels, 67 three, none deeper). Upstream permits more, so an entry below the third level is listed at the third, directly after its ancestor, in pre-order — only parentage is flattened and nothing is dropped. A flat list with parent references was rejected: it changes the meaning of the existing array, needs index paths because IDs repeat within a tree (`en:salt` under two cheeses), and runs 20–45% larger.
 
 **A clipped hit count is labelled, never rounded off or hidden.** The text backend stops counting at 10,000 and reports `is_count_exact: false` when it does; `total_is_lower_bound` carries that straight through to the caller, and `format()` renders the figure as `10000+`. The alternative — presenting the ceiling as an exact total — makes every broad query report the same fabricated number, and made the pagination guidance derive a precise page count from it. Detection reads the upstream flag rather than comparing the count against `TEXT_SEARCH_RESULT_WINDOW`: the page-depth limit and the hit-counting limit are separate limits that sit at the same number today, and only the backend knows when it stopped counting.
 
