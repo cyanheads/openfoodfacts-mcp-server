@@ -2,7 +2,8 @@
  * @fileoverview Regression tests for OpenFoodFactsService — covers HTTP 404 not-found handling
  * (Bug #3), text search routing (Bug #2), score-filter query-param mapping (GH issue #3), the
  * declared error contract carried by every failure (GH issue #12), retry classification and
- * upstream-detail surfacing (GH issue #19), and User-Agent header verification.
+ * upstream-detail surfacing (GH issue #19), status-decided retryability (GH issue #37), and
+ * User-Agent header verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
@@ -1343,6 +1344,183 @@ describe('OpenFoodFactsService', () => {
       expect(error.data?.status).toBe(401);
       expect(error.message).toContain('rendered error page');
       expect(error.message).not.toContain('<!doctype');
+    });
+  });
+
+  // ── #37: the HTTP status decides retryability; the body only shapes the message ──
+  //
+  // Driven through the real withRetry + fetchWithTimeout against a stubbed global fetch, so the
+  // attempt count is the number of requests Open Food Facts would see. Fake timers skip the
+  // backoff sleeps without skipping the retries themselves.
+
+  describe('status decides retryability', () => {
+    /** The rendered page Product Opener serves on a refused request (seen live on search page 11). */
+    const refusalPage =
+      '<!-- start templates/web/common/site_layout.tt.html -->\n\n<!doctype html>\n<html lang="en"><head><title>Error</title></head><body>Error</body></html>';
+
+    /** Run a service call to settlement with the retry backoff collapsed onto fake timers. */
+    async function settle(run: () => Promise<unknown>): Promise<McpErrorish> {
+      vi.useFakeTimers();
+      try {
+        const pending = captureError(run());
+        await vi.runAllTimersAsync();
+        return await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it('rejects a 501 once as upstream_rejected, not a retried upstream_error', async () => {
+      // fetchWithTimeout flags a 501 data.retryable: false; the published-field allowlist used to
+      // drop the flag and upstream_error set retryable: true again, so it was sent four times.
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Not Implemented', 501));
+
+      const error = await settle(() => svc.getProduct('3017620422003', ctx));
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.data?.retryable).toBe(false);
+      expect(error.data?.status).toBe(501);
+      expect(error.message).toContain('HTTP 501');
+      expect(error.message).not.toContain('failed after');
+      expect(error.data?.recovery?.hint).toBe(
+        offGetProductTool.errors?.find((e) => e.reason === 'upstream_rejected')?.recovery,
+      );
+    });
+
+    it('rejects a 501 once on the search and taxonomy paths too', async () => {
+      const searchCtx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Not Implemented', 501));
+      const searchError = await settle(() =>
+        svc.searchProducts({ categories_tag: 'en:pizzas', page: 1, page_size: 20 }, searchCtx),
+      );
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(searchError.data?.reason).toBe('upstream_rejected');
+
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Not Implemented', 501));
+      const taxonomyError = await settle(() =>
+        svc.suggestTaxonomy('category', 'hummus', 10, createMockContext()),
+      );
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(taxonomyError.data?.reason).toBe('upstream_rejected');
+    });
+
+    it.each([401, 403])(
+      'describes an HTML-bodied %i as a refusal, sent once, without blaming load',
+      async (status) => {
+        // Product Opener answers anonymous clients 401 with a rendered page for every search page
+        // past 10. The retry flag was already right (#19); the message still blamed load shedding.
+        const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+        global.fetch = vi.fn().mockResolvedValue(mockResponse(refusalPage, status));
+
+        const error = await settle(() =>
+          svc.searchProducts({ categories_tag: 'en:pizzas', page: 11, page_size: 50 }, ctx),
+        );
+
+        expect(global.fetch).toHaveBeenCalledOnce();
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data?.reason).toBe('upstream_rejected');
+        expect(error.data?.retryable).toBe(false);
+        expect(error.data?.status).toBe(status);
+        expect(error.message).toContain(`refused the request (HTTP ${status})`);
+        expect(error.message).toContain('rendered error page');
+        expect(error.message).not.toMatch(/shedding load|load/i);
+        expect(error.message).not.toMatch(/<!doctype|<html/i);
+      },
+    );
+
+    it.each([500, 502, 503])(
+      'keeps a %i an upstream_error, retryable, retried for the full budget',
+      async (status) => {
+        const ctx = createMockContext({ errors: offGetProductTool.errors });
+        global.fetch = vi.fn().mockResolvedValue(mockResponse('Upstream failure', status));
+
+        const error = await settle(() => svc.getProduct('3017620422003', ctx));
+
+        expect(global.fetch).toHaveBeenCalledTimes(4);
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data?.reason).toBe('upstream_error');
+        expect(error.data?.retryable).toBe(true);
+        expect(error.data?.status).toBe(status);
+      },
+    );
+
+    it('keeps an HTML-bodied 503 an upstream_error that names load, retried for the full budget', async () => {
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(refusalPage, 503));
+
+      const error = await settle(() =>
+        svc.searchProducts({ categories_tag: 'en:pizzas', page: 2, page_size: 50 }, ctx),
+      );
+
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.data?.retryable).toBe(true);
+      expect(error.message).toContain('rendered error page');
+      expect(error.message).toContain('shedding load');
+    });
+
+    it('keeps an HTML page served with a 200 an upstream_error, retried for the full budget', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn(
+        async () =>
+          ({
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+            json: async () => JSON.parse(refusalPage),
+            text: async () => refusalPage,
+          }) as unknown as Response,
+      );
+
+      const error = await settle(() => svc.getProduct('3017620422003', ctx));
+
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.data?.retryable).toBe(true);
+    });
+
+    it('keeps a 504 an upstream_timeout, retried for the full budget', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Gateway Timeout', 504));
+
+      const error = await settle(() => svc.getProduct('3017620422003', ctx));
+
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.data?.reason).toBe('upstream_timeout');
+      expect(error.data?.retryable).toBe(true);
+    });
+
+    it('keeps a 429 rate_limited, retried for the full budget', async () => {
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Too Many Requests', 429));
+
+      const error = await settle(() => svc.getProduct('3017620422003', ctx));
+
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data?.reason).toBe('rate_limited');
+      expect(error.data?.retryable).toBe(true);
+    });
+
+    it('surfaces a 501 from off_get_product as upstream_rejected after one request', async () => {
+      // The issue's second repro, end to end through the tool handler and the real service.
+      initOpenFoodFactsService();
+      const ctx = createMockContext({ errors: offGetProductTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(mockResponse('Not Implemented', 501));
+
+      const error = await settle(async () =>
+        offGetProductTool.handler({ barcode: '3017620422003' }, ctx),
+      );
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.data?.retryable).toBe(false);
+      expect(error.data?.status).toBe(501);
     });
   });
 

@@ -7,7 +7,12 @@
 import { readFileSync } from 'node:fs';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  defaultIsTransient,
+  fetchWithTimeout,
+  withExtra,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import type {
   NutrientOperator,
@@ -79,15 +84,24 @@ const REASON_MESSAGES: Record<UpstreamReason, string> = {
 };
 
 /**
- * Classifies a framework fetch error onto a declared reason. Deliberately code-driven, never
- * message-driven: `fetchWithTimeout` maps HTTP status to a `JsonRpcErrorCode` and raises `Timeout`
- * for a blown deadline, so the code already carries the authoritative classification.
+ * Classifies a framework fetch error onto a declared reason. Deliberately status-driven, never
+ * body- or message-driven: `fetchWithTimeout` maps the HTTP status to a `JsonRpcErrorCode`, raises
+ * `Timeout` for a blown deadline, and flags a status no retry can change with
+ * `data.retryable: false`, so the error already carries the authoritative classification. The body
+ * only shapes the message (see `upstreamDetail`).
  *
- * Every 4xx becomes `upstream_rejected` — the request as formed will be refused again, so it is
+ * A status the framework flags non-retryable is `upstream_rejected` whatever its code — today that
+ * is 501 Not Implemented, which keeps the transient `ServiceUnavailable` code and would otherwise be
+ * re-flagged retryable here and sent four times. Every other 4xx except 408/425 (`Timeout`) and 429
+ * (`RateLimited`) is `upstream_rejected` too: the request as formed will be refused again, so it is
  * flagged non-retryable and the upstream's own `detail` is surfaced instead of being retried away.
- * `InternalError` here is an upstream 500/501 (the caller-abort case is filtered out before this).
+ * The framework maps every other 5xx to `ServiceUnavailable` (504 to `Timeout`) and never raises
+ * `InternalError` for an HTTP status; that code is read as an upstream failure rather than a
+ * rejection because it names no request the caller could correct.
  */
-function reasonForCode(code: JsonRpcErrorCode): UpstreamReason {
+function reasonFor(error: McpError): UpstreamReason {
+  if (error.data?.retryable === false) return 'upstream_rejected';
+  const { code } = error;
   if (code === JsonRpcErrorCode.Timeout) return 'upstream_timeout';
   if (code === JsonRpcErrorCode.RateLimited) return 'rate_limited';
   if (code === JsonRpcErrorCode.ServiceUnavailable || code === JsonRpcErrorCode.InternalError) {
@@ -111,8 +125,14 @@ function looksLikeHtml(body: string): boolean {
  * else falls back to a short snippet so the caller still learns why the request was refused.
  * `error.data.body` is head-truncated by the framework, so this reads whatever survived — and a
  * rendered error page is summarized rather than pasted, since its markup carries no signal.
+ *
+ * The summary follows the reason the status already settled, never the other way round: a page
+ * served with a refusal (a 4xx, or the non-retryable 501) is described as a refusal, and only a
+ * page served with a retryable failure is attributed to load. Product Opener answers every
+ * anonymous search page past 10 with a 401 and a rendered page, and blaming load there told the
+ * caller to wait for a refusal that cannot change.
  */
-function upstreamDetail(body: unknown): string | undefined {
+function upstreamDetail(body: unknown, reason: UpstreamReason): string | undefined {
   if (typeof body !== 'string' || body.trim() === '') return;
   try {
     const parsed = JSON.parse(body) as { detail?: unknown };
@@ -121,7 +141,9 @@ function upstreamDetail(body: unknown): string | undefined {
     /* Not JSON (HTML error page, plain text) — fall through to the snippet. */
   }
   if (looksLikeHtml(body)) {
-    return 'the upstream served a rendered error page rather than JSON, which usually means it is shedding load or refusing this client';
+    return reason === 'upstream_rejected'
+      ? 'it answered with a rendered error page rather than a JSON explanation of the refusal'
+      : 'the upstream served a rendered error page rather than JSON, which usually means it is shedding load or refusing this client';
   }
   return plainTextDetail(body);
 }
@@ -217,17 +239,18 @@ function contractError(
 
 /**
  * Re-raises a framework fetch error as the declared contract failure. Called inside the retry
- * boundary so the mapped code — not the raw one — drives `withRetry`'s transient classification:
- * 5xx, timeouts, and 429s stay retryable while a 4xx fails immediately.
+ * boundary so the mapped reason — not the raw code — drives `withRetry`'s transient
+ * classification: 5xx other than 501, timeouts, and 429s stay retryable while a 4xx or a 501 fails
+ * immediately.
  */
 function toContractError(error: unknown, ctx: Context, data: Record<string, unknown>): unknown {
   if (!(error instanceof McpError)) return error;
   // A caller-cancelled request is not an upstream failure — leave it untouched.
   if (error.data?.errorSource === 'FetchAborted') return error;
 
-  const reason = reasonForCode(error.code);
+  const reason = reasonFor(error);
   const status = error.data?.status;
-  const detail = upstreamDetail(error.data?.body);
+  const detail = upstreamDetail(error.data?.body, reason);
   const message =
     `${REASON_MESSAGES[reason]}${typeof status === 'number' ? ` (HTTP ${status})` : ''}` +
     `${detail ? `: ${detail}` : '.'}`;
@@ -262,9 +285,10 @@ const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
 /**
  * Largest `size` the autocomplete endpoint honors. Live-verified: it returns exactly the requested
  * option count up to 200 and caps below the request above that (500 answered 249), so a request is
- * clamped here rather than sent and silently under-served.
+ * clamped here rather than sent and silently under-served. Exported because the taxonomy service
+ * asks for the whole pool to rank it.
  */
-const MAX_AUTOCOMPLETE_SIZE = 200;
+export const MAX_AUTOCOMPLETE_SIZE = 200;
 
 /**
  * Reserved characters in search-a-licious's Lucene-style `q` syntax (field:value clauses, boolean
@@ -301,28 +325,14 @@ const NUTRIENT_RANGE_FORMS: Record<NutrientOperator, (value: number) => string> 
 class BudgetExhaustedError extends McpError {}
 
 /**
- * Error codes the framework treats as transient, mirrored here because `withRetry` does not export
- * them. Verified against `@cyanheads/mcp-ts-core` 0.13.3's `retry.js`; re-check on a framework bump.
- */
-const TRANSIENT_CODES = new Set<JsonRpcErrorCode>([
-  JsonRpcErrorCode.ServiceUnavailable,
-  JsonRpcErrorCode.Timeout,
-  JsonRpcErrorCode.RateLimited,
-]);
-
-/**
- * Retry predicate for every upstream call. It matches the framework default except that this
- * server's own budget refusal fails fast: the refusal must stay `retryable: true` on the wire —
- * waiting and retrying is exactly what the caller should do — and `withRetry` would otherwise read
- * that flag plus its `retryAfter` and sleep out the whole window inside the handler instead of
- * returning. Opting out by type keeps the two decisions independent.
+ * Retry predicate for every upstream call. It is the framework default except that this server's
+ * own budget refusal fails fast: the refusal must stay `retryable: true` on the wire — waiting and
+ * retrying is exactly what the caller should do — and `withRetry` would otherwise read that flag
+ * plus its `retryAfter` and sleep out the whole window inside the handler instead of returning.
+ * Opting out by type keeps the two decisions independent.
  */
 function isRetryableUpstreamFailure(error: unknown): boolean {
-  if (error instanceof BudgetExhaustedError) return false;
-  if (error instanceof McpError) {
-    return error.data?.retryable !== false && TRANSIENT_CODES.has(error.code);
-  }
-  return true;
+  return !(error instanceof BudgetExhaustedError) && defaultIsTransient(error);
 }
 
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
