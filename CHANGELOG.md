@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.5](changelog/0.3.x/0.3.5.md) — 2026-09-22
+
+The HTTP status now decides retryability, off_get_product carries nested sub-ingredients up to three levels, off_browse_taxonomy ranks the exact-term tag first, and four output descriptions are corrected.
+
 ## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-09-17
 
 Field-subset dependency expansion, three new product fields, escaped Markdown rendering, per-request rate-limit charging, and a trimmed error-data contract on off_get_product.

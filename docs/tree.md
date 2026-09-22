@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-09-17 17:51:41
+Generated on: 2026-09-22 22:33:54
 
 ```text
 openfoodfacts-mcp-server/
@@ -162,6 +162,10 @@ openfoodfacts-mcp-server/
 │   ├── config/
 │   │   └── server-config.test.ts
 │   ├── fixtures/
+│   │   ├── ingredients/
+│   │   │   ├── product-0028400157827.json
+│   │   │   ├── product-3046920022651.json
+│   │   │   └── product-7622210449283.json
 │   │   └── canonical-tag-ids.ts
 │   ├── mcp-server/
 │   │   └── tools/
