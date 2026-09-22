@@ -1,0 +1,587 @@
+{
+  "code": "0028400157827",
+  "product": {
+    "ecoscore_tags": ["unknown"],
+    "ingredients": [
+      {
+        "ciqual_food_code": "9615",
+        "id": "en:cornmeal",
+        "ingredients": [
+          {
+            "ciqual_food_code": "9615",
+            "id": "en:cornmeal",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 33.3333333333333,
+            "percent_max": 100,
+            "percent_min": 4.16666666666667,
+            "text": "Corn Meal",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:ferrous-sulfate",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 14.5833333333333,
+            "percent_max": 50,
+            "percent_min": 0,
+            "text": "Ferrous Sulfate"
+          },
+          {
+            "id": "en:e375",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 7.29166666666666,
+            "percent_max": 33.3333333333333,
+            "percent_min": 0,
+            "text": "Niacin",
+            "vegan": "maybe",
+            "vegetarian": "maybe"
+          },
+          {
+            "id": "en:thiamin-mononitrate",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 3.64583333333333,
+            "percent_max": 25,
+            "percent_min": 0,
+            "text": "Thiamin Mononitrate",
+            "vegan": "maybe",
+            "vegetarian": "maybe"
+          },
+          {
+            "id": "en:e101",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.82291666666666,
+            "percent_max": 20,
+            "percent_min": 0,
+            "text": "Riboflavin",
+            "vegan": "maybe",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:folic-acid",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.82291666666666,
+            "percent_max": 16.6666666666667,
+            "percent_min": 0,
+            "text": "Folic Acid",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          }
+        ],
+        "is_in_taxonomy": 1,
+        "percent_estimate": 62.5,
+        "percent_max": 100,
+        "percent_min": 25,
+        "processing": "en:enriched",
+        "text": "Corn Meal",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "from_palm_oil": "maybe",
+        "id": "en:vegetable-oil",
+        "ingredients": [
+          {
+            "ciqual_food_code": "9200",
+            "id": "en:corn",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 9.375,
+            "percent_max": 50,
+            "percent_min": 0,
+            "text": "Corn",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ecobalyse_code": "rapeseed-non-eu",
+            "id": "en:canola",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 4.6875,
+            "percent_max": 25,
+            "percent_min": 0,
+            "text": "Canola",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "17440",
+            "ecobalyse_code": "sunflower-oil",
+            "from_palm_oil": "no",
+            "id": "en:sunflower-oil",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 4.6875,
+            "percent_max": 16.6666666666667,
+            "percent_min": 0,
+            "text": "and Sunflower Oil",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          }
+        ],
+        "is_in_taxonomy": 1,
+        "percent_estimate": 18.75,
+        "percent_max": 50,
+        "percent_min": 0,
+        "text": "Vegetable Oil",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "id": "en:cheddar-jalapeno-seasoning",
+        "ingredients": [
+          {
+            "id": "en:whey",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 4.6875,
+            "percent_max": 33.3333333333333,
+            "percent_min": 0,
+            "text": "Whey",
+            "vegan": "no",
+            "vegetarian": "maybe"
+          },
+          {
+            "id": "en:maltodextrin",
+            "ingredients": [
+              {
+                "id": "en:made-from-corn",
+                "is_in_taxonomy": 0,
+                "percent_estimate": 2.34375,
+                "percent_max": 16.6666666666667,
+                "percent_min": 0,
+                "text": "Made from Corn"
+              }
+            ],
+            "is_in_taxonomy": 1,
+            "percent_estimate": 2.34375,
+            "percent_max": 16.6666666666667,
+            "percent_min": 0,
+            "text": "Maltodextrin",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "11058",
+            "id": "en:salt",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.171875,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Salt",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "17130",
+            "ecobalyse_code": "rapeseed-oil",
+            "from_palm_oil": "no",
+            "id": "en:canola-oil",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.5859375,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Canola Oil",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "19801",
+            "id": "en:buttermilk",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.29296875,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Buttermilk",
+            "vegan": "no",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_proxy_food_code": "12999",
+            "id": "en:romano-cheese",
+            "ingredients": [
+              {
+                "ciqual_proxy_food_code": "19051",
+                "ecobalyse_code": "milk",
+                "id": "en:cow-s-milk",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.0732421875,
+                "percent_max": 2.59,
+                "percent_min": 0,
+                "text": "Cow's Milk",
+                "vegan": "no",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:lactic-ferments",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.03662109375,
+                "percent_max": 1.295,
+                "percent_min": 0,
+                "text": "Cheese Cultures",
+                "vegan": "maybe",
+                "vegetarian": "yes"
+              },
+              {
+                "ciqual_food_code": "11058",
+                "id": "en:salt",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.018310546875,
+                "percent_max": 0.863333333333333,
+                "percent_min": 0,
+                "text": "Salt",
+                "vegan": "yes",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:enzyme",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.018310546875,
+                "percent_max": 0.6475,
+                "percent_min": 0,
+                "text": "Enzymes",
+                "vegan": "maybe",
+                "vegetarian": "maybe"
+              }
+            ],
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.146484375,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Romano Cheese",
+            "vegan": "no",
+            "vegetarian": "maybe"
+          },
+          {
+            "id": "en:e621",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.0732421875,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Monosodium Glutamate",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "12726",
+            "id": "en:cheddar",
+            "ingredients": [
+              {
+                "ciqual_proxy_food_code": "19051",
+                "ecobalyse_code": "milk",
+                "id": "en:milk",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.018310546875,
+                "percent_max": 2.59,
+                "percent_min": 0,
+                "text": "Milk",
+                "vegan": "no",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:lactic-ferments",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.0091552734375,
+                "percent_max": 1.295,
+                "percent_min": 0,
+                "text": "Cheese Cultures",
+                "vegan": "maybe",
+                "vegetarian": "yes"
+              },
+              {
+                "ciqual_food_code": "11058",
+                "id": "en:salt",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.00457763671875,
+                "percent_max": 0.863333333333333,
+                "percent_min": 0,
+                "text": "Salt",
+                "vegan": "yes",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:enzyme",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 0.00457763671875,
+                "percent_max": 0.6475,
+                "percent_min": 0,
+                "text": "Enzymes",
+                "vegan": "maybe",
+                "vegetarian": "maybe"
+              }
+            ],
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.03662109375,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Cheddar Cheese",
+            "vegan": "no",
+            "vegetarian": "maybe"
+          },
+          {
+            "ciqual_food_code": "20034",
+            "ecobalyse_code": "onion-non-eu",
+            "id": "en:onion",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.018310546875,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "processing": "en:powder",
+            "text": "Onion",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_proxy_food_code": "31016",
+            "ecobalyse_code": "sugar",
+            "id": "en:sugar",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.0091552734375,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Sugar",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "9510",
+            "id": "en:corn-starch",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.00457763671875,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Corn Starch",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:natural-and-artificial-flavouring",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.002288818359375,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Natural and Artificial Flavors",
+            "vegan": "maybe",
+            "vegetarian": "maybe"
+          },
+          {
+            "ciqual_food_code": "9510",
+            "id": "en:modified-corn-starch",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.0011444091796875,
+            "percent_max": 2.59,
+            "percent_min": 0,
+            "text": "Modified Corn Starch",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_proxy_food_code": "31016",
+            "id": "en:dextrose",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.00057220458984375,
+            "percent_max": 2.38095238095238,
+            "percent_min": 0,
+            "text": "Dextrose",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:spice",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.000286102294921875,
+            "percent_max": 2.22222222222222,
+            "percent_min": 0,
+            "text": "Spices",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:lactose",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 0.000143051147460938,
+            "percent_max": 2.08333333333333,
+            "percent_min": 0,
+            "text": "Lactose",
+            "vegan": "no",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "20151",
+            "id": "en:jalapeno-pepper",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 7.15255737304688e-5,
+            "percent_max": 1.96078431372549,
+            "percent_min": 0,
+            "text": "Jalapeno Pepper",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "11000",
+            "id": "en:garlic",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 3.57627868652344e-5,
+            "percent_max": 1.85185185185185,
+            "percent_min": 0,
+            "processing": "en:powder",
+            "text": "Garlic",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:sodium-caseinate",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.78813934326172e-5,
+            "percent_max": 1.75438596491228,
+            "percent_min": 0,
+            "text": "Sodium Caseinate",
+            "vegan": "no",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:colour",
+            "ingredients": [
+              {
+                "id": "en:e110",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 4.4703483581543e-6,
+                "percent_max": 1.66666666666667,
+                "percent_min": 0,
+                "text": "Including Yellow 6",
+                "vegan": "yes",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:e102",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 2.23517417907715e-6,
+                "percent_max": 0.833333333333333,
+                "percent_min": 0,
+                "text": "Yellow 5",
+                "vegan": "yes",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:e133",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 1.11758708953857e-6,
+                "percent_max": 0.555555555555556,
+                "percent_min": 0,
+                "text": "Blue 1",
+                "vegan": "yes",
+                "vegetarian": "yes"
+              },
+              {
+                "id": "en:e129",
+                "is_in_taxonomy": 1,
+                "percent_estimate": 1.11758708953857e-6,
+                "percent_max": 0.416666666666667,
+                "percent_min": 0,
+                "text": "Red 40",
+                "vegan": "yes",
+                "vegetarian": "yes"
+              }
+            ],
+            "is_in_taxonomy": 1,
+            "percent_estimate": 8.94069671630859e-6,
+            "percent_max": 1.66666666666667,
+            "percent_min": 0,
+            "text": "Artificial Color"
+          },
+          {
+            "ciqual_proxy_food_code": "19051",
+            "ecobalyse_code": "milk",
+            "id": "en:skimmed-milk",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 4.4703483581543e-6,
+            "percent_max": 1.58730158730159,
+            "percent_min": 0,
+            "text": "Skim Milk",
+            "vegan": "no",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:e270",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 2.23517417907715e-6,
+            "percent_max": 1.51515151515152,
+            "percent_min": 0,
+            "text": "Lactic Acid",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:e330",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.11758708953857e-6,
+            "percent_max": 1.44927536231884,
+            "percent_min": 0,
+            "text": "Citric Acid",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:e296",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 5.58793544769287e-7,
+            "percent_max": 1.38888888888889,
+            "percent_min": 0,
+            "text": "Malic Acid",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "17440",
+            "ecobalyse_code": "sunflower-oil",
+            "from_palm_oil": "no",
+            "id": "en:sunflower-oil",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 2.79396772384644e-7,
+            "percent_max": 1.33333333333333,
+            "percent_min": 0,
+            "text": "Sunflower Oil",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "id": "en:e631",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.39698386192322e-7,
+            "percent_max": 1.28205128205128,
+            "percent_min": 0,
+            "text": "Disodium Inosinate",
+            "vegan": "maybe",
+            "vegetarian": "maybe"
+          },
+          {
+            "id": "en:e627",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 1.39698386192322e-7,
+            "percent_max": 1.23456790123457,
+            "percent_min": 0,
+            "text": "Disodium Guanylate",
+            "vegan": "maybe",
+            "vegetarian": "maybe"
+          }
+        ],
+        "is_in_taxonomy": 0,
+        "percent_estimate": 9.375,
+        "percent_max": 33.3333333333333,
+        "percent_min": 0,
+        "text": "Cheddar Jalapeno Seasoning"
+      },
+      {
+        "ciqual_food_code": "11058",
+        "id": "en:salt",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 9.375,
+        "percent_max": 2.59,
+        "percent_min": 0,
+        "text": "and Salt",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      }
+    ],
+    "lang": "en",
+    "product_name": "Cheetos Jalapeno & Cheddar 9.5z"
+  },
+  "status": 1,
+  "status_verbose": "product found"
+}

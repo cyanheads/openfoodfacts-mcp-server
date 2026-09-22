@@ -3,6 +3,7 @@
  * @module tests/mcp-server/tools/definitions/get-product.tool.test
  */
 
+import { readFileSync } from 'node:fs';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -12,9 +13,42 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
 
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import type { RawProduct } from '@/services/openfoodfacts/types.js';
 
 const mockGetProduct = vi.fn();
 const mockGetProductFields = vi.fn();
+
+/**
+ * The `product` object of a real Open Food Facts response saved under `tests/fixtures/ingredients/`
+ * — the payload the upstream returned for `fields=ingredients` (plus the name) on that barcode.
+ */
+function fixtureProduct(barcode: string): RawProduct {
+  const body = JSON.parse(
+    readFileSync(
+      new URL(`../../../fixtures/ingredients/product-${barcode}.json`, import.meta.url),
+      'utf8',
+    ),
+  ) as { product: RawProduct };
+  return body.product;
+}
+
+/** One parsed-ingredient entry as the output schema carries it, at any level of the tree. */
+type IngredientNode = {
+  id?: string | undefined;
+  text: string;
+  ingredients?: IngredientNode[] | undefined;
+};
+
+/** Every entry in a parsed-ingredient tree, in pre-order, with the level it sits at (1-based). */
+function walkIngredients(
+  entries: IngredientNode[] | undefined,
+  level = 1,
+): { entry: IngredientNode; level: number }[] {
+  return (entries ?? []).flatMap((entry) => [
+    { entry, level },
+    ...walkIngredients(entry.ingredients, level + 1),
+  ]);
+}
 
 /** Create the contract-bearing context wired by the production handler factory. */
 function createToolContext() {
@@ -1081,5 +1115,310 @@ describe('off_get_product', () => {
     expect(text).toContain('~9.375%');
     expect(text).not.toContain('~56.9%');
     expect(text).not.toContain('~9.4%');
+  });
+
+  // ── #43: output descriptions match the values the tool returns ────────────
+
+  it('echoes the input barcode, not the form Open Food Facts stores the record under', async () => {
+    // 030000010402 resolves to the record stored as 0030000010402; the 12-digit input comes back.
+    mockGetProduct.mockResolvedValue({ product_name: 'Quaker Oats' });
+
+    const result = offGetProductTool.output.parse(
+      await offGetProductTool.handler({ barcode: '030000010402' }, ctx),
+    );
+
+    expect(result.barcode).toBe('030000010402');
+    expect(offGetProductTool.output.shape.barcode.description).toMatch(/input/i);
+    expect(offGetProductTool.output.shape.barcode.description).toMatch(/echo/i);
+    expect(offGetProductTool.output.shape.barcode.description).not.toMatch(/returned by the API/);
+  });
+
+  it('describes the full Nutri-Score and Green-Score vocabularies', () => {
+    const product = offGetProductTool.output.shape.product.shape;
+    for (const term of ['"unknown"', '"not-applicable"']) {
+      expect(product.nutriscore_grade.description).toContain(term);
+    }
+    for (const term of ['"a-plus"', '"f"', '"unknown"', '"not-applicable"']) {
+      expect(product.ecoscore_grade.description).toContain(term);
+    }
+  });
+
+  // ── #40: sub-ingredients nest under their parent instead of being dropped ──
+  //
+  // Fixtures are the real upstream payloads, so the tree shapes and the percent_estimate values
+  // are what Open Food Facts actually sends. Output assertions go through output.parse(): a raw
+  // handler return bypasses the schema, and an undeclared nested key would pass there and then be
+  // stripped on the wire.
+
+  describe('nested sub-ingredients (#40)', () => {
+    it('leaves a product with no sub-ingredients unchanged on both surfaces', async () => {
+      // 3046920022651 parses to four flat entries — the characterization the nesting must not move.
+      mockGetProduct.mockResolvedValue(fixtureProduct('3046920022651'));
+
+      const result = offGetProductTool.output.parse(
+        await offGetProductTool.handler({ barcode: '3046920022651' }, ctx),
+      );
+
+      expect(result).toEqual({
+        barcode: '3046920022651',
+        product: {
+          product_name: 'Noir Intense',
+          ingredients: [
+            {
+              id: 'en:cocoa-paste',
+              text: 'Pâte de cacao',
+              percent_estimate: 64.23,
+              vegan: 'yes',
+              vegetarian: 'yes',
+            },
+            {
+              id: 'en:sugar',
+              text: 'sucre',
+              percent_estimate: 19.77,
+              vegan: 'maybe',
+              vegetarian: 'yes',
+            },
+            {
+              id: 'en:cocoa-butter',
+              text: 'beurre de cacao',
+              percent_estimate: 9.92,
+              vegan: 'yes',
+              vegetarian: 'yes',
+            },
+            {
+              id: 'en:vanilla',
+              text: 'vanille',
+              percent_estimate: 6.08,
+              vegan: 'yes',
+              vegetarian: 'yes',
+            },
+          ],
+        },
+      });
+      expect(firstText(offGetProductTool.format!(result))).toMatchInlineSnapshot(`
+        "## Noir Intense
+        **Barcode:** 3046920022651
+
+        **Nutrition:** Not available
+
+        **Ingredients:** Not available
+
+        **Parsed ingredients:**
+        - Pâte de cacao (id: en:cocoa-paste, ~64.23%, vegan: yes, vegetarian: yes)
+        - sucre (id: en:sugar, ~19.77%, vegan: maybe, vegetarian: yes)
+        - beurre de cacao (id: en:cocoa-butter, ~9.92%, vegan: yes, vegetarian: yes)
+        - vanille (id: en:vanilla, ~6.08%, vegan: yes, vegetarian: yes)
+
+        **Allergens:** Not entered (absence does not mean allergen-free)
+        **Traces:** Not entered (absence does not mean trace-free)
+
+        *Data: Open Food Facts (ODbL 1.0) — crowd-sourced. Missing fields = not yet entered.*"
+      `);
+    });
+
+    it('nests the sub-ingredients of a two-level tree on the subset path', async () => {
+      // The issue's repro: fields: ["ingredients"] on 7622210449283 returned 13 flat entries and
+      // dropped the four under en:cereal and en:vegetable-oil from both surfaces.
+      mockGetProductFields.mockResolvedValue(fixtureProduct('7622210449283'));
+
+      const result = offGetProductTool.output.parse(
+        await offGetProductTool.handler({ barcode: '7622210449283', fields: ['ingredients'] }, ctx),
+      );
+      const top = result.product.ingredients ?? [];
+
+      // The request is unchanged — fields=ingredients already returns the whole tree upstream.
+      expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('ingredients');
+      // The top-level list keeps its length and order.
+      expect(top).toHaveLength(13);
+      expect(top[0]?.id).toBe('en:cereal');
+
+      const cereal = top.find((e) => e.id === 'en:cereal');
+      expect(cereal?.ingredients).toEqual([
+        {
+          id: 'en:wheat-flour',
+          text: 'Farine de blé',
+          percent_estimate: 35.05,
+          vegan: 'yes',
+          vegetarian: 'yes',
+        },
+        {
+          id: 'en:whole-wheat-flour',
+          text: 'farine de blé complet',
+          percent_estimate: 12.76,
+          vegan: 'yes',
+          vegetarian: 'yes',
+        },
+      ]);
+      const oils = top.find((e) => e.id === 'en:vegetable-oil');
+      expect(oils?.ingredients?.map((e) => e.id)).toEqual(['en:palm-oil', 'en:colza-oil']);
+      // A leaf carries no empty `ingredients` array.
+      expect(top.find((e) => e.id === 'en:sugar')).not.toHaveProperty('ingredients');
+
+      // content[]: each child sits indented directly under its parent.
+      const lines = firstText(offGetProductTool.format!(result)).split('\n');
+      const at = (text: string) => lines.findIndex((line) => line.includes(text));
+      expect(lines[at('Céréale')]).toMatch(/^- Céréale \(id: en:cereal, ~47\.75%/);
+      expect(lines[at('Céréale') + 1]).toBe(
+        '  - Farine de blé (id: en:wheat-flour, ~35.05%, vegan: yes, vegetarian: yes)',
+      );
+      expect(lines[at('Céréale') + 2]).toMatch(
+        /^ {2}- farine de blé complet \(id: en:whole-wheat-flour/,
+      );
+      expect(lines[at('huiles végétales')]).toMatch(/^- huiles végétales \(id: en:vegetable-oil/);
+      expect(lines[at('huiles végétales') + 1]).toMatch(/^ {2}- huile de palme \(id: en:palm-oil/);
+      expect(lines[at('huiles végétales') + 2]).toMatch(/^ {2}- huile de colza \(id: en:colza-oil/);
+      expect(lines[at('huiles végétales') + 3]).toMatch(/^- cacao maigre en poudre/);
+    });
+
+    it('carries all 53 entries of a three-level tree on both surfaces', async () => {
+      // 0028400157827 parses to 53 entries across three levels, of which 4 are top-level; en:milk
+      // sits at the third, under en:cheddar under en:cheddar-jalapeno-seasoning.
+      mockGetProduct.mockResolvedValue(fixtureProduct('0028400157827'));
+
+      const result = offGetProductTool.output.parse(
+        await offGetProductTool.handler({ barcode: '0028400157827' }, ctx),
+      );
+      const walked = walkIngredients(result.product.ingredients);
+
+      expect(result.product.ingredients).toHaveLength(4);
+      expect(walked).toHaveLength(53);
+      expect(Math.max(...walked.map((w) => w.level))).toBe(3);
+
+      const seasoning = result.product.ingredients?.find(
+        (e) => e.id === 'en:cheddar-jalapeno-seasoning',
+      );
+      const cheddar = seasoning?.ingredients?.find((e) => e.id === 'en:cheddar');
+      expect(cheddar?.ingredients?.map((e) => e.id)).toEqual([
+        'en:milk',
+        'en:lactic-ferments',
+        'en:salt',
+        'en:enzyme',
+      ]);
+
+      // content[] renders every entry once, at the indentation of its level, in tree order.
+      const bullets = firstText(offGetProductTool.format!(result))
+        .split('\n')
+        .filter((line) => /^ *- .*\(id: /.test(line));
+      expect(bullets).toHaveLength(53);
+      bullets.forEach((line, i) => {
+        const node = walked[i] as { entry: IngredientNode; level: number };
+        expect(
+          line.startsWith(
+            `${'  '.repeat(node.level - 1)}- ${node.entry.text} (id: ${node.entry.id}`,
+          ),
+        ).toBe(true);
+      });
+      expect(bullets).toContain(
+        '    - Milk (id: en:milk, ~0.018310546875%, vegan: no, vegetarian: yes)',
+      );
+    });
+
+    it('describes a nested percent_estimate as a share of the whole product', () => {
+      // Measured on the fixtures: a parent's estimate equals the sum of its children's, at the
+      // second and the third level, so a child's figure is not a share of its parent.
+      const product = fixtureProduct('0028400157827');
+      const parents = walkIngredients(product.ingredients as IngredientNode[]).filter(
+        (w) => (w.entry.ingredients?.length ?? 0) > 0,
+      );
+      const estimate = (e: IngredientNode) =>
+        (e as { percent_estimate?: number }).percent_estimate ?? 0;
+      expect(parents.length).toBeGreaterThan(0);
+      for (const { entry } of parents) {
+        const childSum = (entry.ingredients ?? []).reduce((sum, e) => sum + estimate(e), 0);
+        expect(childSum).toBeCloseTo(estimate(entry), 5);
+      }
+
+      const topEntry = offGetProductTool.output.shape.product.shape.ingredients.unwrap().element;
+      const nestedEntry = topEntry.shape.ingredients.unwrap().element;
+      expect(nestedEntry.shape.percent_estimate.description).toMatch(/whole product/);
+      expect(nestedEntry.shape.percent_estimate.description).toMatch(/not of its parent/);
+    });
+
+    it('folds an entry below the third level into the third, right after its ancestor', async () => {
+      // No real product nests deeper than three (616 surveyed), but upstream permits it. The
+      // schema stops at three, so a deeper entry is listed at the third level — never dropped.
+      mockGetProduct.mockResolvedValue({
+        product_name: 'Four Levels',
+        ingredients: [
+          {
+            id: 'en:a',
+            text: 'A',
+            ingredients: [
+              {
+                id: 'en:a1',
+                text: 'A1',
+                ingredients: [
+                  {
+                    id: 'en:a1x',
+                    text: 'A1x',
+                    ingredients: [
+                      { id: 'en:a1x-deep', text: 'A1x deep', percent_estimate: 1 },
+                      {
+                        id: 'en:a1x-deeper',
+                        text: 'A1x deeper',
+                        ingredients: [{ id: 'en:a1x-deepest', text: 'A1x deepest' }],
+                      },
+                    ],
+                  },
+                  { id: 'en:a1y', text: 'A1y' },
+                ],
+              },
+            ],
+          },
+          { id: 'en:b', text: 'B' },
+        ],
+      });
+
+      const result = offGetProductTool.output.parse(
+        await offGetProductTool.handler({ barcode: '1234567890123' }, ctx),
+      );
+      const walked = walkIngredients(result.product.ingredients);
+
+      expect(walked.map((w) => [w.entry.id, w.level])).toEqual([
+        ['en:a', 1],
+        ['en:a1', 2],
+        ['en:a1x', 3],
+        ['en:a1x-deep', 3],
+        ['en:a1x-deeper', 3],
+        ['en:a1x-deepest', 3],
+        ['en:a1y', 3],
+        ['en:b', 1],
+      ]);
+      expect(walked.find((w) => w.entry.id === 'en:a1x-deep')?.entry).toEqual({
+        id: 'en:a1x-deep',
+        text: 'A1x deep',
+        percent_estimate: 1,
+      });
+
+      const text = firstText(offGetProductTool.format!(result));
+      expect(text).toContain('    - A1x (id: en:a1x)\n    - A1x deep (id: en:a1x-deep, ~1%)\n');
+      expect(text).toContain('    - A1x deepest (id: en:a1x-deepest)\n    - A1y (id: en:a1y)\n- B');
+    });
+
+    it('escapes nested text and id the way top-level values are escaped', () => {
+      const output = {
+        barcode: '12345678',
+        product: {
+          product_name: 'Nested escaping',
+          ingredients: [
+            {
+              text: 'parent',
+              ingredients: [
+                {
+                  text: '[click](https://example.invalid)',
+                  id: 'en:`x`',
+                  ingredients: [{ text: '*bold*\n# heading', id: 'en:a_b' }],
+                },
+              ],
+            },
+          ],
+        },
+      };
+      const text = firstText(offGetProductTool.format!(output));
+
+      expect(text).toContain('  - \\[click\\](https://example.invalid) (id: en:\\`x\\`)');
+      expect(text).toContain('    - \\*bold\\* # heading (id: en:a\\_b)');
+      expect(text.split('\n').some((line) => line.startsWith('# heading'))).toBe(false);
+    });
   });
 });

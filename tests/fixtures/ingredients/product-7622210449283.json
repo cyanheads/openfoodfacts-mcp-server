@@ -1,0 +1,198 @@
+{
+  "code": "7622210449283",
+  "product": {
+    "ingredients": [
+      {
+        "id": "en:cereal",
+        "ingredients": [
+          {
+            "ciqual_food_code": "9410",
+            "ciqual_proxy_food_code": "9410",
+            "ecobalyse_code": "a2e25aca-1f42-4bc8-bc0e-4d7c751775aa",
+            "id": "en:wheat-flour",
+            "is_in_taxonomy": 1,
+            "percent": 34.8,
+            "percent_estimate": 35.05,
+            "quantity_estimate": 40.01,
+            "text": "Farine de blé",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "9410",
+            "ciqual_proxy_food_code": "9410",
+            "ecobalyse_code": "a2e25aca-1f42-4bc8-bc0e-4d7c751775aa",
+            "id": "en:whole-wheat-flour",
+            "is_in_taxonomy": 1,
+            "percent": 15.2,
+            "percent_estimate": 12.76,
+            "quantity_estimate": 14.95,
+            "text": "farine de blé complet",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          }
+        ],
+        "is_in_taxonomy": 1,
+        "percent": 50,
+        "percent_estimate": 47.75,
+        "quantity_estimate": 54.96,
+        "text": "Céréale",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "31016",
+        "ciqual_proxy_food_code": "31016",
+        "ecobalyse_code": "5fc8032f-ca1c-4497-844b-f9213075eab3",
+        "id": "en:sugar",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 17.12,
+        "quantity_estimate": 17.12,
+        "text": "sucre",
+        "vegan": "maybe",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "17001",
+        "from_palm_oil": "maybe",
+        "id": "en:vegetable-oil",
+        "ingredients": [
+          {
+            "ciqual_food_code": "16129",
+            "ecobalyse_code": "45658c32-66d9-4305-a34b-21d6a4cef89c",
+            "from_palm_oil": "yes",
+            "id": "en:palm-oil",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 6.72,
+            "quantity_estimate": 6.72,
+            "text": "huile de palme",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          },
+          {
+            "ciqual_food_code": "17130",
+            "ecobalyse_code": "96b301d9-d21b-4cea-8903-bd7917e95a30",
+            "from_palm_oil": "no",
+            "id": "en:colza-oil",
+            "is_in_taxonomy": 1,
+            "percent_estimate": 2.23,
+            "quantity_estimate": 2.23,
+            "text": "huile de colza",
+            "vegan": "yes",
+            "vegetarian": "yes"
+          }
+        ],
+        "is_in_taxonomy": 1,
+        "percent_estimate": 8.94,
+        "quantity_estimate": 8.94,
+        "text": "huiles végétales",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "18100",
+        "id": "en:fat-reduced-cocoa-powder",
+        "is_in_taxonomy": 1,
+        "percent": 4.5,
+        "percent_estimate": 4.75,
+        "quantity_estimate": 4.92,
+        "text": "cacao maigre en poudre",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "31016",
+        "ciqual_proxy_food_code": "31016",
+        "id": "en:glucose-syrup",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 3.8,
+        "quantity_estimate": 3.8,
+        "text": "sirop de glucose",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "9510",
+        "ciqual_proxy_food_code": "9510",
+        "id": "en:wheat-starch",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 2.85,
+        "quantity_estimate": 2.85,
+        "text": "amidon de blé",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "additive_class": "en:raising-agent",
+        "id": "en:e503",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 2,
+        "quantity_estimate": 2,
+        "text": "carbonates d'ammonium",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "additive_class": "en:raising-agent",
+        "id": "en:e500",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 1.84,
+        "quantity_estimate": 1.84,
+        "text": "carbonates de sodium",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "42200",
+        "id": "en:soya-lecithin",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 1.55,
+        "quantity_estimate": 1.55,
+        "text": "lécithines de soja",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "11058",
+        "id": "en:salt",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 0.51,
+        "quantity_estimate": 0.51,
+        "text": "sel",
+        "vegan": "yes",
+        "vegetarian": "yes"
+      },
+      {
+        "ciqual_food_code": "19054",
+        "ecobalyse_code": "b6776a28-ec84-4bf3-988c-07b3c29f6136",
+        "id": "en:skimmed-milk-powder",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 0.51,
+        "quantity_estimate": 0.51,
+        "text": "lait écrémé en poudre",
+        "vegan": "no",
+        "vegetarian": "yes"
+      },
+      {
+        "id": "en:whey-permeate",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 0.51,
+        "quantity_estimate": 0.51,
+        "text": "perméat de lactosérum",
+        "vegan": "no",
+        "vegetarian": "maybe"
+      },
+      {
+        "id": "en:flavouring",
+        "is_in_taxonomy": 1,
+        "percent_estimate": 0.51,
+        "quantity_estimate": 0.51,
+        "text": "arômes",
+        "vegan": "maybe",
+        "vegetarian": "maybe"
+      }
+    ]
+  },
+  "status": 1,
+  "status_verbose": "product found"
+}

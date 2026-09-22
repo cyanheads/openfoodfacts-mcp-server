@@ -6,7 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import type { RawNutriments, RawProduct } from '@/services/openfoodfacts/types.js';
+import type { RawIngredient, RawNutriments, RawProduct } from '@/services/openfoodfacts/types.js';
 import { mdCodeFence, mdInline, mdUrl } from '@/utils/markdown.js';
 
 /**
@@ -166,6 +166,119 @@ function tagList(tags: string[]): string {
 }
 
 /**
+ * Fields every parsed-ingredient entry carries, at every level of the tree. A factory rather than
+ * a shared object so each level gets its own schema instances.
+ */
+const ingredientEntryFields = () => ({
+  id: z.string().optional().describe('Canonical ingredient ID (e.g. "en:sugar", "en:salt").'),
+  text: z.string().describe('Ingredient name as it appears in the list.'),
+  percent_estimate: z
+    .number()
+    .optional()
+    .describe(
+      "Estimated share of the whole product, in percent. On a sub-ingredient it is still a share of the whole product, not of its parent — a parent's estimate already includes its sub-ingredients, so summing across levels double-counts.",
+    ),
+  vegan: z.string().optional().describe('"yes", "no", or "maybe" — absent when unknown.'),
+  vegetarian: z.string().optional().describe('"yes", "no", or "maybe" — absent when unknown.'),
+});
+
+/**
+ * Deepest level of the parsed-ingredient tree the output schema declares. The schema is written
+ * out level by level rather than as a self-referential one: a recursive schema overflows the
+ * definition linter's stack and emits `$defs`/`$ref`, which some clients reject. Three is the
+ * deepest Open Food Facts has been observed to nest (616 products surveyed); upstream permits more,
+ * so a deeper entry is folded in at this level rather than dropped (see `buildIngredients`).
+ */
+const INGREDIENT_TREE_DEPTH = 3;
+
+/** A third-level entry — the deepest the schema declares, so it carries no `ingredients` of its own. */
+const thirdLevelIngredient = z
+  .object(ingredientEntryFields())
+  .describe(
+    'A sub-ingredient at the third level. An entry nested deeper upstream is listed at this level too, directly after the entry it belongs under.',
+  );
+
+/** A second-level entry, whose own sub-ingredients are the third level. */
+const secondLevelIngredient = z
+  .object({
+    ...ingredientEntryFields(),
+    ingredients: z
+      .array(thirdLevelIngredient)
+      .optional()
+      .describe(
+        'Sub-ingredients of this entry. Anything nested deeper upstream is listed here as well, right after the entry it belongs under, so no entry is dropped. Absent when the entry has none.',
+      ),
+  })
+  .describe('A sub-ingredient of a top-level entry.');
+
+/** One parsed-ingredient entry and its sub-ingredients, as the output carries them. */
+type IngredientOutput = {
+  id?: string;
+  text: string;
+  percent_estimate?: number;
+  vegan?: string;
+  vegetarian?: string;
+  ingredients?: IngredientOutput[];
+};
+
+/**
+ * Normalize a parsed-ingredient list, keeping each entry's sub-ingredients nested under it down to
+ * `INGREDIENT_TREE_DEPTH`. At that level an entry cannot carry `ingredients`, so its descendants
+ * are folded in after it in pre-order: only the parentage below the third level is flattened, and
+ * nothing is dropped. An empty upstream `ingredients` array is not carried — it means no children.
+ */
+function buildIngredients(raw: RawIngredient[], level = 1): IngredientOutput[] {
+  return raw.flatMap((ing) => {
+    const entry: IngredientOutput = {
+      ...(ing.id && { id: ing.id }),
+      text: ing.text ?? '',
+      ...(typeof ing.percent_estimate === 'number' && {
+        percent_estimate: ing.percent_estimate,
+      }),
+      ...(ing.vegan && { vegan: ing.vegan }),
+      ...(ing.vegetarian && { vegetarian: ing.vegetarian }),
+    };
+    const children = ing.ingredients ?? [];
+    if (children.length === 0) return [entry];
+    if (level < INGREDIENT_TREE_DEPTH) {
+      return [{ ...entry, ingredients: buildIngredients(children, level + 1) }];
+    }
+    return [entry, ...buildIngredients(children, level)];
+  });
+}
+
+/**
+ * A parsed-ingredient entry as `format()` receives it. Structural rather than the output type,
+ * since the Zod-inferred shape differs per level and the project runs `exactOptionalPropertyTypes`.
+ */
+type RenderedIngredient = {
+  id?: string | undefined;
+  text: string;
+  percent_estimate?: number | undefined;
+  vegan?: string | undefined;
+  vegetarian?: string | undefined;
+  ingredients?: RenderedIngredient[] | undefined;
+};
+
+/**
+ * Render a parsed-ingredient tree as a nested Markdown list, each sub-ingredient indented under
+ * its parent. The estimate is rendered at full precision — rounding to one decimal turned 56.85
+ * into "56.9", an unrecoverable loss since re-calling returns the same text — and "maybe" is kept,
+ * since it is a real Open Food Facts verdict (the status depends on sourcing), not an unknown.
+ */
+function ingredientLines(entries: RenderedIngredient[], depth = 0): string[] {
+  return entries.flatMap((ing) => {
+    const attrs: string[] = [];
+    if (ing.id) attrs.push(`id: ${mdInline(ing.id)}`);
+    if (ing.percent_estimate !== undefined) attrs.push(`~${ing.percent_estimate}%`);
+    if (ing.vegan) attrs.push(`vegan: ${mdInline(ing.vegan)}`);
+    if (ing.vegetarian) attrs.push(`vegetarian: ${mdInline(ing.vegetarian)}`);
+    const line = `${'  '.repeat(depth)}- ${mdInline(ing.text)}${attrs.length > 0 ? ` (${attrs.join(', ')})` : ''}`;
+    return [line, ...ingredientLines(ing.ingredients ?? [], depth + 1)];
+  });
+}
+
+/**
  * Render the serving denominator: the printed label plus the parsed quantity when OFF has one.
  * Only called when at least one of the two exists — a product with neither gets the disclosure in
  * the per-serving section instead, where the missing denominator is what the reader needs to know.
@@ -234,7 +347,11 @@ export const offGetProductTool = tool('off_get_product', {
   }),
 
   output: z.object({
-    barcode: z.string().describe('Barcode as returned by the API.'),
+    barcode: z
+      .string()
+      .describe(
+        'The input barcode, echoed back unchanged. Open Food Facts can hold the record under another form of the same code (030000010402 resolves to the record stored as 0030000010402); that stored form is not reported.',
+      ),
     product: z
       .object({
         product_name: z
@@ -254,28 +371,20 @@ export const offGetProductTool = tool('off_get_product', {
           .array(
             z
               .object({
-                id: z
-                  .string()
+                ...ingredientEntryFields(),
+                ingredients: z
+                  .array(secondLevelIngredient)
                   .optional()
-                  .describe('Canonical ingredient ID (e.g. "en:sugar", "en:salt").'),
-                text: z.string().describe('Ingredient name as it appears in the list.'),
-                percent_estimate: z
-                  .number()
-                  .optional()
-                  .describe('Estimated percentage of this ingredient.'),
-                vegan: z
-                  .string()
-                  .optional()
-                  .describe('"yes", "no", or "maybe" — absent when unknown.'),
-                vegetarian: z
-                  .string()
-                  .optional()
-                  .describe('"yes", "no", or "maybe" — absent when unknown.'),
+                  .describe(
+                    'Sub-ingredients of this entry (e.g. the flours under "cereal"), in the same entry shape and nested up to two more levels. Absent when the entry has none.',
+                  ),
               })
-              .describe('A single parsed ingredient entry.'),
+              .describe('A single top-level parsed ingredient entry.'),
           )
           .optional()
-          .describe('Parsed ingredient list. Absent when not yet parsed by contributors.'),
+          .describe(
+            'Parsed ingredient list, top level in label order, each entry carrying its sub-ingredients. Absent when not yet parsed by contributors.',
+          ),
         allergens_tags: z
           .array(z.string().describe('Canonical allergen tag ID (e.g. "en:milk", "en:gluten").'))
           .optional()
@@ -304,7 +413,7 @@ export const offGetProductTool = tool('off_get_product', {
           .string()
           .optional()
           .describe(
-            'Nutri-Score letter (a–e, lowercase). "a" is highest nutritional quality. Absent when not enough nutrition data to compute. Regional formula variants exist.',
+            'Nutri-Score grade, lowercase: "a" (highest nutritional quality) through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none. Regional formula variants exist.',
           ),
         nova_group: z
           .number()
@@ -316,7 +425,7 @@ export const offGetProductTool = tool('off_get_product', {
           .string()
           .optional()
           .describe(
-            'Green-Score/Eco-Score environmental impact letter (a–e, or "unknown"). Highly variable — depends on packaging, origins, and transport data completeness.',
+            'Green-Score (formerly Eco-Score) environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Highly variable — depends on packaging, origins, and transport data completeness.',
           ),
         nutriments: z
           .object({
@@ -466,14 +575,16 @@ export const offGetProductTool = tool('off_get_product', {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'Barcode status:0 — not present in any contributor record',
+      severity: 'notice',
       recovery:
         'Try off_search_products with the product name or brand to find the correct barcode, or check that the barcode digits are correct.',
     },
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns 5xx, serves an HTML error page, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry after a brief pause. If it keeps failing, Open Food Facts is degraded — check the barcode again later.',
     },
@@ -482,14 +593,16 @@ export const offGetProductTool = tool('off_get_product', {
       code: JsonRpcErrorCode.Timeout,
       when: 'Open Food Facts did not answer within the request deadline',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry once. If it times out again, pass a narrower fields subset so Open Food Facts assembles less per request.',
     },
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Open Food Facts answers 4xx for something other than a missing barcode',
+      when: 'Open Food Facts answers 4xx for something other than a missing barcode, or 501 Not Implemented',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Do not retry — the request will be refused again. Read data.status and the upstream explanation in the message, then correct the request.',
     },
@@ -498,6 +611,7 @@ export const offGetProductTool = tool('off_get_product', {
       code: JsonRpcErrorCode.RateLimited,
       when: "This server's own per-minute request budget is spent, or Open Food Facts answers 429",
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Wait the seconds given in data.retryAfter, then retry. Spread lookups out rather than issuing them in a burst.',
     },
@@ -633,22 +747,13 @@ export const offGetProductTool = tool('off_get_product', {
     }
 
     if (p.ingredients && p.ingredients.length > 0) {
-      // Rendered in full. The whole list is already in structuredContent, so slicing here saved
-      // nothing on the wire and only left text-only clients with a silently short list. "maybe" is
-      // a real Open Food Facts verdict — it means the ingredient's status depends on sourcing — so
-      // dropping it read as "unknown" when the database had actually answered.
+      /**
+       * Rendered in full, sub-ingredients indented under their parent. The whole tree is already
+       * in structuredContent, so slicing here saved nothing on the wire and only left text-only
+       * clients with a silently short list.
+       */
       lines.push('\n**Parsed ingredients:**');
-      for (const ing of p.ingredients) {
-        const attrs: string[] = [];
-        if (ing.id) attrs.push(`id: ${mdInline(ing.id)}`);
-        // The estimate is rendered at full precision. Rounding to one decimal turned 56.85 into
-        // "56.9" and 9.375 into "9.4" — the same unrecoverable loss as the completeness percentage,
-        // since re-calling returns the same rounded text.
-        if (ing.percent_estimate !== undefined) attrs.push(`~${ing.percent_estimate}%`);
-        if (ing.vegan) attrs.push(`vegan: ${mdInline(ing.vegan)}`);
-        if (ing.vegetarian) attrs.push(`vegetarian: ${mdInline(ing.vegetarian)}`);
-        lines.push(`- ${mdInline(ing.text)}${attrs.length > 0 ? ` (${attrs.join(', ')})` : ''}`);
-      }
+      lines.push(...ingredientLines(p.ingredients));
     }
 
     // Allergens
@@ -724,13 +829,7 @@ type ProductOutput = {
   brands?: string;
   quantity?: string;
   ingredients_text?: string;
-  ingredients?: Array<{
-    id?: string;
-    text: string;
-    percent_estimate?: number;
-    vegan?: string;
-    vegetarian?: string;
-  }>;
+  ingredients?: IngredientOutput[];
   allergens_tags?: string[];
   traces_tags?: string[];
   additives_tags?: string[];
@@ -781,15 +880,7 @@ function buildProductOutput(
   if (raw.quantity) product.quantity = raw.quantity;
   if (raw.ingredients_text) product.ingredients_text = raw.ingredients_text;
   if (raw.ingredients && raw.ingredients.length > 0) {
-    product.ingredients = raw.ingredients.map((ing) => ({
-      ...(ing.id && { id: ing.id }),
-      text: ing.text ?? '',
-      ...(typeof ing.percent_estimate === 'number' && {
-        percent_estimate: ing.percent_estimate,
-      }),
-      ...(ing.vegan && { vegan: ing.vegan }),
-      ...(ing.vegetarian && { vegetarian: ing.vegetarian }),
-    }));
+    product.ingredients = buildIngredients(raw.ingredients);
   }
   if (raw.allergens_tags) product.allergens_tags = raw.allergens_tags;
   // An empty array is carried through rather than dropped: for traces it is Open Food Facts

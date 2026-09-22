@@ -8,13 +8,19 @@
 /** Raw nutriments map from the OFF API — flat key-value with hyphenated keys and suffix variants. */
 export type RawNutriments = Record<string, number | string | undefined>;
 
-/** Parsed ingredient entry from the OFF API. */
+/**
+ * Parsed ingredient entry from the OFF API. `ingredients` holds its sub-ingredients in the same
+ * shape — upstream declares the field self-recursive and unbounded, and a non-empty array is the
+ * only signal an entry has any (`has_sub_ingredients` never appears in the v2 product response).
+ * A sub-ingredient's `percent_estimate` is its share of the whole product, not of its parent.
+ */
 export type RawIngredient = {
   id?: string;
   text?: string;
   percent_estimate?: number;
   vegan?: string;
   vegetarian?: string;
+  ingredients?: RawIngredient[];
 };
 
 /** Raw product object from the OFF API. Only documents the fields we actually use. */
