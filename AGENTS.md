@@ -2,7 +2,7 @@
 
 **Server:** openfoodfacts-mcp-server
 **Version:** 0.3.4
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.3`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
 **Zod:** ^4.6.5
@@ -42,7 +42,7 @@ export const offGetProduct = tool('off_get_product', {
       .describe('Subset of fields to return. Omitting returns all standard fields.'),
   }),
   output: z.object({
-    barcode: z.string().describe('Barcode as returned by the API.'),
+    barcode: z.string().describe('The input barcode, echoed back unchanged.'),
     // No `found` flag: a missing record is the thrown not_found error, so a boolean here could
     // only ever be true. Don't advertise a state the handler cannot return — a caller that
     // branches on it never handles the path that actually fires.
@@ -60,7 +60,9 @@ export const offGetProduct = tool('off_get_product', {
   async handler(input, ctx) {
     const svc = getOpenFoodFactsService();
     const product = await svc.getProduct(input.barcode, ctx);
-    if (!product) throw ctx.fail('not_found', `Barcode ${input.barcode} not found`);
+    if (!product) {
+      throw ctx.fail('not_found', `Barcode ${input.barcode} not found`, ctx.recoveryFor('not_found'));
+    }
     return { barcode: input.barcode, product };
   },
 
@@ -143,7 +145,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. Pass `ctx.recoveryFor('reason')` as the throw's data to put it on the wire (`data.recovery.hint`, mirrored into `content[]` text); override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. Pass `ctx.recoveryFor('reason')` as the throw's data to put it on the wire (`data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim); override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Forwarding it is lint-enforced per throw site (`error-contract-recovery-unforwarded`). Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
