@@ -7,12 +7,14 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  getOpenFoodFactsService,
+  MAX_AUTOCOMPLETE_SIZE,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 export type TaxonomyEntry = {
   id: string;
   name: string;
-  products?: number;
 };
 
 /**
@@ -328,6 +330,22 @@ function matchesTerm(entry: EmbeddedEntry, term: string): boolean {
 /** Public projection: aliases widen what resolves, never what the caller is handed. */
 const toTag = ({ aliases: _aliases, ...tag }: EmbeddedEntry): TaxonomyEntry => tag;
 
+/**
+ * Stable-sorts the live suggestions whose ID is the term itself as a tag — `en:<slug>`,
+ * `en:<slug>s`, or `en:<slug>es`, where the slug is the lowercased term with whitespace runs
+ * hyphenated, the normalization tag IDs use — ahead of the rest, which keep upstream order. Only
+ * an equal ID moves, so a compound that merely shares a word (`en:red-lentils` for "lentil") stays
+ * where upstream put it. Nothing is added or dropped.
+ */
+function rankExactTagFirst(live: TaxonomyEntry[], term: string): TaxonomyEntry[] {
+  const slug = term.toLowerCase().replace(/\s+/g, '-');
+  const exact = new Set([`en:${slug}`, `en:${slug}s`, `en:${slug}es`]);
+  return [
+    ...live.filter((entry) => exact.has(entry.id)),
+    ...live.filter((entry) => !exact.has(entry.id)),
+  ];
+}
+
 export type TaxonomySearchResult = {
   facet: string;
   tags: TaxonomyEntry[];
@@ -402,9 +420,15 @@ export class TaxonomyService {
      */
     let live: TaxonomyEntry[];
     try {
-      // One past the limit, so a full page can be told apart from an exactly-full one and reported
-      // as truncated. The endpoint offers no offset, so this is the only way to know more exist.
-      live = await this.off.suggestTaxonomy(taxonomyName, term, limit + 1, ctx);
+      /**
+       * The whole pool the endpoint honors, not a request sized to the limit. Upstream lists a
+       * term's compound tags ahead of the plain one (`lentil` answers eight `en:lentil-*`
+       * suggestions with `en:lentils` last; `cheese` puts `en:cheeses` 37th of 69), so a
+       * limit-sized request never receives the tag the term names and no reordering can reach it.
+       * It costs a few kilobytes and no extra request, and anything past the limit still reads as
+       * truncation — the endpoint has no offset, so over-asking is the only way to know more exist.
+       */
+      live = await this.off.suggestTaxonomy(taxonomyName, term, MAX_AUTOCOMPLETE_SIZE, ctx);
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error);
       ctx.log.warning('Live taxonomy resolution failed — falling back to the offline sample', {
@@ -430,15 +454,19 @@ export class TaxonomyService {
      * E-number query returns a page of unrelated E-numbers — so unfiltered pass-through would
      * answer `e330` with tags that do not contain it. Measured across ordinary terms (cheese,
      * kombucha, olive oil, organic, tofu, …) this drops nothing and removes only that noise.
+     *
+     * What survives is ranked exact-tag first, the live portion only: the embedded block keeps its
+     * hand-maintained order ahead of it.
      */
     const seen = new Set(offline.map((entry) => entry.id));
-    const merged: TaxonomyEntry[] = offline.map(toTag);
+    const liveMatches: TaxonomyEntry[] = [];
     for (const entry of live) {
       if (!seen.has(entry.id) && matchesTerm(entry, term)) {
         seen.add(entry.id);
-        merged.push(entry);
+        liveMatches.push(entry);
       }
     }
+    const merged = [...offline.map(toTag), ...rankExactTagFirst(liveMatches, term)];
 
     return {
       facet,

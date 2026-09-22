@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for off_browse_taxonomy — live taxonomy resolution against the
  * search-a-licious autocomplete endpoint, the offline-sample merge and fallback (GH issue #14),
- * and bare NOVA group tag IDs (GH issue #15).
+ * bare NOVA group tag IDs (GH issue #15), exact-term ranking of live suggestions (GH issue #42),
+ * and the tag output shape (GH issue #43).
  *
  * The taxonomy service now makes an HTTP call for the five open facets, so these stub global
  * `fetch` rather than mocking `fetchWithTimeout`: the framework helper throws on a non-2xx, so a
@@ -146,19 +147,29 @@ describe('off_browse_taxonomy', () => {
       facet: 'labels',
       tags: [
         { id: 'en:organic', name: 'Organic' },
-        { id: 'en:fair-trade', name: 'Fair Trade', products: 5000 },
+        { id: 'en:fair-trade', name: 'Fair Trade' },
       ],
       total_in_facet: 50,
     };
     const blocks = offBrowseTaxonomyTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
     const text = firstText(blocks);
-    expect(text).toContain('en:organic');
-    expect(text).toContain('Organic');
-    expect(text).toContain('en:fair-trade');
-    // products count rendered
-    expect(text).toContain('5');
-    expect(text).toContain('labels');
+    expect(text).toContain('- `en:organic` — Organic');
+    expect(text).toContain('- `en:fair-trade` — Fair Trade');
+    expect(text).toContain('## labels (2 entries of 50 total)');
+  });
+
+  it('advertises no product count on a tag, since no source ever supplies one (#43)', async () => {
+    // tags[].products was described as an approximate product count, yet neither the live
+    // suggester, the offline sample, nor the fixed vocabularies carries one.
+    const tagShape = offBrowseTaxonomyTool.output.shape.tags.element.shape;
+    expect(Object.keys(tagShape)).toEqual(['id', 'name']);
+
+    stubAutocomplete([{ id: 'en:hummus', text: 'Hummus' }]);
+    const result = offBrowseTaxonomyTool.output.parse(
+      await offBrowseTaxonomyTool.handler({ facet: 'categories', search: 'hummus', limit: 5 }, ctx),
+    );
+    for (const tag of result.tags) expect(Object.keys(tag)).toEqual(['id', 'name']);
   });
 
   it('formats an empty result without claiming the tag does not exist', () => {
@@ -200,7 +211,7 @@ describe('off_browse_taxonomy', () => {
       expect(result.tags.map((t) => t.id)).toEqual(['en:kombuchas']);
     });
 
-    it('queries the autocomplete endpoint with the facet taxonomy name and one past the limit', async () => {
+    it('queries the autocomplete endpoint with the facet taxonomy name and the full suggestion pool', async () => {
       await offBrowseTaxonomyTool.handler({ facet: 'labels', search: 'organic', limit: 5 }, ctx);
 
       const url = fetchedUrl();
@@ -208,8 +219,10 @@ describe('off_browse_taxonomy', () => {
       expect(url.pathname).toBe('/autocomplete');
       expect(url.searchParams.get('q')).toBe('organic');
       expect(url.searchParams.get('taxonomy_names')).toBe('label');
-      // limit + 1 — the endpoint has no offset, so an extra option is the only truncation signal.
-      expect(url.searchParams.get('size')).toBe('6');
+      // The most the endpoint honors, not limit + 1: upstream lists compound tags ahead of the
+      // plain one, so a request sized to the limit misses the exact tag (#42). Anything past the
+      // limit still reads as truncation.
+      expect(url.searchParams.get('size')).toBe('200');
     });
 
     it('maps each open facet to its upstream taxonomy name', async () => {
@@ -708,6 +721,164 @@ describe('off_browse_taxonomy', () => {
     });
   });
 
+  // ── #42: the exact-term tag ranks ahead of compound live suggestions ──────
+
+  describe('exact-term ranking (#42)', () => {
+    /** The live `category` suggestions for "lentil", in the order upstream returns them. */
+    const lentilOptions: Option[] = [
+      { id: 'en:lentil-spreads', text: 'Lentil dips' },
+      { id: 'en:lentil-dishes', text: 'Lentil dishes' },
+      { id: 'en:lentil-flours', text: 'Lentil flours' },
+      { id: 'en:lentil-pasta', text: 'Lentil pasta' },
+      { id: 'en:lentil-salads', text: 'Lentil salads' },
+      { id: 'en:lentil-soups', text: 'Lentil soups' },
+      { id: 'en:lentil-sprouts', text: 'Lentil sprouts' },
+      { id: 'en:lentils', text: 'Lentils' },
+    ];
+
+    /** The live `category` suggestions for "chickpea", in upstream order. */
+    const chickpeaOptions: Option[] = [
+      { id: 'en:chickpea-crisps', text: 'Chickpea crisps' },
+      { id: 'en:chickpea-flours', text: 'Chickpea flours' },
+      { id: 'en:chickpea-pasta', text: 'Chickpea pasta' },
+      { id: 'en:chickpeas', text: 'Chickpeas' },
+    ];
+
+    /**
+     * Stub the endpoint the way it behaves live: the options come back in upstream order, cut to
+     * the requested `size`. A fixed list that ignored `size` would hide a request too small to
+     * reach the exact tag at all.
+     */
+    function stubAutocompleteBySize(options: Option[]): void {
+      global.fetch = vi.fn(async (url: string | URL | Request) => {
+        const size = Number(new URL(String(url)).searchParams.get('size'));
+        return mockResponse({ took: 1, timed_out: false, options: options.slice(0, size) });
+      });
+    }
+
+    it('puts en:lentils first and keeps the rest of the live order', async () => {
+      stubAutocompleteBySize(lentilOptions);
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'lentil', limit: 20 },
+        ctx,
+      );
+
+      expect(result.tags.map((t) => t.id)).toEqual([
+        'en:lentils',
+        'en:lentil-spreads',
+        'en:lentil-dishes',
+        'en:lentil-flours',
+        'en:lentil-pasta',
+        'en:lentil-salads',
+        'en:lentil-soups',
+        'en:lentil-sprouts',
+      ]);
+      // content[] lists the tags in the same order.
+      const text = firstText(offBrowseTaxonomyTool.format!(result));
+      expect(text.indexOf('`en:lentils`')).toBeLessThan(text.indexOf('`en:lentil-spreads`'));
+    });
+
+    it('includes en:chickpeas under limit 2, where it used to be cut', async () => {
+      // Upstream lists the plain tag after every compound, so a request sized to the limit never
+      // received it — reordering what arrived could not reach it.
+      stubAutocompleteBySize(chickpeaOptions);
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'chickpea', limit: 2 },
+        ctx,
+      );
+
+      expect(result.tags.map((t) => t.id)).toEqual(['en:chickpeas', 'en:chickpea-crisps']);
+      // The two dropped suggestions are disclosed, not silently cut.
+      expect(getEnrichment(ctx).truncated).toBe(true);
+      expect(getEnrichment(ctx).shown).toBe(2);
+    });
+
+    it('matches a hyphenated slug of a multi-word, mixed-case term, and an -es plural', async () => {
+      stubAutocompleteBySize([
+        { id: 'en:flavored-sparkling-waters', text: 'Flavored sparkling waters' },
+        { id: 'en:sparkling-water-drinks', text: 'Sparkling water drinks' },
+        { id: 'en:sparkling-waters', text: 'Sparkling waters' },
+      ]);
+      const multiWord = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'Sparkling Water', limit: 10 },
+        ctx,
+      );
+      expect(multiWord.tags.map((t) => t.id)).toEqual([
+        'en:sparkling-waters',
+        'en:flavored-sparkling-waters',
+        'en:sparkling-water-drinks',
+      ]);
+
+      stubAutocompleteBySize([
+        { id: 'en:peach-jams', text: 'Peach jams' },
+        { id: 'en:peaches', text: 'Peaches' },
+      ]);
+      const esPlural = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'peach', limit: 10 },
+        createMockContext(),
+      );
+      expect(esPlural.tags.map((t) => t.id)).toEqual(['en:peaches', 'en:peach-jams']);
+    });
+
+    it('promotes no compound that merely shares the word', async () => {
+      stubAutocompleteBySize([
+        { id: 'en:lentil-soups', text: 'Lentil soups' },
+        { id: 'en:red-lentils', text: 'Red lentils' },
+      ]);
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'lentil', limit: 10 },
+        ctx,
+      );
+
+      expect(result.tags.map((t) => t.id)).toEqual(['en:lentil-soups', 'en:red-lentils']);
+    });
+
+    it('leaves the live order alone when no exact or plural tag was suggested', async () => {
+      stubAutocompleteBySize([
+        { id: 'en:tomato-sauces', text: 'Tomato sauces' },
+        { id: 'en:tomato-juices', text: 'Tomato juices' },
+        { id: 'en:cherry-tomatoes', text: 'Cherry tomatoes' },
+      ]);
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'tomato', limit: 10 },
+        ctx,
+      );
+
+      expect(result.tags.map((t) => t.id)).toEqual([
+        'en:tomato-sauces',
+        'en:tomato-juices',
+        'en:cherry-tomatoes',
+      ]);
+    });
+
+    it('keeps the offline block ahead of the live one, in its own order', async () => {
+      // "milk" matches three embedded categories, one of them the exact en:milks. The embedded
+      // block is merged first in its hand-maintained order; the ranking never reaches into it.
+      stubAutocompleteBySize([
+        { id: 'en:milk-chocolates', text: 'Milk chocolates' },
+        { id: 'en:milks', text: 'Milks' },
+        { id: 'en:whole-milks', text: 'Whole milks' },
+      ]);
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'milk', limit: 10 },
+        ctx,
+      );
+
+      expect(result.tags.map((t) => t.id)).toEqual([
+        'en:fermented-milk-products',
+        'en:milks',
+        'en:plant-based-milk-alternatives',
+        'en:milk-chocolates',
+        'en:whole-milks',
+      ]);
+    });
+  });
+
   // ── #27: a tag ID cannot close its own code span ─────────────────────────
 
   describe('markdown escaping', () => {
@@ -729,11 +900,11 @@ describe('off_browse_taxonomy', () => {
       const text = firstText(
         offBrowseTaxonomyTool.format!({
           facet: 'labels',
-          tags: [{ id: 'en:organic', name: 'Organic', products: 1234 }],
+          tags: [{ id: 'en:organic', name: 'Organic' }],
         }),
       );
 
-      expect(text).toContain('- `en:organic` — Organic (~1,234 products)');
+      expect(text).toContain('- `en:organic` — Organic\n');
       expect(text).not.toContain('\\');
     });
   });

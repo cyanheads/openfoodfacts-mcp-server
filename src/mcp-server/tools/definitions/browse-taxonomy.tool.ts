@@ -44,7 +44,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .max(100)
       .default(20)
       .describe(
-        'Maximum entries to return (1–100, default 20). There is no offset or page input: Open Food Facts returns only the first `limit` matches for a term and offers no cursor, so narrow the search term rather than paging.',
+        'Maximum entries to return (1–100, default 20). There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag spelling the term itself (e.g. "lentil" → en:lentils) is listed first among the live matches, so it is not the one a small limit cuts.',
       ),
   }),
 
@@ -60,12 +60,6 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
                 'Canonical tag ID (e.g. "en:organic"; bare "1"–"4" for NOVA groups, bare "a"–"e" for Nutri-Score grades). Pass this value through to the matching off_search_products filter parameter unchanged.',
               ),
             name: z.string().describe('Human-readable display name (e.g. "Organic").'),
-            products: z
-              .number()
-              .optional()
-              .describe(
-                'Approximate count of products with this tag. Not available for all facets.',
-              ),
           })
           .describe('A single taxonomy tag entry with its canonical ID and display name.'),
       )
@@ -141,11 +135,9 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     }
 
     for (const tag of result.tags) {
-      const products =
-        tag.products !== undefined ? ` (~${tag.products.toLocaleString()} products)` : '';
       // A backtick in a tag ID would close a single-backtick span and render the rest of the ID as
       // prose, so the span's delimiter is sized past whatever the ID carries.
-      lines.push(`- ${mdInlineCode(tag.id)} — ${mdInline(tag.name)}${products}`);
+      lines.push(`- ${mdInlineCode(tag.id)} — ${mdInline(tag.name)}`);
     }
 
     lines.push(
