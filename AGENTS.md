@@ -32,12 +32,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { BARCODE_PATTERN } from '@/services/openfoodfacts/types.js';
 
 export const offGetProduct = tool('off_get_product', {
-  description: 'Fetch a packaged food product by barcode (EAN-13 or UPC).',
+  description: 'Fetch a packaged food product by barcode (4–40 digits).',
   annotations: { readOnlyHint: true },
   input: z.object({
-    barcode: z.string().regex(/^\d{8,14}$/).describe('EAN-13 or UPC barcode (8–14 digits).'),
+    barcode: z.string().regex(BARCODE_PATTERN).describe('Product barcode, digits only: 4–40 digits after any leading zeros.'),
     fields: z.array(z.enum(['product_name', 'brands', 'nutriscore_grade', 'nutriments'])).optional()
       .describe('Subset of fields to return. Omitting returns all standard fields.'),
   }),
@@ -197,7 +198,7 @@ src/
       openfoodfacts-service.ts          # Open Food Facts API client (HTTP, rate limiting, retry)
       types.ts                          # Domain types
     taxonomy/
-      taxonomy-service.ts               # Tag vocabulary — live resolution, offline sample, merge/fallback policy
+      taxonomy-service.ts               # Tag vocabulary — live resolution, offline sample, merge/fallback policy, tag-value canonicalization
   utils/
     markdown.ts                         # Contextual Markdown escaping for crowd-sourced values in content[]
   mcp-server/

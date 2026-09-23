@@ -1,6 +1,6 @@
 <div align="center">
   <h1>@cyanheads/openfoodfacts-mcp-server</h1>
-  <p><b>Look up food products by barcode, search by ingredient or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.</b>
+  <p><b>Look up food products by barcode, search by keyword, tag, allergen, or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.</b>
   <div>4 Tools</div>
   </p>
 </div>
@@ -36,7 +36,7 @@ Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged
 | Tool | Description |
 |:-----|:------------|
 | `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, declared and trace allergens, additives, the vegan/vegetarian/palm-oil analysis, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, countries of sale, and data completeness. |
-| `off_search_products` | Search by text query, structured tag filters (category, brand, label, allergen, additive, Nutri-Score grade, NOVA group, country), and numeric per-100 g nutrient thresholds. Returns summary rows with barcodes for follow-up lookups. |
+| `off_search_products` | Search by text query, structured tag filters (category, brand, labels, allergen, trace, vegan/vegetarian/palm-oil verdict, additive, Nutri-Score grade, NOVA group, country), allergen and trace exclusions, and numeric per-100 g nutrient thresholds. Returns summary rows with barcodes for follow-up lookups. |
 | `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy, macros, salt, Nutri-Score, NOVA, and Green-Score. |
 | `off_browse_taxonomy` | Resolve a human term to the canonical tag ID (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) that `off_search_products` filters on, against the live Open Food Facts taxonomy. |
 
@@ -44,7 +44,7 @@ Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged
 
 ### `off_get_product` <sub>tool</sub>
 
-- Accepts 8–14 digit barcodes (EAN-13, EAN-8, UPC-A, UPC-E)
+- Accepts every barcode Open Food Facts serves: digits only, 4–40 digits after any leading zeros — EAN-13, EAN-8, UPC-A, UPC-E, and the shorter and longer codes the database also holds
 - Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags, and each entry's sub-ingredients nested under it — wheat flour under "cereal", palm oil under "vegetable oils" — up to three levels deep), all 14 major allergens as tag IDs, E-number additives, Nutri-Score (`a`–`e`, `unknown`, `not-applicable`), NOVA 1–4, Green-Score (`a-plus`, `a`–`f`, `unknown`, `not-applicable`), every nutrient Open Food Facts holds per 100g and per serving, the serving size those per-serving figures are measured against, categories/labels/packaging/origins/countries of sale as canonical tag IDs, front image URL, and data completeness score (0–1)
 - `traces_tags` carries the "may contain" allergen warning separately from the declared `allergens_tags`; `["en:none"]` is the label stating no traces, while an empty array means not yet entered — never trace-free
 - `ingredients_analysis_tags` carries the vegan, vegetarian, and palm-oil verdicts Open Food Facts computes itself, including its "maybe" states, rather than leaving the per-ingredient flags to be aggregated by the caller
@@ -56,15 +56,18 @@ Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged
 
 ### `off_search_products` <sub>tool</sub>
 
-- Full-text `query` plus structured tag filters — `categories_tag`, `brands_tag`, `labels_tag`, `allergens_tag`, `additives_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag` — and numeric `nutrient_filters`, all combining as AND; all tag values are canonical IDs, resolved via `off_browse_taxonomy` (`brands_tag` matches an exact slug, not free text)
+- Full-text `query` plus structured tag filters — `categories_tag`, `brands_tag`, `labels_tag` (one label, or an array that must all apply), `allergens_tag`, `traces_tag` (the "may contain" warning), `ingredients_analysis_tag` (one of the 12 vegan, vegetarian, and palm-oil verdicts), `additives_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag` — and numeric `nutrient_filters`, all combining as AND; tag values are canonical IDs, resolved via `off_browse_taxonomy` (`brands_tag` matches an exact slug, not free text)
+- `exclude_allergens` and `exclude_traces` drop products that declare an allergen or warn of a trace, on both paths. Each value must be an allergen tag the Open Food Facts vocabulary confirms — an unrecognized one would exclude nothing, so it is rejected before any search is sent. A product with no allergen or trace data entered passes an exclusion, and every response carrying one says so and points to `off_get_product` for a per-product check
+- Every word of `query` must match a product's name, generic name, categories, labels, or brand (ingredients and quantity are not searched), in any of the 31 languages the text index analyzes, so a product named only in French or Russian is found by that name; stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit") are not required, and `query` takes at most 24 words
+- On a search carrying `query` or `nutrient_filters`, each tag value is resolved to its canonical form before it is sent — a brand name is slugged (`Nutella` → `nutella`), and a case variant, synonym, or singular resolves where the Open Food Facts vocabulary confirms it (`US` → `en:united-states`, `en:peanut` → `en:peanuts`); anything unconfirmed is matched exactly, and an empty result names which values were
 - Numeric `nutrient_filters` express per-100 g thresholds over `energy-kcal`, `fat`, `saturated-fat`, `carbohydrates`, `sugars`, `fiber`, `proteins`, `salt`, and `sodium` — each a `{ nutrient, operator, value }` triple with `lt` / `lte` / `gt` / `gte`; pair two entries on one nutrient for a range. They AND with every other filter and are served by the text backend, so supplying one routes the search there even without `query`
 - `additives_tag` filters only on searches carrying neither `query` nor `nutrient_filters` — both route to a backend with no additives field, so the pairing is rejected up front rather than silently returning zero hits
-- Pagination via `page` (1-based) and `page_size` (1–50, default 20); text searches serve only the first 10,000 results (`page * page_size` beyond that is rejected), tag-only searches publish no window but refuse deep pages unpredictably
+- Pagination via `page` (1-based) and `page_size` (1–50, default 20); tag-only searches are served through page 10, and text searches serve only the first 10,000 results (`page * page_size` beyond that); a request past either bound is rejected before it is sent, and `last_page` reports the deepest page that can be requested
 - `total` is exact on tag-only searches; text searches stop counting at 10,000 and set `total_is_lower_bound: true` with the count rendered as `10000+`
 - The two paths read different indexes: a search carrying `query` is answered by a text index that lags the live database, and says so on both response surfaces; a tag-only search reads the live database. A recently contributed product can be missing from the first and present in the second
 - `sort_by` (`last_modified_t`, `unique_scans_n`, `created_t`, `popularity_key`) orders newest or highest first on both paths; omitting it leaves text searches relevance-ranked
 - A page past the end of a result set is reported as an exhausted page naming the deepest page that holds products, not as a zero-match search — the broaden-the-filters guidance appears only when nothing matched
-- Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — chain to `off_get_product` for full label data; counts reflect contributed products, not the market
+- Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — chain to `off_get_product` for full label data; counts reflect contributed products, not the market. Every returned barcode is one `off_get_product` accepts: a match Open Food Facts stores under a code it cannot serve (`00000636`) is left off the page and counted in `omitted`
 - Own client-side budget of ~10 requests/min, kept well inside what Open Food Facts asks of clients
 
 ---
@@ -226,7 +229,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OFF_BASE_URL` | Open Food Facts API base URL. Override for local testing against a mock server. | `https://world.openfoodfacts.org` |
 | `OFF_RATE_LIMIT_PRODUCT` | Product read rate limit (requests/min). Matches the 15 req/min/IP Open Food Facts documents for product reads. | `15` |
 | `OFF_RATE_LIMIT_SEARCH` | Search rate limit (requests/min). | `10` |
-| `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy resolution rate limit (requests/min). A spent budget falls back to the offline sample rather than failing. | `10` |
+| `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy resolution rate limit (requests/min), shared by `off_browse_taxonomy`, tag-value resolution on text searches, and the check on allergen and trace exclusions. A spent budget falls back to the offline sample, or to the tag value as normalized, rather than failing — except that an exclusion it could not check is refused as retryable. | `10` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
@@ -277,7 +280,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/services/openfoodfacts` | Open Food Facts API client — HTTP, rate limiting, retry, field normalization. |
-| `src/services/taxonomy` | Tag vocabulary service for `off_browse_taxonomy` — live resolution, offline sample, merge and fallback policy. |
+| `src/services/taxonomy` | Tag vocabulary service — live resolution, offline sample, merge and fallback policy for `off_browse_taxonomy`, and tag-value canonicalization for text searches. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide

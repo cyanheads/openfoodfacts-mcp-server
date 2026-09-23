@@ -54,7 +54,7 @@
         },
         {
           "name": "OFF_RATE_LIMIT_TAXONOMY",
-          "description": "Taxonomy resolution rate limit (requests/min). Applies to the live tag-vocabulary lookups off_browse_taxonomy makes; a spent budget falls back to the offline sample rather than failing.",
+          "description": "Taxonomy resolution rate limit (requests/min). Applies to the live tag-vocabulary lookups off_browse_taxonomy makes, to tag-value resolution on text searches, and to checking allergen and trace exclusions on every search; a spent budget falls back to the offline sample, or to the tag value as normalized, rather than failing, except that an exclusion it could not check is refused as retryable.",
           "format": "string",
           "isRequired": false,
           "default": "10"
@@ -111,7 +111,7 @@
         },
         {
           "name": "OFF_RATE_LIMIT_TAXONOMY",
-          "description": "Taxonomy resolution rate limit (requests/min). Applies to the live tag-vocabulary lookups off_browse_taxonomy makes; a spent budget falls back to the offline sample rather than failing.",
+          "description": "Taxonomy resolution rate limit (requests/min). Applies to the live tag-vocabulary lookups off_browse_taxonomy makes, to tag-value resolution on text searches, and to checking allergen and trace exclusions on every search; a spent budget falls back to the offline sample, or to the tag value as normalized, rather than failing, except that an exclusion it could not check is refused as retryable.",
           "format": "string",
           "isRequired": false,
           "default": "10"
