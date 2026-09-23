@@ -2,6 +2,7 @@
  * @fileoverview Taxonomy service for Open Food Facts tag vocabularies. Resolves a search term
  * against the live search-a-licious autocomplete endpoint and merges the result with an embedded
  * vocabulary, which also serves unfiltered browsing, the two fixed facets, and offline operation.
+ * Also canonicalizes the tag values a text search quotes into exact-match clauses.
  * @module services/taxonomy/taxonomy-service
  */
 
@@ -306,13 +307,20 @@ const TAXONOMY: Record<Facet, EmbeddedEntry[]> = {
  * empty option list when named one — and both vocabularies are closed and complete above, so the
  * embedded entries are the whole truth for them rather than a sample.
  */
-const LIVE_TAXONOMY_NAME: Partial<Record<Facet, string>> = {
+const LIVE_TAXONOMY_NAME = {
   categories: 'category',
   labels: 'label',
   allergens: 'allergen',
   additives: 'additive',
   countries: 'country',
-};
+} as const satisfies Partial<Record<Facet, string>>;
+
+/** A facet the live autocomplete serves. */
+type LiveFacet = keyof typeof LIVE_TAXONOMY_NAME;
+
+function isLiveFacet(facet: Facet): facet is LiveFacet {
+  return facet in LIVE_TAXONOMY_NAME;
+}
 
 /**
  * The facet's documented match rule: case-insensitive substring against tag ID, display name, or —
@@ -346,6 +354,94 @@ function rankExactTagFirst(live: TaxonomyEntry[], term: string): TaxonomyEntry[]
   ];
 }
 
+/* -------------------------------------------------------------------------- */
+/* Tag-value canonicalization                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A facet whose values are tag strings a search filters on, each quoted into an exact clause: the
+ * facets the live autocomplete serves, plus brands, whose tags are slugs with no vocabulary.
+ */
+export type TagFacet = LiveFacet | 'brands';
+
+/**
+ * The value to quote into an exact tag clause, and how it was arrived at.
+ *
+ * - `vocabulary` — an Open Food Facts tag has exactly this ID: the offline sample or the live
+ *   autocomplete confirmed it.
+ * - `normalized` — only local normalization was applied, and `reason` says why nothing confirmed
+ *   it: the facet has no vocabulary to check (`no_vocabulary`, brands), the vocabulary answered
+ *   with no exact entry (`no_match`), or it could not be consulted — a failed lookup or a spent
+ *   taxonomy budget (`lookup_failed`). A caller that must not send an unconfirmed value (an
+ *   exclusion, which a wrong value turns into a silent no-op) refuses anything but `vocabulary`.
+ */
+export type CanonicalTag =
+  | { value: string; resolution: 'vocabulary' }
+  | {
+      value: string;
+      resolution: 'normalized';
+      reason: 'no_vocabulary' | 'no_match' | 'lookup_failed';
+    };
+
+/**
+ * Characters Product Opener turns into `-` when it builds a tag ID from text
+ * (`get_string_id_for_lang` in `lib/ProductOpener/Store.pm`): whitespace, control characters, the
+ * zero-width space, ASCII punctuation, and a list of typographic symbols. Letters in every script
+ * pass through; accents are kept, as its default normalization keeps them.
+ */
+const TAG_ID_SEPARATORS =
+  /[\s\p{Cc}​!"#$%&'()*+,/:;<=>?@[\\\]^_`{|}~¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼⅓½⅔¾¿×ˆ˜–—‘’‚“”„†‡•…‰‹›€™]/gu;
+
+/**
+ * Slugs text the way Product Opener builds a tag ID from it under its default normalization:
+ * Unicode NFC, lowercase, `.` and every separator to `-`, dash runs collapsed, leading and
+ * trailing dashes dropped. Brand tags are exactly this slug of the brand name (`Nutella` →
+ * `nutella`, `Ben & Jerry's` → `ben-jerry-s`), so it is what the tag path computes from the same
+ * input.
+ */
+export function slugTagValue(text: string): string {
+  return text
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/\./g, '-')
+    .replace(TAG_ID_SEPARATORS, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/** A language prefix on a taxonomy value: `en:`, `FR:`. */
+const LANGUAGE_PREFIX = /^([a-z]{2}):/i;
+
+/**
+ * The tag ID Product Opener would store for a taxonomy value it cannot match: the value's language
+ * prefix (English when it carries none) and the slug of the rest (`US` → `en:us`,
+ * `EN:Organic` → `en:organic`).
+ */
+function normalizeTaxonomyValue(value: string): string {
+  const prefix = LANGUAGE_PREFIX.exec(value);
+  return `${(prefix?.[1] ?? 'en').toLowerCase()}:${slugTagValue(prefix ? value.slice(prefix[0].length) : value)}`;
+}
+
+/**
+ * Endings after which English forms a plural with `es` (tomato → tomatoes, peach → peaches,
+ * glass → glasses). Any other `es` plural is a word ending in `e` plus `s`, so accepting `es`
+ * after any stem resolves a truncated word to a different tag: live 2026-09-23, the autocomplete
+ * answers `ric` with `en:rices` and `chees` with `en:cheeses`, while Product Opener counts
+ * `categories_tags=en:ric` as 0.
+ */
+const ES_PLURAL_STEM = /(?:ss|x|z|ch|sh|o)$/;
+
+/** A display name reduced for equality: lowercase, hyphens read as spaces, spacing collapsed. */
+function comparableName(text: string): string {
+  return text.toLowerCase().replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Most resolutions kept in process. Keys are caller-supplied values, so the cache is bounded and
+ * evicts oldest-first; at a few dozen bytes an entry the bound costs nothing.
+ */
+const MAX_CANONICAL_CACHE_ENTRIES = 500;
+
 export type TaxonomySearchResult = {
   facet: string;
   tags: TaxonomyEntry[];
@@ -370,7 +466,122 @@ export type TaxonomySearchResult = {
 };
 
 export class TaxonomyService {
+  /** Settled resolutions per facet and normalized value; failed lookups are never stored. */
+  private readonly canonicalCache = new Map<string, CanonicalTag>();
+  /** Live lookups in flight per facet and normalized value, removed once each settles. */
+  private readonly inFlightLookups = new Map<string, Promise<CanonicalTag>>();
+
   constructor(private readonly off: OpenFoodFactsService) {}
+
+  /**
+   * Canonicalize one tag value before it is quoted into an exact tag clause. Brands are slugged.
+   * A taxonomy value is confirmed against the offline sample first, then the live autocomplete,
+   * accepting only an entry whose ID equals the normalized value, whose name equals the value
+   * with its language prefix stripped (compared case-insensitively, hyphens read as spaces), or —
+   * live only — whose ID is the normalized value plus `s` or `es`. So a synonym (`US` →
+   * `en:united-states`) or singular (`en:peanut` → `en:peanuts`, `en:nut` → `en:nuts`) resolves,
+   * and a prefix or partial match never does (`nutell` is not `nutella`, `US` is not `USSR`).
+   *
+   * Never throws. Anything nothing confirms comes back normalized the way Product Opener would
+   * store it, with the reason. Settled answers are cached in process per facet and value, bounded
+   * at `MAX_CANONICAL_CACHE_ENTRIES`; a failed lookup is not, so the next search retries it.
+   * Concurrent calls for one value share a single lookup. A live lookup spends the taxonomy
+   * budget, not the search budget.
+   */
+  async canonicalizeTag(facet: TagFacet, value: string, ctx: Context): Promise<CanonicalTag> {
+    const trimmed = value.trim();
+    if (facet === 'brands') {
+      return { value: slugTagValue(trimmed), resolution: 'normalized', reason: 'no_vocabulary' };
+    }
+
+    const normalized = normalizeTaxonomyValue(trimmed);
+    const term = trimmed.replace(LANGUAGE_PREFIX, '').replace(/-/g, ' ').trim();
+    const name = comparableName(term);
+    const isMatch = (entry: TaxonomyEntry) =>
+      entry.id === normalized || comparableName(entry.name) === name;
+
+    const offline = TAXONOMY[facet].find(isMatch);
+    if (offline) return { value: offline.id, resolution: 'vocabulary' };
+
+    const cacheKey = `${facet}\u0000${normalized}`;
+    const cached = this.canonicalCache.get(cacheKey);
+    if (cached) return cached;
+
+    // Concurrent calls for one value — an inclusion and an exclusion of the same allergen in one
+    // search — share the lookup in flight. The entry leaves the map once the lookup settles, so a
+    // failed one is retried by the next call just as an uncached one is.
+    const inFlight = this.inFlightLookups.get(cacheKey);
+    if (inFlight) return inFlight;
+    const lookup = this.resolveLive(facet, { trimmed, normalized, term, isMatch }, cacheKey, ctx);
+    this.inFlightLookups.set(cacheKey, lookup);
+    try {
+      return await lookup;
+    } finally {
+      this.inFlightLookups.delete(cacheKey);
+    }
+  }
+
+  /**
+   * The live half of `canonicalizeTag`: one autocomplete lookup, the accept rule, and the cache
+   * write for a settled answer. The accept rule, in order: an option whose ID is the normalized
+   * value; one whose name equals the value; one whose ID is its plural. The autocomplete answers
+   * `nut` with `{id: en:nuts, text: Nuts}`, whose name is the plural, while Product Opener
+   * canonicalizes `en:nut` to `en:nuts` itself (and counts `en:chocolate` exactly as
+   * `en:chocolates`). The plural is the value plus `s`, or plus `es` only after an `ES_PLURAL_STEM`
+   * ending — narrower than `rankExactTagFirst`, which only ranks and never resolves.
+   */
+  private async resolveLive(
+    facet: LiveFacet,
+    value: {
+      trimmed: string;
+      normalized: string;
+      term: string;
+      isMatch: (entry: TaxonomyEntry) => boolean;
+    },
+    cacheKey: string,
+    ctx: Context,
+  ): Promise<CanonicalTag> {
+    const { trimmed, normalized, term, isMatch } = value;
+    let live: TaxonomyEntry[];
+    try {
+      live = await this.off.suggestTaxonomy(
+        LIVE_TAXONOMY_NAME[facet],
+        term,
+        MAX_AUTOCOMPLETE_SIZE,
+        ctx,
+      );
+    } catch (error) {
+      ctx.log.warning(
+        'Tag value could not be checked against the live vocabulary — sending it normalized',
+        {
+          facet,
+          value: trimmed,
+          sent: normalized,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      return { value: normalized, resolution: 'normalized', reason: 'lookup_failed' };
+    }
+
+    const plurals = new Set([
+      `${normalized}s`,
+      ...(ES_PLURAL_STEM.test(normalized) ? [`${normalized}es`] : []),
+    ]);
+    const confirmed =
+      live.find((entry) => entry.id === normalized) ??
+      live.find((entry) => isMatch(entry)) ??
+      live.find((entry) => plurals.has(entry.id));
+    const resolved: CanonicalTag = confirmed
+      ? { value: confirmed.id, resolution: 'vocabulary' }
+      : { value: normalized, resolution: 'normalized', reason: 'no_match' };
+
+    if (this.canonicalCache.size >= MAX_CANONICAL_CACHE_ENTRIES) {
+      const oldest = this.canonicalCache.keys().next().value;
+      if (oldest !== undefined) this.canonicalCache.delete(oldest);
+    }
+    this.canonicalCache.set(cacheKey, resolved);
+    return resolved;
+  }
 
   /**
    * Resolve tags for a facet. With a search term, the live Open Food Facts vocabulary is queried
@@ -385,7 +596,7 @@ export class TaxonomyService {
   ): Promise<TaxonomySearchResult> {
     const embedded = TAXONOMY[facet];
     const term = search?.trim();
-    const taxonomyName = LIVE_TAXONOMY_NAME[facet];
+    const taxonomyName = isLiveFacet(facet) ? LIVE_TAXONOMY_NAME[facet] : undefined;
 
     if (!taxonomyName) {
       const matched = term ? embedded.filter((entry) => matchesTerm(entry, term)) : embedded;
