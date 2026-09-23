@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.6](changelog/0.3.x/0.3.6.md) — 2026-09-22
+
+off_search_products now requires every query word to match across 31 languages, gains allergen/trace exclusions and a vegan/vegetarian/palm-oil filter, and off_get_product accepts the full range of barcodes Open Food Facts serves.
+
 ## [0.3.5](changelog/0.3.x/0.3.5.md) — 2026-09-22
 
 The HTTP status now decides retryability, off_get_product carries nested sub-ingredients up to three levels, off_browse_taxonomy ranks the exact-term tag first, and four output descriptions are corrected.

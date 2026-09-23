@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-09-22 22:33:54
+Generated on: 2026-09-23 04:20:34
 
 ```text
 openfoodfacts-mcp-server/
@@ -151,6 +151,7 @@ openfoodfacts-mcp-server/
 │   │           └── search-products.tool.ts
 │   ├── services/
 │   │   ├── openfoodfacts/
+│   │   │   ├── analyzer-stop-words.ts
 │   │   │   ├── openfoodfacts-service.ts
 │   │   │   └── types.ts
 │   │   └── taxonomy/
@@ -166,7 +167,9 @@ openfoodfacts-mcp-server/
 │   │   │   ├── product-0028400157827.json
 │   │   │   ├── product-3046920022651.json
 │   │   │   └── product-7622210449283.json
-│   │   └── canonical-tag-ids.ts
+│   │   ├── barcode-cases.ts
+│   │   ├── canonical-tag-ids.ts
+│   │   └── text-search-fields.ts
 │   ├── mcp-server/
 │   │   └── tools/
 │   │       └── definitions/
@@ -177,8 +180,10 @@ openfoodfacts-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/
-│   │   └── openfoodfacts/
-│   │       └── openfoodfacts-service.test.ts
+│   │   ├── openfoodfacts/
+│   │   │   └── openfoodfacts-service.test.ts
+│   │   └── taxonomy/
+│   │       └── taxonomy-service.test.ts
 │   ├── tools/
 │   └── utils/
 │       └── markdown.test.ts
