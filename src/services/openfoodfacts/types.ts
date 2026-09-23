@@ -74,6 +74,19 @@ export type RawProductResponse = {
   product?: RawProduct;
 };
 
+/**
+ * A search result row as either backend sends it: the summary fields plus the barcode it is keyed
+ * by. `code` is requested on both paths but, like every upstream field, not assumed present.
+ */
+export type RawSearchProduct = RawProduct & { code?: string };
+
+/**
+ * A search result row the service hands on: its barcode matches `BARCODE_PATTERN`. Rows without
+ * one are dropped before the page is counted — a row with nothing a product lookup can serve is not
+ * a usable result.
+ */
+export type SearchRow = RawProduct & { code: string };
+
 /** Response envelope from GET /api/v2/search */
 export type RawSearchResponse = {
   count?: number;
@@ -81,16 +94,21 @@ export type RawSearchResponse = {
   page_count?: number;
   page_size?: number;
   skip?: number;
-  products?: RawProduct[];
+  products?: RawSearchProduct[];
 };
 
 /**
- * Response envelope from GET https://search.openfoodfacts.org/search
+ * Response envelope from POST https://search.openfoodfacts.org/search
  * Used for text-based queries — the /api/v2/search endpoint silently ignores the `search_terms`
  * parameter and returns all products unfiltered.
  * Note: `page_count` here is TOTAL PAGES, not products on the page (differs from /api/v2/search).
  */
 export type RawTextSearchResponse = {
+  /**
+   * Present, with no `hits` or `count`, when the backend's Elasticsearch query failed. The endpoint
+   * still answers HTTP 200 in that case, so this list is the only failure signal.
+   */
+  errors?: { title?: string; description?: string }[];
   count?: number;
   /**
    * False when `count` is the backend's hit-tracking ceiling rather than the real match total —
@@ -159,6 +177,43 @@ export const NUTRIENT_FIELDS = [
 /** Comparisons a nutrient constraint may express, each mapping to one Lucene range form. */
 export const NUTRIENT_OPERATORS = ['lt', 'lte', 'gt', 'gte'] as const;
 
+/**
+ * The barcodes Open Food Facts serves: Product Opener's `is_valid_code`
+ * (`lib/ProductOpener/Products.pm`) strips leading zeros and then requires 4–40 digits, so a code
+ * as short as `1212` or as long as 22 digits resolves. Deliberately stricter than upstream in one
+ * way: Product Opener drops every non-digit before looking a code up, so `3017620422003a` answers
+ * with Nutella — digits only here, so a typo is refused instead of returning another product.
+ */
+export const BARCODE_PATTERN = /^0*[1-9]\d{3,39}$/;
+
+/** The validation message for a barcode `BARCODE_PATTERN` rejects. */
+export const BARCODE_PATTERN_MESSAGE =
+  'Barcode must be digits only, 4–40 digits long after any leading zeros.';
+
+/**
+ * The 12 verdicts of the Open Food Facts `ingredients_analysis` taxonomy
+ * (`taxonomies/ingredients_analysis.txt` in openfoodfacts-server): the vegan, vegetarian, and
+ * palm-oil answers Open Food Facts computes from a product's parsed ingredients, each with its
+ * `maybe`/`may contain` and `unknown` states. A closed vocabulary, so it is offered as an enum and
+ * needs no canonicalization on either search path.
+ */
+export const INGREDIENTS_ANALYSIS_TAGS = [
+  'en:palm-oil',
+  'en:palm-oil-free',
+  'en:may-contain-palm-oil',
+  'en:palm-oil-content-unknown',
+  'en:vegan',
+  'en:maybe-vegan',
+  'en:non-vegan',
+  'en:vegan-status-unknown',
+  'en:vegetarian',
+  'en:maybe-vegetarian',
+  'en:non-vegetarian',
+  'en:vegetarian-status-unknown',
+] as const;
+
+export type IngredientsAnalysisTag = (typeof INGREDIENTS_ANALYSIS_TAGS)[number];
+
 export type NutrientField = (typeof NUTRIENT_FIELDS)[number];
 export type NutrientOperator = (typeof NUTRIENT_OPERATORS)[number];
 
@@ -173,14 +228,26 @@ export type NutrientFilter = {
  * Search parameters shared by both search backends. A `query` or a nutrient constraint (with or
  * without tag filters) routes to search.openfoodfacts.org, where any tag filters are folded into
  * the Lucene `q`; tag filters alone route to /api/v2/search. `sort_by` applies on both paths, in
- * each one's spelling.
+ * each one's spelling. The text path quotes tag values verbatim into exact-match clauses, so a
+ * caller routing there passes canonical values (the search tool canonicalizes them first).
  */
 export type SearchParams = {
   query?: string;
   categories_tag?: string;
   brands_tag?: string;
-  labels_tag?: string;
+  /** One label, or several that must all apply. */
+  labels_tag?: string | string[];
   allergens_tag?: string;
+  /** An allergen the label warns the product may contain as a trace. */
+  traces_tag?: string;
+  ingredients_analysis_tag?: IngredientsAnalysisTag;
+  /**
+   * Allergen and trace tags a product must not carry. Sent only as confirmed canonical IDs: an
+   * exclusion value neither backend recognizes excludes nothing, so the tool refuses one rather
+   * than passing it here.
+   */
+  exclude_allergens?: string[];
+  exclude_traces?: string[];
   /**
    * Applied only on the tag-filter path (/api/v2/search). search-a-licious does not index
    * `additives_tags`, so the tool rejects this filter alongside a text query rather than sending a
@@ -218,7 +285,13 @@ export type SearchResult = {
    */
   count_is_exact: boolean;
   page: number;
+  /**
+   * Rows on this page after rows without a servable barcode are dropped — always
+   * `products.length`.
+   */
   page_count: number;
   page_size: number;
-  products: RawProduct[];
+  products: SearchRow[];
+  /** Rows the upstream returned on this page that were dropped for lacking a servable barcode. */
+  dropped: number;
 };

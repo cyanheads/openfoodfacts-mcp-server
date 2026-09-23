@@ -9,7 +9,7 @@
 
 import { readFileSync } from 'node:fs';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -25,10 +25,65 @@ import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-p
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
 import {
+  ANALYZER_STOP_WORDS,
+  STOP_WORD_LANGS,
+} from '@/services/openfoodfacts/analyzer-stop-words.js';
+import {
   initOpenFoodFactsService,
   OpenFoodFactsService,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { getTaxonomyService, initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import {
+  UPSTREAM_MULTI_MATCH_FIELDS,
+  UPSTREAM_TEXT_LANGS,
+} from '../../fixtures/text-search-fields.js';
+
+/** The text search endpoint, which takes its parameters as a JSON body. */
+const TEXT_SEARCH_URL = 'https://search.openfoodfacts.org/search';
+
+/** The summary fields both search paths request, in request order. */
+const SEARCH_FIELD_LIST = [
+  'code',
+  'product_name',
+  'brands',
+  'nutriscore_grade',
+  'nova_group',
+  'ecoscore_grade',
+  'categories_tags',
+];
+
+/**
+ * The per-word group the text path must build: the word, as it will appear in `q`, against every
+ * field the backend's own relevance match searches. Built from the captured upstream field list,
+ * not from the service's constant, so a derivation error in the service fails here.
+ */
+function wordGroup(word: string): string {
+  return `(${UPSTREAM_MULTI_MATCH_FIELDS.map((field) => `${field}:${word}`).join(' OR ')})`;
+}
+
+/** The request the stubbed fetch received on a given call: URL, method, JSON body, and headers. */
+function sentRequest(call = 0): {
+  url: string;
+  method: string | undefined;
+  body: Record<string, unknown> | undefined;
+  headers: Record<string, string>;
+} {
+  const [url, init] = (vi.mocked(global.fetch).mock.calls[call] ?? []) as [
+    unknown,
+    RequestInit | undefined,
+  ];
+  return {
+    url: String(url),
+    method: init?.method,
+    body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
+    headers: (init?.headers ?? {}) as Record<string, string>,
+  };
+}
+
+/** The Lucene `q` the text path sent on a given call, read from the JSON body. */
+function sentQ(call = 0): string {
+  return String(sentRequest(call).body?.q ?? '');
+}
 
 /** Build a minimal service instance with default test config. */
 function makeService(): OpenFoodFactsService {
@@ -230,7 +285,7 @@ describe('OpenFoodFactsService', () => {
       // Combined requests never fall back to the text-blind /api/v2/search endpoint.
       expect(fetchCall).not.toContain('api/v2/search');
 
-      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      const q = sentQ();
       expect(q).toContain('labels_tags:"en:organic"');
       expect(q).toContain('countries_tags:"en:france"');
       expect(q).toContain('chocolate');
@@ -254,7 +309,7 @@ describe('OpenFoodFactsService', () => {
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
       expect(fetchCall).toContain('search.openfoodfacts.org');
 
-      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      const q = sentQ();
       expect(q).toContain('nutriscore_grade:a');
       expect(q).toContain('nova_group:1');
       expect(q).toContain('cereal');
@@ -278,10 +333,14 @@ describe('OpenFoodFactsService', () => {
 
       await svc.searchProducts({ query: 'brands: nutella', page: 1, page_size: 20 }, ctx);
 
-      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
-      const q = new URL(fetchCall).searchParams.get('q') ?? '';
-      expect(q).toContain('brands\\: nutella');
-      expect(q).not.toMatch(/(?<!\\):/);
+      // The per-word groups name their own fields; strip them, and what remains — the caller's
+      // text — carries no unescaped colon.
+      const q = sentQ();
+      const callerText = q.replace(/\([^()]*\)/g, '').trim();
+      expect(callerText).toBe('brands\\: nutella');
+      expect(callerText).not.toMatch(/(?<!\\):/);
+      // Inside a group the caller's colon is escaped too, so it stays part of the word.
+      expect(q).toContain('brands:brands\\:');
     });
 
     it('normalizes brands array from text search to a comma-joined string', async () => {
@@ -350,7 +409,7 @@ describe('OpenFoodFactsService', () => {
 
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
       expect(fetchCall).toContain('search.openfoodfacts.org');
-      expect(new URL(fetchCall).searchParams.get('sort_by')).toBe('-popularity_key');
+      expect(sentRequest().body?.sort_by).toBe('-popularity_key');
     });
 
     it('sends every sort_by value on the text path, none skipped or special-cased', async () => {
@@ -369,8 +428,7 @@ describe('OpenFoodFactsService', () => {
           ctx,
         );
 
-        const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
-        expect(new URL(fetchCall).searchParams.get('sort_by')).toBe(`-${value}`);
+        expect(sentRequest().body?.sort_by).toBe(`-${value}`);
       }
     });
 
@@ -382,9 +440,8 @@ describe('OpenFoodFactsService', () => {
           mockResponse({ count: 1, page: 1, page_size: 20, page_count: 1, hits: [] }),
         );
       await svc.searchProducts({ query: 'chocolate', page: 1, page_size: 20 }, ctx);
-      expect(
-        new URL(vi.mocked(global.fetch).mock.calls[0]?.[0] as string).searchParams.get('sort_by'),
-      ).toBeNull();
+      expect(sentRequest().body).toBeDefined();
+      expect(sentRequest().body).not.toHaveProperty('sort_by');
 
       const tagCtx = createMockContext();
       global.fetch = vi
@@ -442,8 +499,8 @@ describe('OpenFoodFactsService', () => {
       // The service must normalize the text search response to use products-on-page.
       const ctx = createMockContext();
       const hits = [
-        { code: '0000000000001', product_name: 'A' },
-        { code: '0000000000002', product_name: 'B' },
+        { code: '0000000001001', product_name: 'A' },
+        { code: '0000000001002', product_name: 'B' },
       ];
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
@@ -505,8 +562,7 @@ describe('OpenFoodFactsService', () => {
         ctx,
       );
 
-      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
-      const q = new URL(fetchCall).searchParams.get('q') ?? '';
+      const q = sentQ();
       expect(q).toContain('allergens_tags:"en:milk"');
       expect(q).toContain('chocolate');
     });
@@ -535,7 +591,8 @@ describe('OpenFoodFactsService', () => {
 
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
       expect(fetchCall).toContain('search.openfoodfacts.org');
-      expect(new URL(fetchCall).searchParams.get('q') ?? '').not.toContain('additives_tags');
+      expect(sentQ()).toContain('chocolate');
+      expect(sentQ()).not.toContain('additives_tags');
     });
   });
 
@@ -556,8 +613,7 @@ describe('OpenFoodFactsService', () => {
         }),
       );
       await svc.searchProducts({ page: 1, page_size: 20, ...params }, ctx);
-      const url = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
-      return new URL(url).searchParams.get('q') ?? '';
+      return sentQ();
     }
 
     it('builds the bracket form the backend parses for each operator', async () => {
@@ -704,8 +760,7 @@ describe('OpenFoodFactsService', () => {
         ctx,
       );
 
-      const url = new URL(vi.mocked(global.fetch).mock.calls[0]?.[0] as string);
-      expect(url.searchParams.get('sort_by')).toBe('-unique_scans_n');
+      expect(sentRequest().body?.sort_by).toBe('-unique_scans_n');
     });
   });
 
@@ -1602,6 +1657,965 @@ describe('OpenFoodFactsService', () => {
       expect(requested).toContain('countries_tags');
       // The declared-allergen field keeps its place alongside them.
       expect(requested).toContain('allergens_tags');
+    });
+  });
+
+  // ── #47: the text path sends every indexed language, by POST ─────────────
+
+  /** A text-search success envelope carrying the given hits. */
+  function textHits(hits: Record<string, unknown>[], count = hits.length): Response {
+    return mockResponse({
+      count,
+      is_count_exact: true,
+      page: 1,
+      page_size: 20,
+      page_count: 1,
+      hits,
+    });
+  }
+
+  describe('text search request (#47)', () => {
+    it('sends the search as a POST with every parameter in a JSON body', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(textHits([]));
+
+      await svc.searchProducts(
+        { query: 'dark chocolate', sort_by: 'popularity_key', page: 2, page_size: 5 },
+        ctx,
+      );
+
+      const request = sentRequest();
+      expect(request.url).toBe(TEXT_SEARCH_URL);
+      expect(request.method).toBe('POST');
+      expect(request.headers['Content-Type']).toBe('application/json');
+      expect(request.headers['User-Agent']).toMatch(/^openfoodfacts-mcp-server\//);
+      expect(request.body).toEqual({
+        q: `${wordGroup('dark')} ${wordGroup('chocolate')} dark chocolate`,
+        langs: [...UPSTREAM_TEXT_LANGS],
+        fields: SEARCH_FIELD_LIST,
+        page: 2,
+        page_size: 5,
+        sort_by: '-popularity_key',
+      });
+    });
+
+    it('sends the 31 analyzed languages on a nutrient-only search too', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(textHits([]));
+
+      await svc.searchProducts(
+        {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 5 }],
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      expect(sentRequest().method).toBe('POST');
+      expect(sentRequest().body).toEqual({
+        q: 'nutriments.sugars_100g:[* TO 5]',
+        langs: [...UPSTREAM_TEXT_LANGS],
+        fields: SEARCH_FIELD_LIST,
+        page: 1,
+        page_size: 20,
+      });
+    });
+
+    it('keeps the tag-only path a GET on /api/v2/search carrying no body', async () => {
+      // Characterization: the tag path is untouched by the text-path transport change.
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+
+      await svc.searchProducts({ categories_tag: 'en:spreads', page: 1, page_size: 20 }, ctx);
+
+      const request = sentRequest();
+      expect(request.method ?? 'GET').toBe('GET');
+      expect(request.body).toBeUndefined();
+      expect(request.url).toBe(
+        'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&categories_tags=en%3Aspreads&page=1&page_size=20',
+      );
+    });
+
+    it('surfaces the message of a JSON-body validation error, not the request it echoes', async () => {
+      // A POST that fails validation answers 422 with `detail` as a list of objects, each echoing
+      // the whole request body under `input`, where a GET answered 400 with a `detail` string.
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse(
+          {
+            detail: [
+              {
+                type: 'value_error',
+                loc: ['body'],
+                msg: 'Value error, Maximum number of returned results is 10 000 (here: page * page_size = 500000)',
+                input: { q: 'chocolate', langs: [...UPSTREAM_TEXT_LANGS], page: 10000 },
+                ctx: { error: {} },
+              },
+            ],
+          },
+          422,
+        ),
+      );
+
+      const error = await captureError(
+        svc.searchProducts({ query: 'chocolate', page: 10_000, page_size: 50 }, ctx),
+      );
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.message).toContain('Maximum number of returned results is 10 000');
+      expect(error.message).not.toContain('"loc"');
+      expect(error.message).not.toContain('langs');
+    });
+
+    it('still finds the message when the echoed request pushes the body past the capture limit', async () => {
+      // A real Response streams, so the framework keeps only a bounded head and tail of it and the
+      // JSON no longer parses; the message leads each entry, so it survives in the head.
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      const detail = [
+        {
+          type: 'value_error',
+          loc: ['body'],
+          msg: 'Value error, Maximum number of returned results is 10 000 (here: page * page_size = 500000)',
+          input: { q: 'chocolate '.repeat(3_000), langs: [...UPSTREAM_TEXT_LANGS] },
+        },
+      ];
+      global.fetch = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail }), {
+            status: 422,
+            headers: { 'content-type': 'application/json' },
+          }),
+      );
+
+      const error = await captureError(
+        svc.searchProducts({ query: 'chocolate', page: 10_000, page_size: 50 }, ctx),
+      );
+
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.message).toContain('Maximum number of returned results is 10 000');
+      expect(error.message).not.toContain('"loc"');
+    });
+
+    it('reports an error envelope served with HTTP 200 as a failure, never as zero matches', async () => {
+      // search-a-licious answers an Elasticsearch failure with HTTP 200 and an `errors` list in
+      // place of `hits` and `count`. Read as a success, that is an exact "no products".
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn(async () =>
+        mockResponse({
+          debug: { query: {} },
+          errors: [
+            {
+              title: 'es_api_error',
+              description:
+                "ApiError(500, 'search_phase_execution_exception', 'too_many_nested_clauses: Query contains too many nested clauses; maxClauseCount is set to 4228')",
+            },
+          ],
+        }),
+      );
+
+      vi.useFakeTimers();
+      try {
+        const pending = captureError(
+          svc.searchProducts({ query: 'chocolate', page: 1, page_size: 20 }, ctx),
+        );
+        await vi.runAllTimersAsync();
+        const error = await pending;
+
+        expect(error.data?.reason).toBe('upstream_error');
+        expect(error.data?.retryable).toBe(true);
+        expect(error.message).toContain('too_many_nested_clauses');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // ── #38: every word of the query constrains the result ───────────────────
+
+  describe('per-word groups (#38)', () => {
+    /** Run a text search with the given parameters and return the `q` it sent. */
+    async function qFor(params: Record<string, unknown>): Promise<string> {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(textHits([]));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, ctx);
+      return sentQ();
+    }
+
+    it('groups each word over exactly the fields the backend searches for the 31 languages', async () => {
+      const q = await qFor({ query: 'milk chocolate' });
+
+      expect(q).toBe(`${wordGroup('milk')} ${wordGroup('chocolate')} milk chocolate`);
+      for (const word of ['milk', 'chocolate']) {
+        const fields = [...q.matchAll(new RegExp(`([a-z_]+(?:\\.[a-z]{2})?):${word}\\b`, 'g'))].map(
+          (m) => m[1],
+        );
+        expect(new Set(fields)).toEqual(new Set(UPSTREAM_MULTI_MATCH_FIELDS));
+        expect(fields).toHaveLength(75);
+      }
+    });
+
+    it('sends a one-word query with no group, which the relevance match already requires', async () => {
+      // Live: `milk` in Mongolia matches the same 6 products with or without its group, and the
+      // group costs about 200 ms a search.
+      await expect(qFor({ query: 'Milk' })).resolves.toBe('milk');
+      await expect(qFor({ query: 'dark-chocolate', labels_tag: 'en:organic' })).resolves.toBe(
+        'labels_tags:"en:organic" dark\\-chocolate',
+      );
+    });
+
+    it('still groups the one required word of a query that also carries a stop word', async () => {
+      await expect(qFor({ query: 'the chocolate' })).resolves.toBe(
+        `${wordGroup('chocolate')} the chocolate`,
+      );
+    });
+
+    it('orders tag clauses, nutrient clauses, one group per word, then the bare words', async () => {
+      const q = await qFor({
+        query: 'Milk chocolate',
+        countries_tag: 'en:mongolia',
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 50 }],
+      });
+
+      expect(q).toBe(
+        `countries_tags:"en:mongolia" nutriments.sugars_100g:{* TO 50} ${wordGroup('milk')} ${wordGroup('chocolate')} milk chocolate`,
+      );
+    });
+
+    it('reads uppercase AND, OR and NOT as words, never as operators', async () => {
+      const q = await qFor({ query: 'milk AND chocolate OR NOT cocoa' });
+
+      expect(q).toBe(
+        `${wordGroup('milk')} ${wordGroup('chocolate')} ${wordGroup('cocoa')} milk and chocolate or not cocoa`,
+      );
+      expect(q).not.toMatch(/\b(AND|NOT)\b/);
+      expect(q.replaceAll(' OR ', ' ')).not.toMatch(/\bOR\b/);
+    });
+
+    it('forms no group for a token with no letter or digit', async () => {
+      // A group over a punctuation-only token analyzes to nothing in every field and matches no
+      // product (live: `milk -` with a group for `-` → 0; without it → 6, Mongolia).
+      const q = await qFor({ query: 'milk - & chocolate' });
+
+      expect(q).toBe(`${wordGroup('milk')} ${wordGroup('chocolate')} milk \\- \\& chocolate`);
+    });
+
+    it('forms no group for a word the English analyzer drops as a stop word', async () => {
+      // `with` never reaches the English name index, so its group could match only through other
+      // fields (live: chocolate with hazelnuts → 84 with a `with` group, 5,840 without).
+      const q = await qFor({ query: 'chocolate with hazelnuts, and the' });
+
+      expect(q).toBe(
+        `${wordGroup('chocolate')} ${wordGroup('hazelnuts,')} chocolate with hazelnuts, and the`,
+      );
+    });
+
+    it.each([
+      // French: `de` is dropped from product_name.fr and categories.fr (live: a group for it over
+      // those fields alone matched 0), so requiring it cut confiture de fraise to 237 from 3,251.
+      ['confiture de fraise', ['confiture', 'fraise']],
+      ['galletas con chocolate', ['galletas', 'chocolate']],
+      ['schokolade mit nüssen', ['schokolade', 'nüssen']],
+      // Portuguese `de` is also a French and Spanish stop word, so it stays optional.
+      ['doce de leite', ['doce', 'leite']],
+      ['latte e cacao', ['latte', 'cacao']],
+    ])(
+      'forms no group for a stop word of a language holding 1%+ of named products: %s',
+      async (query, grouped) => {
+        const q = await qFor({ query });
+
+        expect(q).toBe(`${grouped.map(wordGroup).join(' ')} ${query}`);
+      },
+    );
+
+    it.each([
+      // Below the threshold: Portuguese `com` (0.75% of named products), Dutch `met` (0.83%),
+      // Russian `и` (0.38%), Hindi `इसका` (0.004%). Each still forms a group.
+      ['pão com queijo', ['pão', 'com', 'queijo']],
+      ['soep met balletjes', ['soep', 'met', 'balletjes']],
+      ['chleb и масло', ['chleb', 'и', 'масло']],
+      ['इसका चाय', ['इसका', 'चाय']],
+    ])('still groups a stop word of a language below the threshold: %s', async (query, grouped) => {
+      const q = await qFor({ query });
+
+      expect(q).toBe(`${grouped.map(wordGroup).join(' ')} ${query}`);
+    });
+
+    it('exempts the stop words of English, French, Spanish, German, and Italian only, 949 in all', () => {
+      expect([...STOP_WORD_LANGS]).toEqual(['en', 'fr', 'es', 'de', 'it']);
+      const selected = new Set(
+        STOP_WORD_LANGS.flatMap((lang) => ANALYZER_STOP_WORDS[lang].split(/\s+/).filter(Boolean)),
+      );
+      expect(selected.size).toBe(949);
+      expect(selected.has('door')).toBe(false);
+      expect(selected.has('soy')).toBe(true);
+    });
+
+    it('treats a word that is a stop word only in another language as optional too', async () => {
+      // The chosen trade-off: Spanish `soy` ("I am") is a stop word, so `soy milk` requires only
+      // `milk`, and `soy` still ranks the soy milks first through the bare words.
+      await expect(qFor({ query: 'soy milk' })).resolves.toBe(`${wordGroup('milk')} soy milk`);
+    });
+
+    it('keeps a stop list for every indexed language, 5,928 words in all', () => {
+      const lists = Object.entries(ANALYZER_STOP_WORDS).map(
+        ([lang, words]) => [lang, words.split(/\s+/).filter(Boolean)] as const,
+      );
+
+      expect(lists.map(([lang]) => lang)).toEqual([...UPSTREAM_TEXT_LANGS]);
+      for (const [, words] of lists) expect(words.length).toBeGreaterThan(0);
+      expect(new Set(lists.flatMap(([, words]) => words)).size).toBe(5928);
+      const byLang = Object.fromEntries(lists);
+      expect(byLang.fr).toContain('de');
+      expect(byLang.de).toContain('mit');
+      expect(byLang.nl).toContain('door');
+      expect(byLang.en).toHaveLength(33);
+    });
+
+    it('keeps a field:value-shaped query as words rather than a field clause', async () => {
+      const q = await qFor({ query: 'brands: nutella' });
+
+      expect(q).toBe(`${wordGroup('brands\\:')} ${wordGroup('nutella')} brands\\: nutella`);
+    });
+
+    it('escapes reserved characters inside a group and groups a repeated word once', async () => {
+      const q = await qFor({ query: 'dark-chocolate 70% dark-chocolate' });
+
+      expect(q).toBe(
+        `${wordGroup('dark\\-chocolate')} ${wordGroup('70%')} dark\\-chocolate 70% dark\\-chocolate`,
+      );
+    });
+
+    it('sends only the tag clauses when there is no query', async () => {
+      const q = await qFor({
+        labels_tag: 'en:organic',
+        nutrient_filters: [{ nutrient: 'salt', operator: 'lt', value: 1 }],
+      });
+
+      expect(q).toBe('labels_tags:"en:organic" nutriments.salt_100g:{* TO 1}');
+    });
+  });
+
+  // ── #35: a search row without a barcode is dropped, not carried as "" ─────
+
+  describe('rows without a barcode (#35)', () => {
+    const rows = [
+      { code: '3017620422003', product_name: 'Nutella', brands: ['Ferrero'] },
+      { product_name: 'No code at all' },
+      { code: '', product_name: 'Empty code' },
+      { code: '   ', product_name: 'Whitespace code' },
+      { code: '7622210449283', product_name: 'Prince', nutriscore_grade: 'd' },
+    ];
+
+    it('drops them on the text path and counts only the kept rows', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(textHits(rows, 40));
+
+      const result = await svc.searchProducts({ query: 'x', page: 1, page_size: 5 }, ctx);
+
+      expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '7622210449283']);
+      expect(result.page_count).toBe(2);
+      expect(result.count).toBe(40);
+      // Rows with a code are carried unchanged.
+      expect(result.products[0]).toEqual({
+        code: '3017620422003',
+        product_name: 'Nutella',
+        brands: 'Ferrero',
+      });
+      expect(result.products[1]?.nutriscore_grade).toBe('d');
+    });
+
+    it('drops them on the tag path and counts only the kept rows', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 40,
+          page: 1,
+          page_count: 5,
+          page_size: 5,
+          products: rows.map((row) =>
+            'brands' in row ? { ...row, brands: (row.brands as string[]).join(', ') } : row,
+          ),
+        }),
+      );
+
+      const result = await svc.searchProducts(
+        { categories_tag: 'en:spreads', page: 1, page_size: 5 },
+        ctx,
+      );
+
+      expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '7622210449283']);
+      expect(result.page_count).toBe(2);
+      expect(result.products[1]).toEqual({
+        code: '7622210449283',
+        product_name: 'Prince',
+        nutriscore_grade: 'd',
+      });
+    });
+
+    it('never hands off_search_products a row whose barcode is empty', async () => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+      global.fetch = vi.fn().mockResolvedValue(textHits(rows, 40));
+
+      const result = await offSearchProductsTool.handler(
+        { query: 'x', page: 1, page_size: 5 },
+        createMockContext({ errors: offSearchProductsTool.errors }),
+      );
+
+      expect(result.products.map((p) => p.barcode)).toEqual(['3017620422003', '7622210449283']);
+      expect(result.page_count).toBe(2);
+    });
+  });
+
+  // ── #46: a search row carries only a barcode off_get_product accepts ──────
+
+  describe('rows whose code no product lookup can serve (#46)', () => {
+    /**
+     * Codes the text index holds that Product Opener answers "no code or invalid code" for, live
+     * 2026-09-23 (`00000636`, `0000000000291`), beside two it serves and one it does not accept.
+     */
+    const rows = [
+      { code: '00000636', product_name: 'Flocons quatre graines' },
+      { code: '3017620422003', product_name: 'Nutella' },
+      { code: '0000000000291', product_name: 'Mendiants' },
+      { code: '00097', product_name: 'Five characters, two significant digits' },
+      { code: '6035215', product_name: 'Short code' },
+      { code: '3017620422003 ', product_name: 'Trailing space' },
+    ];
+
+    it('drops them on the text path before page_count is set', async () => {
+      global.fetch = vi.fn().mockResolvedValue(textHits(rows, 6));
+
+      const result = await svc.searchProducts(
+        { query: 'x', page: 1, page_size: 6 },
+        createMockContext(),
+      );
+
+      expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '6035215']);
+      expect(result.page_count).toBe(2);
+      expect(result.count).toBe(6);
+      expect(result.dropped).toBe(4);
+    });
+
+    it('reports no drop on a page whose codes are all servable', async () => {
+      global.fetch = vi.fn().mockResolvedValue(textHits([{ code: '3017620422003' }], 1));
+
+      const result = await svc.searchProducts(
+        { query: 'x', page: 1, page_size: 1 },
+        createMockContext(),
+      );
+
+      expect(result.dropped).toBe(0);
+    });
+
+    it('drops them on the tag path before page_count is set', async () => {
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 6, page: 1, page_count: 6, page_size: 6, products: rows }),
+        );
+
+      const result = await svc.searchProducts(
+        { categories_tag: 'en:honeys', page: 1, page_size: 6 },
+        createMockContext(),
+      );
+
+      expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '6035215']);
+      expect(result.page_count).toBe(2);
+      expect(result.dropped).toBe(4);
+    });
+
+    it('emits only barcodes off_get_product accepts', async () => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+      global.fetch = vi.fn().mockResolvedValue(textHits(rows, 6));
+
+      const result = await offSearchProductsTool.handler(
+        { query: 'x', page: 1, page_size: 6 },
+        createMockContext({ errors: offSearchProductsTool.errors }),
+      );
+
+      expect(result.products).toHaveLength(2);
+      for (const { barcode } of result.products) {
+        expect(offGetProductTool.input.safeParse({ barcode }).success).toBe(true);
+      }
+      expect(result.omitted).toBe(4);
+    });
+
+    it('does not call a page of only unservable codes past the end, on either surface', async () => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+      global.fetch = vi.fn().mockResolvedValue(textHits([{ code: '00000636' }], 3));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'flocons quatre graines',
+        page: 1,
+        page_size: 1,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total: 3, page_count: 0, omitted: 1, products: [] });
+      const notice = String(structured.notice ?? '');
+      expect(notice).not.toMatch(/past the end/i);
+      expect(notice).toContain('Request page 2');
+      const text = (result.content ?? []).map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      expect(text).not.toMatch(/past the end|No products found/i);
+      expect(text).toMatch(/1 match on this page .*left off/i);
+    });
+  });
+
+  // ── #39: tag values reach the text path in canonical form ────────────────
+
+  describe('tag canonicalization on the text path (#39)', () => {
+    /**
+     * Routes the stubbed fetch: autocomplete calls answer from `options` keyed by taxonomy name
+     * (the live responses captured 2026-09-22 for `US` and `peanut`), and the search answers one
+     * hit. Every request is recorded in call order.
+     */
+    function routeFetch(options: Record<string, { id: string; text: string }[]>): void {
+      global.fetch = vi.fn(async (input: unknown) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/autocomplete') {
+          const taxonomy = url.searchParams.get('taxonomy_names') ?? '';
+          return mockResponse({ took: 1, timed_out: false, options: options[taxonomy] ?? [] });
+        }
+        return textHits([{ code: '3017620422003' }], 1);
+      });
+    }
+
+    beforeEach(() => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+    });
+
+    /** Requests the stubbed fetch received, as `pathname?taxonomy_names&q` or `search`. */
+    function requestLog(): string[] {
+      return vi.mocked(global.fetch).mock.calls.map(([input]) => {
+        const url = new URL(String(input));
+        return url.pathname === '/autocomplete'
+          ? `autocomplete:${url.searchParams.get('taxonomy_names')}:${url.searchParams.get('q')}`
+          : url.pathname;
+      });
+    }
+
+    it('quotes the canonical value for a brand, a country synonym, a singular, and a case variant', async () => {
+      routeFetch({
+        country: [
+          { id: 'en:united-states', text: 'US' },
+          { id: 'en:soviet-union', text: 'USSR' },
+        ],
+        allergen: [{ id: 'en:peanuts', text: 'peanut' }],
+      });
+
+      await offSearchProductsTool.handler(
+        {
+          query: 'butter',
+          brands_tag: 'Nutella',
+          countries_tag: 'US',
+          allergens_tag: 'en:peanut',
+          labels_tag: 'EN:Organic',
+          page: 1,
+          page_size: 20,
+        },
+        createMockContext({ errors: offSearchProductsTool.errors }),
+      );
+
+      const searchCall = requestLog().indexOf('/search');
+      const q = sentQ(searchCall);
+      expect(q).toContain('brands_tags:"nutella"');
+      expect(q).toContain('countries_tags:"en:united-states"');
+      expect(q).toContain('allergens_tags:"en:peanuts"');
+      expect(q).toContain('labels_tags:"en:organic"');
+      // The brand is slugged locally and the label resolves from the offline sample; only the two
+      // values the sample cannot confirm cost a live lookup.
+      expect(requestLog().sort()).toEqual(
+        ['/search', 'autocomplete:allergen:peanut', 'autocomplete:country:US'].sort(),
+      );
+    });
+
+    it('sends an unconfirmable value normalized and still runs the search', async () => {
+      global.fetch = vi.fn(async (input: unknown) =>
+        new URL(String(input)).pathname === '/autocomplete'
+          ? mockResponse({ detail: 'refused' }, 400)
+          : textHits([], 0),
+      );
+
+      const result = await offSearchProductsTool.handler(
+        { query: 'oat milk', countries_tag: 'Never Land', page: 1, page_size: 20 },
+        createMockContext({ errors: offSearchProductsTool.errors }),
+      );
+
+      expect(result.total).toBe(0);
+      expect(sentQ(requestLog().indexOf('/search'))).toContain('countries_tags:"en:never-land"');
+    });
+
+    it('leaves the tag-only request byte-identical and makes no lookup', async () => {
+      // Characterization: Product Opener canonicalizes tag parameters itself.
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+
+      await offSearchProductsTool.handler(
+        { brands_tag: 'Nutella', countries_tag: 'US', page: 1, page_size: 20 },
+        createMockContext({ errors: offSearchProductsTool.errors }),
+      );
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      const url = new URL(sentRequest().url);
+      expect(url.pathname).toBe('/api/v2/search');
+      expect(url.searchParams.get('brands_tags')).toBe('Nutella');
+      expect(url.searchParams.get('countries_tags')).toBe('US');
+    });
+  });
+
+  // ── #41: exclusion, trace, verdict, and multi-label filters ──────────────
+
+  describe('exclusion, trace, verdict, and multi-label filters (#41)', () => {
+    /** The tag-path URL prefix every search carries: endpoint plus the summary field list. */
+    const TAG_SEARCH_PREFIX =
+      'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags';
+
+    /** Run a tag-only search with the given parameters and return the URL it fetched. */
+    async function tagUrlFor(params: Record<string, unknown>): Promise<string> {
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] }),
+        );
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      expect(global.fetch).toHaveBeenCalledOnce();
+      return sentRequest().url;
+    }
+
+    /** Run a text search with the given parameters and return the `q` it sent. */
+    async function textQFor(params: Record<string, unknown>): Promise<string> {
+      global.fetch = vi.fn().mockResolvedValue(textHits([]));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      return sentQ();
+    }
+
+    it('sends single-string labels_tag and allergens_tag byte-identically', async () => {
+      // Characterization: the request a single-value call produced before these filters existed.
+      await expect(tagUrlFor({ labels_tag: 'en:organic', allergens_tag: 'en:nuts' })).resolves.toBe(
+        `${TAG_SEARCH_PREFIX}&labels_tags=en%3Aorganic&allergens_tags=en%3Anuts&page=1&page_size=20`,
+      );
+    });
+
+    it('joins an inclusion and its exclusions into one allergens_tags value', async () => {
+      // Product Opener ANDs comma-separated values and negates a `-` prefix within one parameter
+      // (live: en:chocolates with allergens_tags=en:nuts,-en:milk → 1,302 of en:nuts' 6,603).
+      await expect(
+        tagUrlFor({ allergens_tag: 'en:nuts', exclude_allergens: ['en:milk', 'en:soybeans'] }),
+      ).resolves.toBe(
+        `${TAG_SEARCH_PREFIX}&allergens_tags=en%3Anuts%2C-en%3Amilk%2C-en%3Asoybeans&page=1&page_size=20`,
+      );
+    });
+
+    it('sends an exclusion alone as a negated value', async () => {
+      await expect(tagUrlFor({ exclude_allergens: ['en:nuts'] })).resolves.toBe(
+        `${TAG_SEARCH_PREFIX}&allergens_tags=-en%3Anuts&page=1&page_size=20`,
+      );
+    });
+
+    it('sends traces, the ingredient verdict, and several labels on the tag path', async () => {
+      await expect(
+        tagUrlFor({
+          categories_tag: 'en:chocolates',
+          labels_tag: ['en:organic', 'en:fair-trade'],
+          traces_tag: 'en:nuts',
+          exclude_traces: ['en:milk'],
+          ingredients_analysis_tag: 'en:vegan',
+        }),
+      ).resolves.toBe(
+        `${TAG_SEARCH_PREFIX}&categories_tags=en%3Achocolates&labels_tags=en%3Aorganic%2Cen%3Afair-trade&traces_tags=en%3Anuts%2C-en%3Amilk&ingredients_analysis_tags=en%3Avegan&page=1&page_size=20`,
+      );
+    });
+
+    it('sends a one-element labels array exactly as the single string', async () => {
+      await expect(tagUrlFor({ labels_tag: ['en:organic'] })).resolves.toBe(
+        `${TAG_SEARCH_PREFIX}&labels_tags=en%3Aorganic&page=1&page_size=20`,
+      );
+    });
+
+    it('orders inclusions, then exclusions, then nutrients, groups, and words on the text path', async () => {
+      const q = await textQFor({
+        query: 'milk chocolate',
+        countries_tag: 'en:mongolia',
+        labels_tag: ['en:organic', 'en:fair-trade'],
+        allergens_tag: 'en:nuts',
+        traces_tag: 'en:milk',
+        ingredients_analysis_tag: 'en:vegan',
+        exclude_allergens: ['en:gluten', 'en:eggs'],
+        exclude_traces: ['en:peanuts'],
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 50 }],
+      });
+
+      expect(q).toBe(
+        'labels_tags:"en:organic" labels_tags:"en:fair-trade" allergens_tags:"en:nuts" ' +
+          'traces_tags:"en:milk" ingredients_analysis_tags:"en:vegan" countries_tags:"en:mongolia" ' +
+          '-allergens_tags:"en:gluten" -allergens_tags:"en:eggs" -traces_tags:"en:peanuts" ' +
+          `nutriments.sugars_100g:{* TO 50} ${wordGroup('milk')} ${wordGroup('chocolate')} milk chocolate`,
+      );
+    });
+
+    it('sends a single-string labels_tag on the text path as one clause', async () => {
+      // Characterization: unchanged from before labels_tag took an array.
+      await expect(textQFor({ query: 'chocolate', labels_tag: 'en:organic' })).resolves.toBe(
+        'labels_tags:"en:organic" chocolate',
+      );
+    });
+
+    describe('through off_search_products', () => {
+      beforeEach(() => {
+        initOpenFoodFactsService();
+        initTaxonomyService();
+      });
+
+      /**
+       * Routes the stubbed fetch: autocomplete calls answer from `options` keyed by taxonomy name
+       * (or with `lookupStatus` when set), and both search endpoints answer one row.
+       */
+      function routeFetch(
+        options: Record<string, { id: string; text: string }[]> = {},
+        lookupStatus?: number,
+      ): void {
+        global.fetch = vi.fn(async (input: unknown) => {
+          const url = new URL(String(input));
+          if (url.pathname === '/autocomplete') {
+            if (lookupStatus !== undefined)
+              return mockResponse({ detail: 'refused' }, lookupStatus);
+            const taxonomy = url.searchParams.get('taxonomy_names') ?? '';
+            return mockResponse({ took: 1, timed_out: false, options: options[taxonomy] ?? [] });
+          }
+          if (url.pathname === '/search') return textHits([{ code: '3017620422003' }], 1);
+          return mockResponse({
+            count: 1,
+            page: 1,
+            page_count: 1,
+            page_size: 20,
+            products: [{ code: '3017620422003' }],
+          });
+        });
+      }
+
+      /** Every request the stubbed fetch received, as `autocomplete:<taxonomy>:<q>` or a path. */
+      function requestLog(): string[] {
+        return vi.mocked(global.fetch).mock.calls.map(([input]) => {
+          const url = new URL(String(input));
+          return url.pathname === '/autocomplete'
+            ? `autocomplete:${url.searchParams.get('taxonomy_names')}:${url.searchParams.get('q')}`
+            : url.pathname;
+        });
+      }
+
+      /** Run the tool handler and return its rejection, failing the test if it resolves. */
+      async function rejectionOf(input: Record<string, unknown>): Promise<McpErrorish> {
+        try {
+          await offSearchProductsTool.handler(
+            { page: 1, page_size: 20, ...input } as never,
+            createMockContext({ errors: offSearchProductsTool.errors }),
+          );
+        } catch (error) {
+          return error as McpErrorish;
+        }
+        throw new Error('Expected the handler to reject.');
+      }
+
+      it('refuses an exclusion no vocabulary confirms before any search request, on the tag path', async () => {
+        routeFetch();
+
+        const error = await rejectionOf({ exclude_allergens: ['en:nutz'] });
+
+        expect(error.data?.reason).toBe('unrecognized_exclusion');
+        expect(error.data?.retryable).toBe(false);
+        expect(error.data?.recovery?.hint).toContain('off_browse_taxonomy');
+        expect(error.message).toContain('en:nutz');
+        expect(requestLog()).toEqual(['autocomplete:allergen:nutz']);
+      });
+
+      it('refuses it on the text path too', async () => {
+        routeFetch();
+
+        const error = await rejectionOf({ query: 'chocolate', exclude_traces: ['Nutz'] });
+
+        expect(error.data?.reason).toBe('unrecognized_exclusion');
+        expect(requestLog()).toEqual(['autocomplete:allergen:Nutz']);
+      });
+
+      it('refuses an exclusion the vocabulary could not be reached to check, as retryable', async () => {
+        routeFetch({}, 400);
+
+        const error = await rejectionOf({ exclude_allergens: ['Lupine'] });
+
+        expect(error.data?.reason).toBe('unrecognized_exclusion');
+        expect(error.data?.retryable).toBe(true);
+        expect(error.message).toMatch(/could not be checked/i);
+        expect(requestLog()).toEqual(['autocomplete:allergen:Lupine']);
+      });
+
+      it('sends an offline-confirmed exclusion canonical, with no lookup, on both paths', async () => {
+        routeFetch();
+
+        await offSearchProductsTool.handler(
+          { exclude_allergens: ['Milk'], page: 1, page_size: 20 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+        expect(requestLog()).toEqual(['/api/v2/search']);
+        expect(sentRequest().url).toBe(
+          `${TAG_SEARCH_PREFIX}&allergens_tags=-en%3Amilk&page=1&page_size=20`,
+        );
+
+        routeFetch();
+        await offSearchProductsTool.handler(
+          { query: 'chocolate', exclude_allergens: ['Milk'], page: 1, page_size: 20 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+        expect(requestLog()).toEqual(['/search']);
+        expect(sentQ()).toBe('-allergens_tags:"en:milk" chocolate');
+      });
+
+      it('resolves trace values against the allergen vocabulary', async () => {
+        routeFetch({ allergen: [{ id: 'en:peanuts', text: 'peanut' }] });
+
+        await offSearchProductsTool.handler(
+          {
+            query: 'butter',
+            traces_tag: 'peanut',
+            exclude_traces: ['en:milk'],
+            page: 1,
+            page_size: 20,
+          },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['autocomplete:allergen:peanut', '/search']);
+        expect(sentQ(1)).toBe('traces_tags:"en:peanuts" -traces_tags:"en:milk" butter');
+      });
+
+      it('accepts a singular exclusion whose plural is the tag (live response for "nut")', async () => {
+        routeFetch({ allergen: [{ id: 'en:nuts', text: 'Nuts' }] });
+
+        await offSearchProductsTool.handler(
+          { exclude_allergens: ['en:nut'], page: 1, page_size: 20 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['autocomplete:allergen:nut', '/api/v2/search']);
+        expect(sentRequest(1).url).toBe(
+          `${TAG_SEARCH_PREFIX}&allergens_tags=-en%3Anuts&page=1&page_size=20`,
+        );
+      });
+
+      it('shares one lookup between an inclusion and an exclusion of the same value', async () => {
+        routeFetch({ allergen: [{ id: 'en:peanuts', text: 'peanut' }] });
+
+        await offSearchProductsTool.handler(
+          {
+            query: 'butter',
+            traces_tag: 'peanut',
+            exclude_allergens: ['peanut'],
+            page: 1,
+            page_size: 20,
+          },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['autocomplete:allergen:peanut', '/search']);
+        expect(sentQ(1)).toBe('traces_tags:"en:peanuts" -allergens_tags:"en:peanuts" butter');
+      });
+
+      it('passes tag-path inclusions through untouched, labels array included', async () => {
+        routeFetch();
+
+        await offSearchProductsTool.handler(
+          {
+            labels_tag: ['EN:Organic', 'en:fair-trade'],
+            traces_tag: 'Nuts',
+            ingredients_analysis_tag: 'en:palm-oil-free',
+            page: 1,
+            page_size: 20,
+          },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['/api/v2/search']);
+        expect(sentRequest().url).toBe(
+          `${TAG_SEARCH_PREFIX}&labels_tags=EN%3AOrganic%2Cen%3Afair-trade&traces_tags=Nuts&ingredients_analysis_tags=en%3Apalm-oil-free&page=1&page_size=20`,
+        );
+      });
+
+      // ── #44: the tag path serves pages 1–10 only ───────────────────────────
+
+      it('sends a tag-only page 10', async () => {
+        // Characterization: page 10 is the deepest page Product Opener serves an anonymous client.
+        routeFetch();
+
+        await offSearchProductsTool.handler(
+          { categories_tag: 'en:pizzas', page: 10, page_size: 50 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['/api/v2/search']);
+        expect(sentRequest().url).toBe(
+          `${TAG_SEARCH_PREFIX}&categories_tags=en%3Apizzas&page=10&page_size=50`,
+        );
+      });
+
+      it('rejects a tag-only page past 10 before any request', async () => {
+        // Product Opener answers every anonymous page past 10 with a 401 and a rendered page,
+        // whatever the page_size (Display.pm `search_and_display_products`).
+        global.fetch = vi.fn().mockResolvedValue(mockResponse('<!doctype html><html></html>', 401));
+
+        const error = await rejectionOf({ categories_tag: 'en:pizzas', page: 11, page_size: 1 });
+
+        expect(global.fetch).not.toHaveBeenCalled();
+        expect(error.data).toMatchObject({
+          reason: 'page_out_of_range',
+          page: 11,
+          page_size: 1,
+          max_page: 10,
+        });
+        expect(error.data?.recovery?.hint).toContain('page 10');
+      });
+
+      it('keeps text-path paging unchanged: a text page 11 is sent', async () => {
+        routeFetch();
+
+        await offSearchProductsTool.handler(
+          { query: 'pizza', page: 11, page_size: 50 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['/search']);
+        expect(sentRequest().body).toMatchObject({ page: 11, page_size: 50 });
+      });
+
+      it('reports the reachable tag-path depth as last_page', async () => {
+        global.fetch = vi.fn().mockResolvedValue(
+          mockResponse({
+            count: 13_435,
+            page: 1,
+            page_count: 50,
+            page_size: 50,
+            products: [{ code: '4260414153068' }],
+          }),
+        );
+
+        const result = await offSearchProductsTool.handler(
+          { categories_tag: 'en:pizzas', page: 1, page_size: 50 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(result.last_page).toBe(10);
+      });
     });
   });
 });
