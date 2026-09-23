@@ -404,7 +404,7 @@ errors: [
   {
     reason: 'upstream_error',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
+    when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, or is unreachable',
     retryable: true,
     recovery: 'Retry after a brief pause — the Open Food Facts service may be shedding load. If it keeps failing, narrow the filters or try again later.',
   },

@@ -461,7 +461,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
