@@ -4,7 +4,7 @@
  */
 
 import { rateLimited, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
@@ -13,6 +13,7 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
 
 import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { ACCEPTED_BARCODES, REJECTED_BARCODES } from '../../../fixtures/barcode-cases.js';
 
 const mockGetProductFields = vi.fn();
 
@@ -650,5 +651,57 @@ describe('off_compare_products', () => {
     for (const term of ['"a-plus"', '"f"', '"unknown"', '"not-applicable"']) {
       expect(row.ecoscore_grade.description).toContain(term);
     }
+  });
+
+  // ── #46: barcodes Open Food Facts serves are accepted ─────────────────────
+
+  describe('barcode input (#46)', () => {
+    it.each(ACCEPTED_BARCODES)('accepts %s in a batch', (barcode) => {
+      expect(
+        offCompareProductsTool.input.safeParse({ barcodes: [barcode, '3017620422003'] }).success,
+      ).toBe(true);
+    });
+
+    it.each(REJECTED_BARCODES)('rejects a batch carrying %j', (barcode) => {
+      expect(
+        offCompareProductsTool.input.safeParse({ barcodes: [barcode, '3017620422003'] }).success,
+      ).toBe(false);
+    });
+
+    it('fetches a 7-digit barcode beside an EAN-13, in input order', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce({ product_name: 'Short-code product' })
+        .mockResolvedValueOnce({ product_name: 'Nutella' });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['6035215', '3017620422003'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockGetProductFields.mock.calls.map((call) => call[0])).toEqual([
+        '6035215',
+        '3017620422003',
+      ]);
+      expect(
+        (result.structuredContent as { products: { barcode: string }[] }).products.map(
+          (row) => row.barcode,
+        ),
+      ).toEqual(['6035215', '3017620422003']);
+    });
+
+    it('describes every barcode field by the range Open Food Facts accepts', () => {
+      const barcodes = offCompareProductsTool.input.shape.barcodes;
+      const output = offCompareProductsTool.output.shape;
+      const descriptions = [
+        barcodes.element.description,
+        output.products.element.shape.barcode.description,
+        output.not_found.element.description,
+        output.failed.unwrap().element.shape.barcode.description,
+      ];
+      expect(barcodes.element.description).toContain('4–40 digits');
+      for (const description of descriptions) {
+        expect(description).not.toMatch(/EAN-13 or UPC|8–14/);
+      }
+    });
   });
 });

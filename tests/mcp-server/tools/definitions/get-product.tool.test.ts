@@ -4,7 +4,7 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
@@ -14,6 +14,7 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import type { RawProduct } from '@/services/openfoodfacts/types.js';
+import { ACCEPTED_BARCODES, REJECTED_BARCODES } from '../../../fixtures/barcode-cases.js';
 
 const mockGetProduct = vi.fn();
 const mockGetProductFields = vi.fn();
@@ -92,7 +93,9 @@ describe('off_get_product', () => {
     // layer, but getProduct() returns null → handler throws ctx.fail('not_found').
     mockGetProduct.mockResolvedValue(null);
 
-    const err = await captureError(offGetProductTool.handler({ barcode: '0000000000001' }, ctx));
+    const barcode = '0000000001234';
+    expect(offGetProductTool.input.safeParse({ barcode }).success).toBe(true);
+    const err = await captureError(offGetProductTool.handler({ barcode }, ctx));
     expect(err).toMatchObject({ data: { reason: 'not_found' } });
   });
 
@@ -1419,6 +1422,49 @@ describe('off_get_product', () => {
       expect(text).toContain('  - \\[click\\](https://example.invalid) (id: en:\\`x\\`)');
       expect(text).toContain('    - \\*bold\\* # heading (id: en:a\\_b)');
       expect(text.split('\n').some((line) => line.startsWith('# heading'))).toBe(false);
+    });
+  });
+
+  // ── #46: barcodes Open Food Facts serves are accepted ─────────────────────
+
+  describe('barcode input (#46)', () => {
+    it.each(ACCEPTED_BARCODES)('accepts %s', (barcode) => {
+      expect(offGetProductTool.input.safeParse({ barcode }).success).toBe(true);
+    });
+
+    it.each(REJECTED_BARCODES)('rejects %j', (barcode) => {
+      expect(offGetProductTool.input.safeParse({ barcode }).success).toBe(false);
+    });
+
+    it('sends a 7-digit barcode on and echoes it unchanged, on both surfaces', async () => {
+      mockGetProduct.mockResolvedValue({ product_name: 'Short-code product' });
+
+      const result = await runToolContract(offGetProductTool, { barcode: '6035215' });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockGetProduct).toHaveBeenCalledOnce();
+      expect(mockGetProduct.mock.calls[0]?.[0]).toBe('6035215');
+      expect((result.structuredContent as { barcode?: string }).barcode).toBe('6035215');
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain('6035215');
+    });
+
+    it('refuses a non-digit barcode without contacting the service', async () => {
+      const result = await runToolContract(offGetProductTool, { barcode: '3017620422003a' });
+
+      expect(result.isError).toBe(true);
+      expect(mockGetProduct).not.toHaveBeenCalled();
+    });
+
+    it('describes the barcode by the range Open Food Facts accepts', () => {
+      const { shape } = offGetProductTool.input as unknown as {
+        shape: Record<string, { description?: string }>;
+      };
+      expect(shape.barcode?.description).toContain('4–40 digits');
+      expect(shape.barcode?.description).not.toMatch(/EAN-13 or UPC|8–14/);
+      expect(offGetProductTool.description).not.toMatch(/EAN-13 or UPC/);
     });
   });
 });

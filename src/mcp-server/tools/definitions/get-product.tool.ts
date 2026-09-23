@@ -6,7 +6,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import type { RawIngredient, RawNutriments, RawProduct } from '@/services/openfoodfacts/types.js';
+import {
+  BARCODE_PATTERN,
+  BARCODE_PATTERN_MESSAGE,
+  type RawIngredient,
+  type RawNutriments,
+  type RawProduct,
+} from '@/services/openfoodfacts/types.js';
 import { mdCodeFence, mdInline, mdUrl } from '@/utils/markdown.js';
 
 /**
@@ -299,15 +305,15 @@ function servingSizeLine(
 export const offGetProductTool = tool('off_get_product', {
   title: 'Get Food Product by Barcode',
   description:
-    'Fetch a packaged food product by barcode (EAN-13 or UPC) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
     barcode: z
       .string()
-      .regex(/^\d{8,14}$/)
+      .regex(BARCODE_PATTERN, BARCODE_PATTERN_MESSAGE)
       .describe(
-        'EAN-13 or UPC barcode (8–14 digits). The primary key for Open Food Facts. Example: "3017620422003" (Nutella FR).',
+        'Product barcode, digits only: 4–40 digits after any leading zeros. The primary key for Open Food Facts — the barcode of an off_search_products row works as is. Example: "3017620422003" (Nutella FR).',
       ),
     fields: z
       .array(

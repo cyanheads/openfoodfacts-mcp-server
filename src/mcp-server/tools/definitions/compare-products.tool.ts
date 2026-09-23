@@ -6,7 +6,11 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import type { RawProduct } from '@/services/openfoodfacts/types.js';
+import {
+  BARCODE_PATTERN,
+  BARCODE_PATTERN_MESSAGE,
+  type RawProduct,
+} from '@/services/openfoodfacts/types.js';
 import { mdInline, mdTableCell } from '@/utils/markdown.js';
 
 /** Fields needed for comparison — narrower than full product fetch. */
@@ -145,8 +149,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
       .array(
         z
           .string()
-          .regex(/^\d{8,14}$/)
-          .describe('EAN-13 or UPC barcode (8–14 digits).'),
+          .regex(BARCODE_PATTERN, BARCODE_PATTERN_MESSAGE)
+          .describe('Product barcode, digits only: 4–40 digits after any leading zeros.'),
       )
       .min(2)
       .max(10)
@@ -160,7 +164,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       .array(
         z
           .object({
-            barcode: z.string().describe('EAN-13 or UPC barcode (same as provided input).'),
+            barcode: z.string().describe('Barcode, echoed exactly as provided in input.'),
             product_name: z
               .string()
               .optional()
@@ -226,7 +230,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       ),
     succeeded: z.number().describe('Number of barcodes that resolved to a found product.'),
     not_found: z
-      .array(z.string().describe('EAN-13 or UPC barcode with no contributor record.'))
+      .array(z.string().describe('Barcode with no contributor record, as provided in input.'))
       .describe(
         'Barcodes Open Food Facts answered for, confirming no contributor record exists. Not an error — the product may exist but not yet be entered. Never used for a fetch that failed.',
       ),
@@ -234,7 +238,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       .array(
         z
           .object({
-            barcode: z.string().describe('EAN-13 or UPC barcode whose fetch failed.'),
+            barcode: z.string().describe('Barcode whose fetch failed, as provided in input.'),
             reason: z
               .string()
               .describe(
