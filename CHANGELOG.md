@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.7](changelog/0.3.x/0.3.7.md) — 2026-10-08
+
+Moves to mcp-ts-core 0.13.14: tool calls repair numeric and boolean strings, lone strings for lists, and integers sent for strings, error results carry their request ID, and the registry's HTTP install entry now starts the HTTP transport.
+
 ## [0.3.6](changelog/0.3.x/0.3.6.md) — 2026-09-22
 
 off_search_products now requires every query word to match across 31 languages, gains allergen/trace exclusions and a vegan/vegetarian/palm-oil filter, and off_get_product accepts the full range of barcodes Open Food Facts serves.
