@@ -75,8 +75,9 @@ export const TAG_SEARCH_MAX_PAGE = 10;
 
 /**
  * Failure reasons this service raises, mapped to the wire code each tool declares for them in its
- * `errors: [...]` contract. Errors leave the service already carrying `reason` + `recovery.hint`,
- * so both client surfaces satisfy the contract without any handler-side try/catch.
+ * `errors: [...]` contract. Errors leave the service carrying `reason`, and the framework fills the
+ * calling tool's declared `recovery.hint` from it, so both client surfaces satisfy the contract
+ * without any handler-side try/catch.
  */
 const REASON_CODES = {
   upstream_error: JsonRpcErrorCode.ServiceUnavailable,
@@ -202,7 +203,7 @@ function plainTextDetail(body: string): string | undefined {
  * not a filter: `fetchWithTimeout` is free to attach whatever diagnostics it needs — including the
  * captured response body, twice — and the contract is what this server chooses to publish, not
  * whatever happened to be on the error. Everything else the caller needs (`reason`, `retryable`,
- * `recovery`, the per-call context) is added at the throw site.
+ * the per-call context) is added at the throw site.
  */
 const PUBLISHED_ERROR_FIELDS = ['status', 'retryAfter', 'retryAttempts', 'operation'] as const;
 
@@ -220,11 +221,7 @@ function publishedErrorData(data: Record<string, unknown> | undefined): Record<s
  * under load. The body is read exactly once — reading it as text to sniff for markup and then
  * calling `response.json()` would fail on the already-consumed stream.
  */
-async function parseJsonBody<T>(
-  response: Response,
-  ctx: Context,
-  data: Record<string, unknown>,
-): Promise<T> {
+async function parseJsonBody<T>(response: Response, data: Record<string, unknown>): Promise<T> {
   if ((response.headers.get('content-type') ?? '').includes('application/json')) {
     return (await response.json()) as T;
   }
@@ -233,7 +230,6 @@ async function parseJsonBody<T>(
     throw contractError(
       'upstream_error',
       'Open Food Facts served an HTML page instead of JSON — the service is rate-limiting or temporarily down.',
-      ctx,
       data,
     );
   }
@@ -241,27 +237,22 @@ async function parseJsonBody<T>(
 }
 
 /**
- * Builds a failure carrying the reason, retryability, and recovery hint declared by the calling
- * tool. `retryable` is emitted for every reason, not just the non-retryable one, so a client reading
- * `data.retryable` gets an answer rather than an absence it has to interpret. Only an upstream
- * rejection is non-retryable — the request as formed will be refused again.
+ * Builds a failure carrying the reason and retryability the calling tool declares; the framework
+ * fills that tool's recovery hint from the reason. `retryable` is emitted for every reason, not just
+ * the non-retryable one, so a client reading `data.retryable` gets an answer rather than an absence
+ * it has to interpret. Only an upstream rejection is non-retryable — the request as formed will be
+ * refused again.
  */
 function contractError(
   reason: UpstreamReason,
   message: string,
-  ctx: Context,
   data: Record<string, unknown>,
   cause?: unknown,
 ): McpError {
   return new McpError(
     REASON_CODES[reason],
     message,
-    {
-      ...data,
-      reason,
-      retryable: reason !== 'upstream_rejected',
-      ...ctx.recoveryFor(reason),
-    },
+    { ...data, reason, retryable: reason !== 'upstream_rejected' },
     cause === undefined ? undefined : { cause },
   );
 }
@@ -272,7 +263,7 @@ function contractError(
  * classification: 5xx other than 501, timeouts, and 429s stay retryable while a 4xx or a 501 fails
  * immediately.
  */
-function toContractError(error: unknown, ctx: Context, data: Record<string, unknown>): unknown {
+function toContractError(error: unknown, data: Record<string, unknown>): unknown {
   if (!(error instanceof McpError)) return error;
   // A caller-cancelled request is not an upstream failure — leave it untouched.
   if (error.data?.errorSource === 'FetchAborted') return error;
@@ -284,7 +275,7 @@ function toContractError(error: unknown, ctx: Context, data: Record<string, unkn
     `${REASON_MESSAGES[reason]}${typeof status === 'number' ? ` (HTTP ${status})` : ''}` +
     `${detail ? `: ${detail}` : '.'}`;
 
-  return contractError(reason, message, ctx, { ...publishedErrorData(error.data), ...data }, error);
+  return contractError(reason, message, { ...publishedErrorData(error.data), ...data }, error);
 }
 
 /** Fields to request on every product fetch — scopes the ~200-key object to what we handle. */
@@ -562,7 +553,7 @@ class RateLimiter {
    * upstream — so the message names this server rather than Open Food Facts, and carries the wait
    * until a slot frees.
    */
-  check(endpoint: string, ctx: Context): void {
+  check(endpoint: string): void {
     const now = Date.now();
     const windowStart = now - this.windowMs;
     // Evict timestamps outside the window
@@ -579,14 +570,7 @@ class RateLimiter {
         `openfoodfacts-mcp-server declined this ${endpoint} request: its own client-side budget of ` +
           `${this.maxRequests} ${endpoint} requests/min is spent, so nothing was sent to Open Food ` +
           `Facts. A slot frees in about ${retryAfter}s.`,
-        {
-          endpoint,
-          limit: this.maxRequests,
-          retryAfter,
-          reason: 'rate_limited',
-          retryable: true,
-          ...ctx.recoveryFor('rate_limited'),
-        },
+        { endpoint, limit: this.maxRequests, retryAfter, reason: 'rate_limited', retryable: true },
       );
     }
     this.timestamps.push(now);
@@ -617,9 +601,9 @@ export class OpenFoodFactsService {
   async getProduct(barcode: string, ctx: Context): Promise<RawProduct | null> {
     return await withRetry(
       () => {
-        this.productLimiter.check('product', ctx);
+        this.productLimiter.check('product');
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${PRODUCT_FIELDS}`;
-        ctx.log.debug('Fetching product', { barcode, url });
+        ctx.log.debug('Fetching product', { barcode });
         return this.fetchProduct(url, barcode, ctx);
       },
       {
@@ -643,7 +627,7 @@ export class OpenFoodFactsService {
   ): Promise<RawProduct | null> {
     return await withRetry(
       () => {
-        this.productLimiter.check('product', ctx);
+        this.productLimiter.check('product');
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${fields}`;
         ctx.log.debug('Fetching product fields', { barcode, fields });
         return this.fetchProduct(url, barcode, ctx);
@@ -686,10 +670,10 @@ export class OpenFoodFactsService {
         ctx.log.debug('Product not found (HTTP 404)', { barcode });
         return null;
       }
-      throw toContractError(error, ctx, { barcode });
+      throw toContractError(error, { barcode });
     }
 
-    const data = await parseJsonBody<RawProductResponse>(response, ctx, { barcode });
+    const data = await parseJsonBody<RawProductResponse>(response, { barcode });
     ctx.log.debug('Product response received', { barcode, status: data.status });
 
     // status:0 = barcode not found in any contributor record (still HTTP 200)
@@ -727,7 +711,7 @@ export class OpenFoodFactsService {
             },
       );
     } catch (error) {
-      throw toContractError(error, ctx, data);
+      throw toContractError(error, data);
     }
   }
 
@@ -771,7 +755,7 @@ export class OpenFoodFactsService {
   private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
-        this.searchLimiter.check('search', ctx);
+        this.searchLimiter.check('search');
         const page = params.page ?? 1;
         const pageSize = params.page_size ?? 20;
         const body = {
@@ -796,7 +780,7 @@ export class OpenFoodFactsService {
           body,
         );
 
-        const data = await parseJsonBody<RawTextSearchResponse>(response, ctx, { page });
+        const data = await parseJsonBody<RawTextSearchResponse>(response, { page });
 
         if (data.errors?.length) {
           const detail = plainTextDetail(
@@ -805,7 +789,6 @@ export class OpenFoodFactsService {
           throw contractError(
             'upstream_error',
             `Open Food Facts text search failed inside its search engine${detail ? `: ${detail}` : '.'}`,
-            ctx,
             { page, page_size: pageSize },
           );
         }
@@ -866,18 +849,16 @@ export class OpenFoodFactsService {
   private async searchProductsByTags(params: SearchParams, ctx: Context): Promise<SearchResult> {
     return await withRetry(
       async () => {
-        this.searchLimiter.check('search', ctx);
+        this.searchLimiter.check('search');
         const url = this.buildSearchUrl(params);
-        ctx.log.debug('Searching products by tags', { params, url });
+        ctx.log.debug('Searching products by tags', { params });
 
         const response = await this.fetchSearch(url, ctx, 'OFF:searchProductsByTags', {
           page: params.page ?? 1,
           page_size: params.page_size ?? 20,
         });
 
-        const data = await parseJsonBody<RawSearchResponse>(response, ctx, {
-          page: params.page ?? 1,
-        });
+        const data = await parseJsonBody<RawSearchResponse>(response, { page: params.page ?? 1 });
 
         ctx.log.debug('Tag search response received', {
           count: data.count,
@@ -927,20 +908,19 @@ export class OpenFoodFactsService {
   ): Promise<{ id: string; name: string }[]> {
     return await withRetry(
       async () => {
-        this.taxonomyLimiter.check('taxonomy', ctx);
+        this.taxonomyLimiter.check('taxonomy');
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/autocomplete`);
         url.searchParams.set('q', term);
         url.searchParams.set('taxonomy_names', taxonomyName);
         url.searchParams.set('size', String(Math.min(size, MAX_AUTOCOMPLETE_SIZE)));
 
-        ctx.log.debug('Resolving taxonomy term', { taxonomyName, term, url: url.toString() });
+        ctx.log.debug('Resolving taxonomy term', { taxonomyName, term });
 
         const data = await parseJsonBody<RawAutocompleteResponse>(
           await this.fetchSearch(url.toString(), ctx, 'OFF:suggestTaxonomy', {
             taxonomy_name: taxonomyName,
             term,
           }),
-          ctx,
           { taxonomy_name: taxonomyName, term },
         );
 

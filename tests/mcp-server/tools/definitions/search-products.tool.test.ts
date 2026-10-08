@@ -69,6 +69,18 @@ function contractText(result: { content?: { type: string; text?: string }[] }): 
     .join('\n');
 }
 
+/**
+ * The recovery hint on a `runToolContract` error envelope. A declared hint reaches the wire through
+ * the framework's fill, which a direct `handler(...)` call skips, so hint assertions go through
+ * the contract runner.
+ */
+function contractHint(result: { structuredContent?: unknown }): string {
+  const { error } = (result.structuredContent ?? {}) as {
+    error?: { data?: { recovery?: { hint?: string } } };
+  };
+  return error?.data?.recovery?.hint ?? '';
+}
+
 /** Reads a field's rendered `.describe()` text off the tool's advertised input schema. */
 function inputDescription(field: string): string {
   const { shape } = offSearchProductsTool.input as unknown as {
@@ -634,19 +646,15 @@ describe('off_search_products', () => {
     });
 
     it('names the nutrient filter as a cause in the additives rejection hint', async () => {
-      const error = (await captureError(
-        offSearchProductsTool.handler(
-          {
-            additives_tag: 'en:e322',
-            nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
-            page: 1,
-            page_size: 20,
-          },
-          ctx,
-        ),
-      )) as { data?: { recovery?: { hint?: string } } };
+      const result = await runToolContract(offSearchProductsTool, {
+        additives_tag: 'en:e322',
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+        page: 1,
+        page_size: 20,
+      });
 
-      expect(error.data?.recovery?.hint ?? '').toContain('nutrient_filters');
+      expect(result.isError).toBe(true);
+      expect(contractHint(result)).toContain('nutrient_filters');
     });
 
     it('applies the text-search page window to a nutrient-only search', async () => {
@@ -1301,14 +1309,15 @@ describe('off_search_products', () => {
     });
 
     it('names both working combinations in the additives rejection hint', async () => {
-      const error = (await captureError(
-        offSearchProductsTool.handler(
-          { query: 'chocolate', additives_tag: 'en:e322', page: 1, page_size: 20 },
-          ctx,
-        ),
-      )) as { data?: { recovery?: { hint?: string } } };
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        additives_tag: 'en:e322',
+        page: 1,
+        page_size: 20,
+      });
 
-      const hint = error.data?.recovery?.hint ?? '';
+      expect(result.isError).toBe(true);
+      const hint = contractHint(result);
       expect(hint).toContain('Drop query');
       expect(hint).toContain('drop additives_tag');
     });

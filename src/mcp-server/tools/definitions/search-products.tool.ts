@@ -461,7 +461,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -470,7 +470,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: 'Open Food Facts did not answer within the request deadline',
+      when: 'Open Food Facts did not answer within the request deadline, or answered 408, 425, or 504',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -479,7 +479,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Open Food Facts answers 4xx or 501 Not Implemented — the request as formed will be refused again',
+      when: 'Open Food Facts refuses the request with a 4xx other than 408, 425, or 429, or with 501 Not Implemented — the request as formed will be refused again',
       retryable: false,
       thrownBy: 'service',
       recovery:
@@ -492,7 +492,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       retryable: true,
       thrownBy: 'service',
       recovery:
-        'Wait the seconds given in data.retryAfter, then retry. Searches carry a much smaller budget than product lookups.',
+        'Wait the seconds given in data.retryAfter, or about a minute when it is absent, then retry. Searches carry a much smaller budget than product lookups.',
     },
   ],
 
@@ -519,9 +519,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       Boolean(input.nova_group);
 
     if (!hasFilter) {
-      throw ctx.fail('no_filters', 'At least one search parameter is required.', {
-        ...ctx.recoveryFor('no_filters'),
-      });
+      throw ctx.fail('no_filters', 'At least one search parameter is required.');
     }
 
     // Only the tag-filter backend indexes additives. The text backend accepts an additives clause
@@ -531,10 +529,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       throw ctx.fail(
         'additives_filter_needs_tag_search',
         'additives_tag filters only on searches the tag backend answers — a query or a nutrient constraint moves the search to a backend with no additives field, so pairing them would match nothing regardless of the additive.',
-        {
-          additives_tag: input.additives_tag,
-          ...ctx.recoveryFor('additives_filter_needs_tag_search'),
-        },
+        { additives_tag: input.additives_tag },
       );
     }
 
@@ -545,11 +540,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       throw ctx.fail(
         'query_too_long',
         `query has ${wordCount} words; the text backend can require at most ${MAX_QUERY_WORDS} at once.`,
-        {
-          word_count: wordCount,
-          max_words: MAX_QUERY_WORDS,
-          ...ctx.recoveryFor('query_too_long'),
-        },
+        { word_count: wordCount, max_words: MAX_QUERY_WORDS },
       );
     }
 
@@ -646,13 +637,11 @@ export const offSearchProductsTool = tool('off_search_products', {
         {
           unrecognized,
           retryable,
-          ...(retryable
-            ? {
-                recovery: {
-                  hint: 'Retry shortly — the allergen vocabulary could not be reached to confirm the value. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.',
-                },
-              }
-            : ctx.recoveryFor('unrecognized_exclusion')),
+          ...(retryable && {
+            recovery: {
+              hint: 'Retry shortly — the allergen vocabulary could not be reached to confirm the value. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.',
+            },
+          }),
         },
       );
     }

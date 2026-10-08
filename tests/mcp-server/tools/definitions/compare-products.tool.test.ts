@@ -22,6 +22,13 @@ function createToolContext() {
   return createMockContext({ errors: offCompareProductsTool.errors });
 }
 
+/** The recovery this tool's contract declares for a reason — what a failed entry closes with. */
+function declaredRecovery(reason: string): string {
+  const recovery = offCompareProductsTool.errors?.find((e) => e.reason === reason)?.recovery;
+  if (!recovery) throw new Error(`off_compare_products declares no reason ${reason}.`);
+  return recovery;
+}
+
 /** Return the first text block produced by the tool formatter. */
 function firstText(blocks: ReturnType<NonNullable<typeof offCompareProductsTool.format>>): string {
   const block = blocks[0];
@@ -266,7 +273,6 @@ describe('off_compare_products', () => {
       .mockRejectedValueOnce(
         serviceUnavailable('Open Food Facts is unavailable (HTTP 503).', {
           reason: 'upstream_error',
-          recovery: { hint: 'Retry the barcodes listed in failed after a brief pause.' },
         }),
       );
 
@@ -278,12 +284,12 @@ describe('off_compare_products', () => {
     expect(result.succeeded).toBe(1);
     expect(result.products[0]?.product_name).toBe('Good Product');
     expect(result.not_found).toHaveLength(0);
+    // The service raises only the reason; the hint is this tool's own declared recovery for it.
     expect(result.failed).toEqual([
       {
         barcode: '2222222222222',
         reason: 'upstream_error',
-        error:
-          'Open Food Facts is unavailable (HTTP 503). Retry the barcodes listed in failed after a brief pause.',
+        error: `Open Food Facts is unavailable (HTTP 503). ${declaredRecovery('upstream_error')}`,
       },
     ]);
   });
@@ -296,7 +302,6 @@ describe('off_compare_products', () => {
       .mockRejectedValueOnce(
         serviceUnavailable('Open Food Facts refused the request (HTTP 400): page too deep', {
           reason: 'upstream_rejected',
-          recovery: { hint: 'Do not retry unchanged.' },
         }),
       );
 
@@ -306,7 +311,7 @@ describe('off_compare_products', () => {
     );
 
     expect(result.failed?.[0]?.error).toBe(
-      'Open Food Facts refused the request (HTTP 400): page too deep. Do not retry unchanged.',
+      `Open Food Facts refused the request (HTTP 400): page too deep. ${declaredRecovery('upstream_rejected')}`,
     );
   });
 
@@ -345,7 +350,11 @@ describe('off_compare_products', () => {
     expect(result.succeeded).toBe(1);
     expect(result.not_found).toHaveLength(0);
     expect(result.failed).toEqual([
-      { barcode: '2222222222222', reason: 'upstream_error', error: 'Network timeout' },
+      {
+        barcode: '2222222222222',
+        reason: 'upstream_error',
+        error: `Network timeout. ${declaredRecovery('upstream_error')}`,
+      },
     ]);
   });
 

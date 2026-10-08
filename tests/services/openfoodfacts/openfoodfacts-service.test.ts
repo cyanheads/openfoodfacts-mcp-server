@@ -917,19 +917,31 @@ describe('OpenFoodFactsService', () => {
   // fetchWithTimeout does the status → code mapping the service then maps onto a contract reason.
 
   describe('error contract', () => {
+    /**
+     * The failure off_get_product puts on the wire for a barcode, through the contract runner —
+     * the path that fills the tool's declared recovery hint from the reason the service raised.
+     */
+    async function getProductWireError(barcode = '3017620422003'): Promise<McpErrorish> {
+      initOpenFoodFactsService();
+      const result = await runToolContract(offGetProductTool, { barcode });
+      expect(result.isError).toBe(true);
+      return (result.structuredContent as { error: McpErrorish }).error;
+    }
+
+    /** The recovery off_get_product declares for a reason. */
+    const declaredRecovery = (reason: string) =>
+      offGetProductTool.errors?.find((e) => e.reason === reason)?.recovery;
+
     it('carries reason and recovery for an unreachable upstream', async () => {
       // The reported repro (OFF_BASE_URL pointed at a dead port) surfaced a bare -32603 with no
       // reason and no recovery hint on either client surface.
-      const ctx = createMockContext({ errors: offGetProductTool.errors });
       global.fetch = vi.fn().mockRejectedValue(new TypeError('Unable to connect.'));
 
-      const error = await captureError(svc.getProduct('3017620422003', ctx));
+      const error = await getProductWireError();
 
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
       expect(error.data?.reason).toBe('upstream_error');
-      expect(error.data?.recovery?.hint).toBe(
-        offGetProductTool.errors?.find((e) => e.reason === 'upstream_error')?.recovery,
-      );
+      expect(error.data?.recovery?.hint).toBe(declaredRecovery('upstream_error'));
     });
 
     it('classifies an upstream 5xx as a retryable upstream_error', async () => {
@@ -1015,9 +1027,6 @@ describe('OpenFoodFactsService', () => {
 
         expect(error.code).toBe(JsonRpcErrorCode.Timeout);
         expect(error.data?.reason).toBe('upstream_timeout');
-        expect(error.data?.recovery?.hint).toBe(
-          offGetProductTool.errors?.find((e) => e.reason === 'upstream_timeout')?.recovery,
-        );
       } finally {
         vi.useRealTimers();
       }
@@ -1054,10 +1063,9 @@ describe('OpenFoodFactsService', () => {
     });
 
     it('keeps the diagnostics the recovery hint refers to', async () => {
-      const ctx = createMockContext({ errors: offGetProductTool.errors });
       global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 503));
 
-      const error = await captureError(svc.getProduct('3017620422003', ctx));
+      const error = await getProductWireError();
       const data = (error.data ?? {}) as Record<string, unknown>;
 
       expect(data.status).toBe(503);
@@ -1065,9 +1073,7 @@ describe('OpenFoodFactsService', () => {
       expect(data.retryable).toBe(true);
       expect(data.barcode).toBe('3017620422003');
       expect(data.retryAttempts).toBe(4);
-      expect((data.recovery as { hint?: string }).hint).toBe(
-        offGetProductTool.errors?.find((e) => e.reason === 'upstream_error')?.recovery,
-      );
+      expect((data.recovery as { hint?: string }).hint).toBe(declaredRecovery('upstream_error'));
     });
 
     it('keeps the per-call context of the search and taxonomy paths', async () => {
@@ -1440,7 +1446,11 @@ describe('OpenFoodFactsService', () => {
       expect(error.data?.status).toBe(501);
       expect(error.message).toContain('HTTP 501');
       expect(error.message).not.toContain('failed after');
-      expect(error.data?.recovery?.hint).toBe(
+
+      // The tool's declared hint for the reason reaches the wire, filled by the framework.
+      initOpenFoodFactsService();
+      const wire = await runToolContract(offGetProductTool, { barcode: '3017620422003' });
+      expect((wire.structuredContent as { error: McpErrorish }).error.data?.recovery?.hint).toBe(
         offGetProductTool.errors?.find((e) => e.reason === 'upstream_rejected')?.recovery,
       );
     });
@@ -2416,17 +2426,18 @@ describe('OpenFoodFactsService', () => {
         });
       }
 
-      /** Run the tool handler and return its rejection, failing the test if it resolves. */
+      /**
+       * Run the tool through the contract runner and return the failure it puts on the wire —
+       * declared recovery hint filled — failing the test if the call succeeds.
+       */
       async function rejectionOf(input: Record<string, unknown>): Promise<McpErrorish> {
-        try {
-          await offSearchProductsTool.handler(
-            { page: 1, page_size: 20, ...input } as never,
-            createMockContext({ errors: offSearchProductsTool.errors }),
-          );
-        } catch (error) {
-          return error as McpErrorish;
-        }
-        throw new Error('Expected the handler to reject.');
+        const result = await runToolContract(offSearchProductsTool, {
+          page: 1,
+          page_size: 20,
+          ...input,
+        } as never);
+        expect(result.isError).toBe(true);
+        return (result.structuredContent as { error: McpErrorish }).error;
       }
 
       it('refuses an exclusion no vocabulary confirms before any search request, on the tag path', async () => {

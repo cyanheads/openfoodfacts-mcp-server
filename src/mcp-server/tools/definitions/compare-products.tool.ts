@@ -41,30 +41,40 @@ function n(raw: Record<string, number | string | undefined>, key: string): numbe
   return typeof v === 'number' ? v : undefined;
 }
 
+/** The failure reasons this tool declares — the four the service raises for a product fetch. */
+const FAILURE_REASONS = [
+  'upstream_error',
+  'upstream_timeout',
+  'upstream_rejected',
+  'rate_limited',
+] as const;
+
+type FailureReason = (typeof FAILURE_REASONS)[number];
+
 type FailedFetch = {
   barcode: string;
-  reason: string;
+  reason: FailureReason;
   error: string;
 };
 
 /**
  * Describe a rejected fetch for the `failed` array. The service raises declared contract failures,
- * so the reason and the recovery hint are read off the error rather than re-derived from its text.
- * The upstream's own explanation is appended raw and rarely ends in punctuation, so the hint is
- * joined as its own sentence instead of running on from the message.
+ * so the reason is read off the error rather than re-derived from its text, and the hint is this
+ * tool's own contract entry for it — the framework fills a declared hint only on an error that
+ * leaves the handler, and these are caught per barcode. The upstream's own explanation is appended
+ * raw and rarely ends in punctuation, so the hint is joined as its own sentence instead of running
+ * on from the message.
  */
-function describeFailure(barcode: string, error: unknown): FailedFetch {
-  if (error instanceof McpError) {
-    const reason = typeof error.data?.reason === 'string' ? error.data.reason : 'upstream_error';
-    const hint = (error.data?.recovery as { hint?: string } | undefined)?.hint;
-    const message = /[.!?]$/.test(error.message) ? error.message : `${error.message}.`;
-    return { barcode, reason, error: hint ? `${message} ${hint}` : message };
-  }
-  return {
-    barcode,
-    reason: 'upstream_error',
-    error: error instanceof Error ? error.message : String(error),
-  };
+function describeFailure(
+  barcode: string,
+  error: unknown,
+  hintFor: (reason: FailureReason) => string,
+): FailedFetch {
+  const raised = error instanceof McpError ? error.data?.reason : undefined;
+  const reason = FAILURE_REASONS.find((known) => known === raised) ?? 'upstream_error';
+  const text = error instanceof Error ? error.message : String(error);
+  const message = /[.!?]$/.test(text) ? text : `${text}.`;
+  return { barcode, reason, error: `${message} ${hintFor(reason)}` };
 }
 
 /**
@@ -72,7 +82,11 @@ function describeFailure(barcode: string, error: unknown): FailedFetch {
  * is the one that cannot — the tool's own contract for it says the request will be refused again —
  * so an all-rejected batch is never told to wait and retry.
  */
-const RETRYABLE_REASONS = new Set(['upstream_error', 'upstream_timeout', 'rate_limited']);
+const RETRYABLE_REASONS: ReadonlySet<string> = new Set<FailureReason>([
+  'upstream_error',
+  'upstream_timeout',
+  'rate_limited',
+]);
 
 /**
  * The closing line of a batch in which no barcode resolved to a product. The structured result
@@ -80,7 +94,7 @@ const RETRYABLE_REASONS = new Set(['upstream_error', 'upstream_timeout', 'rate_l
  * while a `not_found` barcode was answered for — so the text reads them off rather than flattening
  * both into one "no products found" that fits neither.
  */
-function zeroFoundSummary(notFound: string[], failed: FailedFetch[]): string {
+function zeroFoundSummary(notFound: string[], failed: readonly { reason: string }[]): string {
   const uncheckable = failed.length > 0;
   const missing = notFound.length > 0;
 
@@ -258,34 +272,38 @@ export const offCompareProductsTool = tool('off_compare_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable — surfaced per barcode in failed[]',
+      when: "Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, or is unreachable for a barcode — reported in that barcode's failed entry rather than failing the call",
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the barcodes listed in failed after a brief pause. Rows that already resolved are kept, so only the failures need repeating.',
     },
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: 'Open Food Facts did not answer within the request deadline — surfaced per barcode in failed[]',
+      when: "Open Food Facts did not answer a barcode within the request deadline, or answered 408, 425, or 504 — reported in that barcode's failed entry rather than failing the call",
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the barcodes listed in failed, or fetch them one at a time with off_get_product to reduce the load per request.',
     },
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Open Food Facts answers 4xx or 501 Not Implemented for a barcode — surfaced per barcode in failed[]',
+      when: "Open Food Facts refuses a barcode with a 4xx other than 404, 408, 425, or 429, or with 501 Not Implemented — reported in that barcode's failed entry rather than failing the call",
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Do not retry unchanged. Check the digits of the barcodes listed in failed, then look them up individually with off_get_product.',
     },
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: "This server's own per-minute request budget is spent, or Open Food Facts answers 429 — surfaced per barcode in failed[]",
+      when: "This server's own per-minute product budget is spent, or Open Food Facts answers 429 — reported in that barcode's failed entry rather than failing the call",
       retryable: true,
+      thrownBy: 'service',
       recovery:
-        'Wait the seconds given in the failed entry, then retry only those barcodes. Compare fewer barcodes per call to stay inside the budget.',
+        'Wait the seconds the failed entry names, or about a minute when it names none, then retry only those barcodes. Compare fewer barcodes per call to stay inside the budget.',
     },
   ],
 
@@ -311,7 +329,13 @@ export const offCompareProductsTool = tool('off_compare_products', {
       const result = settlements[i] as PromiseSettledResult<RawProduct | null>;
 
       if (result.status === 'rejected') {
-        failed.push(describeFailure(barcode, result.reason));
+        failed.push(
+          describeFailure(
+            barcode,
+            result.reason,
+            (reason) => ctx.recoveryFor(reason).recovery.hint,
+          ),
+        );
         continue;
       }
 

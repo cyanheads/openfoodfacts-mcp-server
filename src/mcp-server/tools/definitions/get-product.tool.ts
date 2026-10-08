@@ -580,7 +580,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Barcode status:0 — not present in any contributor record',
+      when: 'Open Food Facts answers HTTP 404 or status 0 for the barcode — no contributor has recorded it',
       severity: 'notice',
       recovery:
         'Try off_search_products with the product name or brand to find the correct barcode, or check that the barcode digits are correct.',
@@ -588,7 +588,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -597,7 +597,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: 'Open Food Facts did not answer within the request deadline',
+      when: 'Open Food Facts did not answer within the request deadline, or answered 408, 425, or 504',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -606,7 +606,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Open Food Facts answers 4xx for something other than a missing barcode, or 501 Not Implemented',
+      when: 'Open Food Facts refuses the request with a 4xx other than 404, 408, 425, or 429, or with 501 Not Implemented',
       retryable: false,
       thrownBy: 'service',
       recovery:
@@ -615,11 +615,11 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: "This server's own per-minute request budget is spent, or Open Food Facts answers 429",
+      when: "This server's own per-minute product budget is spent, or Open Food Facts answers 429",
       retryable: true,
       thrownBy: 'service',
       recovery:
-        'Wait the seconds given in data.retryAfter, then retry. Spread lookups out rather than issuing them in a burst.',
+        'Wait the seconds given in data.retryAfter, or about a minute when it is absent, then retry. Spread lookups out rather than issuing them in a burst.',
     },
   ],
 
@@ -636,7 +636,6 @@ export const offGetProductTool = tool('off_get_product', {
     if (!product) {
       throw ctx.fail('not_found', `Barcode ${input.barcode} not found in Open Food Facts`, {
         barcode: input.barcode,
-        ...ctx.recoveryFor('not_found'),
       });
     }
 
