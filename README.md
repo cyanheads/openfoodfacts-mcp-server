@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,65 +29,48 @@
 
 ## Overview
 
-Food product data from Open Food Facts, a crowd-sourced database of 3M+ packaged food products. Look up items by barcode, search by text and nutrition/allergen/label tags, compare products side-by-side, and resolve everyday terms to the canonical tag vocabulary from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ products. Look up items by barcode, search by text, tags, allergens, and nutrient thresholds, compare products side by side, and resolve everyday terms to the canonical tags the filters take. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
 ### Tools
 
 | Tool | Description |
 |:-----|:------------|
-| `off_get_product` | Fetch a packaged food product by barcode. Returns name, brand, quantity, ingredients, declared and trace allergens, additives, the vegan/vegetarian/palm-oil analysis, Nutri-Score, NOVA group, Green-Score, nutrition per 100g/serving, categories, labels, countries of sale, and data completeness. |
-| `off_search_products` | Search by text query, structured tag filters (category, brand, labels, allergen, trace, vegan/vegetarian/palm-oil verdict, additive, Nutri-Score grade, NOVA group, country), allergen and trace exclusions, and numeric per-100 g nutrient thresholds. Returns summary rows with barcodes for follow-up lookups. |
-| `off_compare_products` | Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy, macros, salt, Nutri-Score, NOVA, and Green-Score. |
-| `off_browse_taxonomy` | Resolve a human term to the canonical tag ID (categories, labels, allergens, additives, countries, NOVA groups, Nutri-Score grades) that `off_search_products` filters on, against the live Open Food Facts taxonomy. |
+| `off_get_product` | Fetch one product by barcode: ingredients, allergens and traces, additives, scores, nutrition, and tags |
+| `off_search_products` | Search by text, tag filters, allergen exclusions, and per-100 g nutrient thresholds; returns summary rows with barcodes |
+| `off_compare_products` | Compare 2–10 products by barcode on per-100 g nutrition, Nutri-Score, NOVA, and Green-Score |
+| `off_browse_taxonomy` | Resolve a human term to the canonical tag ID that `off_search_products` filters on |
 
 ## Capability reference
 
 ### `off_get_product` <sub>tool</sub>
 
-- Accepts every barcode Open Food Facts serves: digits only, 4–40 digits after any leading zeros — EAN-13, EAN-8, UPC-A, UPC-E, and the shorter and longer codes the database also holds
-- Returns ingredients (raw text and parsed list with percent estimates, vegan/vegetarian flags, and each entry's sub-ingredients nested under it — wheat flour under "cereal", palm oil under "vegetable oils" — up to three levels deep), all 14 major allergens as tag IDs, E-number additives, Nutri-Score (`a`–`e`, `unknown`, `not-applicable`), NOVA 1–4, Green-Score (`a-plus`, `a`–`f`, `unknown`, `not-applicable`), every nutrient Open Food Facts holds per 100g and per serving, the serving size those per-serving figures are measured against, categories/labels/packaging/origins/countries of sale as canonical tag IDs, front image URL, and data completeness score (0–1)
-- `traces_tags` carries the "may contain" allergen warning separately from the declared `allergens_tags`; `["en:none"]` is the label stating no traces, while an empty array means not yet entered — never trace-free
-- `ingredients_analysis_tags` carries the vegan, vegetarian, and palm-oil verdicts Open Food Facts computes itself, including its "maybe" states, rather than leaving the per-ingredient flags to be aggregated by the caller
-- Optional `fields` parameter restricts the response to a subset (e.g., scores only, or nutrition only); a field that cannot be read on its own arrives with what it depends on — `nutriments` brings the serving size its per-serving figures are measured against — and `requested_fields` echoes the full set that was fetched
-- Open Food Facts is crowd-sourced — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product
-- A barcode no contributor has recorded raises the `not_found` error carrying a recovery hint — it is never returned as an empty result
+- `barcode` is digits only, 4–40 digits after any leading zeros; optional `fields` trims the response and pulls in what a field depends on (`nutriments` brings the serving size), with `requested_fields` echoing what was fetched
+- Returns ingredients (raw text plus a parsed tree up to three levels deep with `percent_estimate`), `allergens_tags`, `traces_tags`, `additives_tags`, `ingredients_analysis_tags` (vegan, vegetarian, palm-oil verdicts), `nutriscore_grade`, `nova_group`, `ecoscore_grade` (Green-Score), `nutriments` per 100 g and per serving, category/label/packaging/origin/country tags, `image_url`, and `completeness` (0–1)
+- `traces_tags: ["en:none"]` means the label states no traces, while an empty array means none entered yet; a barcode no contributor has recorded fails as `not_found`
 
 ---
 
 ### `off_search_products` <sub>tool</sub>
 
-- Full-text `query` plus structured tag filters — `categories_tag`, `brands_tag`, `labels_tag` (one label, or an array that must all apply), `allergens_tag`, `traces_tag` (the "may contain" warning), `ingredients_analysis_tag` (one of the 12 vegan, vegetarian, and palm-oil verdicts), `additives_tag`, `nutrition_grade` (a–e), `nova_group` (1–4), `countries_tag` — and numeric `nutrient_filters`, all combining as AND; tag values are canonical IDs, resolved via `off_browse_taxonomy` (`brands_tag` matches an exact slug, not free text)
-- `exclude_allergens` and `exclude_traces` drop products that declare an allergen or warn of a trace, on both paths. Each value must be an allergen tag the Open Food Facts vocabulary confirms — an unrecognized one would exclude nothing, so it is rejected before any search is sent. A product with no allergen or trace data entered passes an exclusion, and every response carrying one says so and points to `off_get_product` for a per-product check
-- Every word of `query` must match a product's name, generic name, categories, labels, or brand (ingredients and quantity are not searched), in any of the 31 languages the text index analyzes, so a product named only in French or Russian is found by that name; stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit") are not required, and `query` takes at most 24 words
-- On a search carrying `query` or `nutrient_filters`, each tag value is resolved to its canonical form before it is sent — a brand name is slugged (`Nutella` → `nutella`), and a case variant, synonym, or singular resolves where the Open Food Facts vocabulary confirms it (`US` → `en:united-states`, `en:peanut` → `en:peanuts`); anything unconfirmed is matched exactly, and an empty result names which values were
-- Numeric `nutrient_filters` express per-100 g thresholds over `energy-kcal`, `fat`, `saturated-fat`, `carbohydrates`, `sugars`, `fiber`, `proteins`, `salt`, and `sodium` — each a `{ nutrient, operator, value }` triple with `lt` / `lte` / `gt` / `gte`; pair two entries on one nutrient for a range. They AND with every other filter and are served by the text backend, so supplying one routes the search there even without `query`
-- `additives_tag` filters only on searches carrying neither `query` nor `nutrient_filters` — both route to a backend with no additives field, so the pairing is rejected up front rather than silently returning zero hits
-- Pagination via `page` (1-based) and `page_size` (1–50, default 20); tag-only searches are served through page 10, and text searches serve only the first 10,000 results (`page * page_size` beyond that); a request past either bound is rejected before it is sent, and `last_page` reports the deepest page that can be requested
-- `total` is exact on tag-only searches; text searches stop counting at 10,000 and set `total_is_lower_bound: true` with the count rendered as `10000+`
-- The two paths read different indexes: a search carrying `query` is answered by a text index that lags the live database, and says so on both response surfaces; a tag-only search reads the live database. A recently contributed product can be missing from the first and present in the second
-- `sort_by` (`last_modified_t`, `unique_scans_n`, `created_t`, `popularity_key`) orders newest or highest first on both paths; omitting it leaves text searches relevance-ranked
-- A page past the end of a result set is reported as an exhausted page naming the deepest page that holds products, not as a zero-match search — the broaden-the-filters guidance appears only when nothing matched
-- Returns summary rows (barcode, name, brand, Nutri-Score, NOVA, categories) — chain to `off_get_product` for full label data; counts reflect contributed products, not the market. Every returned barcode is one `off_get_product` accepts: a match Open Food Facts stores under a code it cannot serve (`00000636`) is left off the page and counted in `omitted`
-- Own client-side budget of ~10 requests/min, kept well inside what Open Food Facts asks of clients
+- `query` (up to 24 words; every word except common stop words must match the name, generic name, categories, labels, or brand) plus tag filters `categories_tag`, `brands_tag`, `labels_tag` (up to 10, all must apply), `allergens_tag`, `traces_tag`, `ingredients_analysis_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, the `exclude_allergens` / `exclude_traces` lists (up to 14 each), and up to 18 per-100 g `nutrient_filters`, all combined as AND; `page_size` 1–50 (default 20), optional `sort_by`
+- Summary rows carry `barcode`, `product_name`, `brands`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, and `categories_tags`, alongside `total`, `total_is_lower_bound`, `last_page`, and `omitted`; responses using an exclusion carry `exclusion_coverage`, since products with no allergen data entered pass it
+- `query` or `nutrient_filters` routes the search to a text index that lags the live database (flagged in `text_index_snapshot`), serves only the first 10,000 results, and rejects `additives_tag` as `additives_filter_needs_tag_search`; tag-only searches read the live database through page 10, and a page past either bound fails as `page_out_of_range`
 
 ---
 
 ### `off_compare_products` <sub>tool</sub>
 
-- Accepts 2–10 barcodes, compared in the order provided
-- Returns a normalized comparison table: energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score; missing nutrition data is preserved as `null`, never imputed
-- `not_found` lists barcodes with no contributor record (not an error — the product may simply not be entered yet)
-- `failed` lists barcodes whose fetch itself failed, with a per-barcode reason — kept separate from `not_found`, and a failed barcode never blocks the rows that did resolve
+- 2–10 `barcodes`, returned one row each in input order
+- Rows carry `found`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, per-100 g energy, fat, saturated fat, sugars, salt, protein, and fiber, and `completeness`; missing values stay absent, never imputed
+- `not_found` lists barcodes with no contributor record and `failed` lists fetches that failed, each with a `reason`; a failed barcode gets no row and never blocks the rest
 
 ---
 
 ### `off_browse_taxonomy` <sub>tool</sub>
 
-- Facets `categories`, `labels`, `allergens`, `additives`, `countries` resolve live against the Open Food Facts taxonomy (case-insensitive substring match on tag ID, display name, or a common synonym — "shellfish" resolves to `en:crustaceans`); upstream tags are often plural, so pass the returned `id` through unchanged. Among the live matches, the tag spelling the term itself ranks first (`lentil` → `en:lentils` ahead of `en:lentil-soups`), so a small `limit` does not cut it
-- `nova_groups` and `nutrition_grades` are closed vocabularies, returned complete, with bare `"1"`–`"4"` / `"a"`–`"e"` ids
-- Live lookups fall back to a small in-process sample when Open Food Facts is unreachable or the budget is spent, and say so rather than failing; omitting `search` returns only that sample, since Open Food Facts can't enumerate a full facet — no `total_in_facet` is reported for the open facets
-- `limit` controls results (1–100, default 20); there is no offset or page — narrow the search term instead
-- Own client-side budget of ~10 requests/min, separate from the search budget
+- `facet` is one of `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`; `search` matches a substring of the tag ID, name, or a synonym ("shellfish" → `en:crustaceans`); `limit` 1–100 (default 20), with no paging
+- Returns `tags[]` of `id` and `name`, where `id` goes to `off_search_products` unchanged; `nova_groups` and `nutrition_grades` come back complete with `total_in_facet`
+- The five open facets resolve against the live Open Food Facts taxonomy and fall back to a small offline sample, with a `notice`, when it is unreachable or the budget is spent; omitting `search` returns only that sample
 
 ## Features
 
@@ -95,18 +78,18 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 Open Food Facts-specific:
 
-- No API key required — the identifying `User-Agent` header (required by OFF terms) is baked into the service layer
-- Token-bucket rate limiting per endpoint class: product reads (~15/min), search (~10/min), taxonomy resolution (~10/min). The product and search defaults are the per-IP ceilings Open Food Facts publishes; lower them on a shared outbound IP. Budgets count upstream requests, so a retried request spends its own slot and a budget exhausted mid-retry surfaces as `rate_limited` rather than sending. A local refusal says so — it never reports itself as an Open Food Facts rate limit
-- Automatic retry (4 attempts, 500ms base) for transient failures only — 5xx other than 501, timeouts, and 429 (honoring `Retry-After`), with HTML error page detection for 503 during high load. The HTTP status decides: a 4xx or a 501 is sent once and never retried, and the upstream's own explanation is surfaced instead — a rendered error page served with a refusal is reported as a refusal, not as load
-- Nutriments normalized from raw hyphenated keys (`energy-kcal_100g`) to underscore form — the `_100g` and `_serving` variants of every nutrient on the record, with the macros as named fields and the rest in an open map that carries each nutrient's own unit (micronutrients are reported in grams, so calcium `0.071` is 71 mg)
-- Live tag resolution for `off_browse_taxonomy` against the Open Food Facts taxonomy, merged behind a small in-process sample that covers offline operation and is authoritative for E-number lookups, which the upstream suggester answers poorly
+- No API key; the identifying `User-Agent` Open Food Facts' terms require is built in
+- Per-endpoint request budgets (product 15/min, search 10/min, taxonomy 10/min), counted per upstream attempt; transient failures (5xx other than 501, timeouts, 429 with `Retry-After`) retry up to 4 attempts, while a 4xx or 501 is sent once
+- Nutriments normalized from hyphenated keys (`energy-kcal_100g` → `energy_kcal_100g`), with named macros plus `additional_100g` / `additional_serving` maps that carry each nutrient's own unit
+- Tag filters take canonical IDs (`en:organic`, `en:no-gluten`); on text searches a case variant, synonym, or brand name is canonicalized before it is sent (`US` → `en:united-states`, `Nutella` → `nutella`)
+- Every field is contributor-entered, so a missing one means not yet recorded rather than absent from the product; Nutri-Score, NOVA, and Green-Score are Open Food Facts' own computed grades, returned as-is, and carry regional formula caveats
 
 Agent-friendly output:
 
-- Per-serving nutrition always carries its denominator — `serving_size` as printed plus the parsed `serving_quantity`/`serving_quantity_unit`, and an explicit note when Open Food Facts has recorded none
-- Computed scores (Nutri-Score, NOVA, Green-Score) returned as-is with regional caveat notes — not interpreted or normalized to health claims
-- Graceful partial failure — `off_compare_products` returns resolved rows even when others fail, splitting confirmed-missing barcodes into `not_found` and failed fetches into `failed`
-- Every failure carries a declared `reason` and a recovery hint on both client surfaces — timeouts, upstream outages, upstream rejections, and rate limits each resolve to their own error code and their own next step
+- Per-serving nutrition carries its denominator: `serving_size`, `serving_quantity`, `serving_quantity_unit`, and a note when none is recorded
+- Graceful partial failure: `off_compare_products` returns resolved rows alongside `not_found` and `failed`
+- Explicit count bounds: `total_is_lower_bound`, `last_page`, and `omitted` on searches, and an exhausted page is reported as such rather than as zero matches
+- Typed failures: each carries a declared `reason` (`upstream_error`, `upstream_timeout`, `upstream_rejected`, `rate_limited`, plus per-tool input reasons) and a recovery hint on both client surfaces
 
 ## Getting started
 
@@ -190,8 +173,8 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
-- No API key needed. The server sends an identifying `User-Agent` to comply with Open Food Facts' terms of service — this is baked in and requires no configuration.
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- No API key or account. Open Food Facts asks clients to identify themselves, and the server's `User-Agent` does so without configuration.
 
 ### Installation
 
@@ -222,19 +205,17 @@ cp .env.example .env
 
 ## Configuration
 
-All configuration is validated at startup via Zod schemas in `src/config/server-config.ts`.
-
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `OFF_BASE_URL` | Open Food Facts API base URL. Override for local testing against a mock server. | `https://world.openfoodfacts.org` |
-| `OFF_RATE_LIMIT_PRODUCT` | Product read rate limit (requests/min). Matches the 15 req/min/IP Open Food Facts documents for product reads. | `15` |
-| `OFF_RATE_LIMIT_SEARCH` | Search rate limit (requests/min). | `10` |
-| `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy resolution rate limit (requests/min), shared by `off_browse_taxonomy`, tag-value resolution on text searches, and the check on allergen and trace exclusions. A spent budget falls back to the offline sample, or to the tag value as normalized, rather than failing — except that an exclusion it could not check is refused as retryable. | `10` |
+| `OFF_BASE_URL` | Open Food Facts API base URL. | `https://world.openfoodfacts.org` |
+| `OFF_RATE_LIMIT_PRODUCT` | Product read budget (requests/min). The default is Open Food Facts' published per-IP limit; lower it on a shared outbound IP. | `15` |
+| `OFF_RATE_LIMIT_SEARCH` | Search budget (requests/min). The default is Open Food Facts' published per-IP limit. | `10` |
+| `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy lookup budget (requests/min), shared by `off_browse_taxonomy`, tag canonicalization on text searches, and exclusion checks. | `10` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `warning`, `error`). | `info` |
-| `LOGS_DIR` | Log file directory (Node.js only). | `<project-root>/logs` |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log each failed tool call's arguments and result, redacted by key name and capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (default `16384`). A secret inside a free-form value is not redacted. | `false` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
@@ -280,7 +261,8 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/services/openfoodfacts` | Open Food Facts API client — HTTP, rate limiting, retry, field normalization. |
-| `src/services/taxonomy` | Tag vocabulary service — live resolution, offline sample, merge and fallback policy for `off_browse_taxonomy`, and tag-value canonicalization for text searches. |
+| `src/services/taxonomy` | Tag vocabulary — live resolution, offline sample, and tag-value canonicalization. |
+| `src/utils` | Markdown escaping for contributor-entered values in text output. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide
@@ -292,15 +274,9 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 - Register new tools via the barrel in `src/mcp-server/tools/definitions/index.ts`
 - Wrap external API calls: validate raw → normalize to domain type → return output schema; never fabricate missing fields
 
-## Attribution
-
-Open Food Facts data is released under the [Open Database License (ODbL) 1.0](https://opendatacommons.org/licenses/odbl/1.0/). Downstream use must cite [Open Food Facts](https://world.openfoodfacts.org/).
-
 ## Contributing
 
-Bugs, feature requests, and documentation gaps all belong in an issue — see [`CONTRIBUTING.md`](./.github/CONTRIBUTING.md) for the forms, what makes a report actionable, and how to tell a server bug from a framework one. Vulnerabilities go through [private disclosure](./.github/SECURITY.md), never a public issue.
-
-Working on the code? Both gates must be green:
+Issues are welcome — see [`CONTRIBUTING.md`](./.github/CONTRIBUTING.md) for the forms and what makes a report actionable. Report vulnerabilities through [private disclosure](./.github/SECURITY.md), never a public issue. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
@@ -309,4 +285,4 @@ bun run test
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) for details.
+Apache-2.0 — see [LICENSE](LICENSE) for details. Open Food Facts data is released under the [Open Database License (ODbL) 1.0](https://opendatacommons.org/licenses/odbl/1.0/); downstream use must cite [Open Food Facts](https://world.openfoodfacts.org/).
