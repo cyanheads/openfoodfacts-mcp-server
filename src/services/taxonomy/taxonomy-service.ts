@@ -643,7 +643,8 @@ export class TaxonomyService {
        * receives the tag the term names and no reordering can reach it. An E-number term answers
        * the whole 650-tag additive vocabulary, where a real tag can sit past any smaller request:
        * `en:e314` is 229th. It costs at most about 119 KB and no extra request, and the endpoint
-       * has no offset, so reading everything is what makes the match count below exact.
+       * has no offset, so reading everything is what makes the match count below exact, up to the
+       * size a lookup asks for.
        */
       live = await this.off.suggestTaxonomy(taxonomyName, term, ctx);
     } catch (error) {

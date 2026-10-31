@@ -77,7 +77,7 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 
 ### `off_browse_taxonomy` <sub>tool</sub>
 
-- `facet` is one of `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`; `search` matches a substring of the tag ID, name, or a synonym ("shellfish" → `en:crustaceans`); `limit` (default 20) returns up to 200 per call, with no input maximum (a larger value returns 200); a cut result says how many matched; no paging. Each lookup reads the term's whole answer from Open Food Facts, so the match count is exact: an E-number term such as `e314` resolves to `en:e314`
+- `facet` is one of `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`; `search` matches a substring of the tag ID, name, or a synonym ("shellfish" → `en:crustaceans`); `limit` (default 20) returns up to 200 per call, with no input maximum (a larger value returns the first 200); a cut result says how many matched; no paging. Each lookup asks for up to 2,000 suggestions, above the largest answer measured (1,313), so an E-number term such as `e314` resolves to `en:e314` and the match count is exact below that size
 - Returns `tags[]` of `id` and `name`, where `id` goes to `off_search_products` unchanged; `nova_groups` and `nutrition_grades` come back complete with `total_in_facet`
 - The five open facets resolve against the live Open Food Facts taxonomy and fall back to a small offline sample, with a `notice`, when it is unavailable; omitting `search` returns only that sample
 
@@ -88,7 +88,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Open Food Facts-specific:
 
 - No API key; the identifying `User-Agent` Open Food Facts' terms require is built in
-- Per-endpoint request budgets (product 15/min, search 10/min, taxonomy 10/min); transient failures retry up to 4 attempts within a total deadline of 35 s for a product or search read and 20 s for a taxonomy lookup (55 s for a search that canonicalizes a tag first), after which the read fails as `upstream_timeout`
+- Per-endpoint request budgets (product 15/min, search 10/min, taxonomy 10/min); transient failures retry up to 4 attempts within a total deadline of 35 s for a product or search read and 20 s for a taxonomy lookup (one caller's search that canonicalizes a tag first can spend 55 s), after which the read fails as `upstream_timeout`, or `rate_limited` when its last finished attempt answered 429
 - Nutriments normalized from hyphenated keys (`energy-kcal_100g` → `energy_kcal_100g`), with `additional_100g` / `additional_serving` maps that label each nutrient with its unit
 - Tag filters take canonical IDs (`en:organic`, `en:no-gluten`); on text searches a case variant, synonym, or brand name is canonicalized first (`US` → `en:united-states`)
 - Every field is contributor-entered, so a missing one means not yet recorded, except that a read of prepared-product nutrition omits as-sold figures the record can still hold; Nutri-Score, NOVA, and Green-Score are Open Food Facts' own computed grades, returned as-is, and carry regional formula caveats
@@ -98,7 +98,7 @@ Agent-friendly output:
 - Per-serving nutrition carries its denominator: `serving_size`, `serving_quantity`, `serving_quantity_unit`, and a note when none is recorded
 - Graceful partial failure: `off_compare_products` returns resolved rows alongside `not_found` and `failed`
 - Explicit count bounds: `total_is_lower_bound`, `last_page`, `omitted`, and `outside_constraints` on searches
-- Typed failures: each carries a declared `reason` (`upstream_error`, `upstream_timeout`, `upstream_rejected`, `rate_limited`, plus per-tool input reasons) and a recovery hint; an incomplete upstream response is a retryable `upstream_error`, never an empty result or a not-found
+- Typed failures: each carries a declared `reason` (`upstream_error`, `upstream_timeout`, `upstream_rejected`, `rate_limited`, plus per-tool input reasons) and a recovery hint; an incomplete upstream response is a retryable `upstream_error`, or `upstream_timeout` when search flags a timeout, never an empty result or a not-found
 
 ## Getting started
 

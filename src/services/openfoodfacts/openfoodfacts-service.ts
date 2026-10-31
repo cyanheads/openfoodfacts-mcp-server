@@ -618,7 +618,7 @@ function wordGroup(word: string): string {
  * everything it matched below that (live, 2026-10-30: `a` on categories is 249 at every size from
  * 500 to 20,000, and `size=201` answers 201). This sits above the largest answer measured, 1,313
  * for `c` on categories, so a lookup reads a term's whole answer in one request and a count taken
- * from it is exact.
+ * from it is exact. An answer that reached this size would be cut here with nothing flagging it.
  */
 const MAX_AUTOCOMPLETE_SIZE = 2000;
 
