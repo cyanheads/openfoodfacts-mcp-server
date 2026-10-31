@@ -1652,9 +1652,7 @@ describe('off_compare_products', () => {
         { barcode: '12345678', found: false },
         { barcode: '87654321', found: false },
       ]);
-      const text = contractText(result);
-      expect(text).not.toMatch(/prepared|as-sold/i);
-      expect(text).not.toContain('### Nutrition');
+      expect(contractText(result)).toContain('holds no contributor record for any of them.');
     });
 
     it('escapes a prepared row label in its table and its note', async () => {
@@ -1669,10 +1667,20 @@ describe('off_compare_products', () => {
 
     it('holds exactly the as-sold column keys, each on the stated basis', () => {
       const prepared = ROW.prepared.unwrap().shape;
-      const columns = Object.keys(ROW).filter((key) => key.endsWith('_100g'));
+      const columns = [
+        'energy_kcal_100g',
+        'fat_100g',
+        'saturated_fat_100g',
+        'carbohydrates_100g',
+        'sugars_100g',
+        'salt_100g',
+        'proteins_100g',
+        'fiber_100g',
+      ] as const;
 
+      expect(Object.keys(ROW).filter((key) => key.endsWith('_100g'))).toEqual(columns);
       expect(Object.keys(prepared)).toEqual(columns);
-      for (const key of Object.keys(prepared) as (keyof typeof prepared)[]) {
+      for (const key of columns) {
         expect(prepared[key].description, key).toContain('per 100 g, or per 100 ml for liquids');
         expect(prepared[key].description, key).toMatch(/prepared/);
       }
