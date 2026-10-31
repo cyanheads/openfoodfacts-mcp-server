@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-30
+
+Checks every nutrient-filtered row against the caller bounds, caps each read with a total retry deadline, treats a flagged search timeout and a dropped connection as declared failures, labels prepared figures on product reads, adds prepared and carbohydrate figures to comparisons, and returns up to 200 taxonomy tags.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-28
 
 Publishes the openfoodfacts-guide Agent Skill over MCP, renders search notices as block quotes with escaped caller text, and moves to mcp-ts-core 0.13.18 (MCP SDK 2.4; a 0.13.16 HTTP per-request memory leak fixed).
