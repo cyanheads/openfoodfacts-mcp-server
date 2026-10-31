@@ -8,10 +8,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import {
-  getOpenFoodFactsService,
-  MAX_AUTOCOMPLETE_SIZE,
-} from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 export type TaxonomyEntry = {
   id: string;
@@ -554,12 +551,7 @@ export class TaxonomyService {
     const { trimmed, normalized, term, isMatch } = value;
     let live: TaxonomyEntry[];
     try {
-      live = await this.off.suggestTaxonomy(
-        LIVE_TAXONOMY_NAME[facet],
-        term,
-        MAX_AUTOCOMPLETE_SIZE,
-        ctx,
-      );
+      live = await this.off.suggestTaxonomy(LIVE_TAXONOMY_NAME[facet], term, ctx);
     } catch (error) {
       // A caller that went away ends the call as cancelled; only an upstream failure degrades.
       if (ctx.signal.aborted) throw error;
@@ -645,14 +637,15 @@ export class TaxonomyService {
     let live: TaxonomyEntry[];
     try {
       /**
-       * The whole pool the endpoint honors, not a request sized to the limit. Upstream lists a
-       * term's compound tags ahead of the plain one (`lentil` answers eight `en:lentil-*`
-       * suggestions with `en:lentils` last; `cheese` puts `en:cheeses` 37th of 69), so a
-       * limit-sized request never receives the tag the term names and no reordering can reach it.
-       * It costs a few kilobytes and no extra request, and anything past the limit still reads as
-       * truncation — the endpoint has no offset, so over-asking is the only way to know more exist.
+       * The term's whole answer, not a request sized to the limit. Upstream lists a term's compound
+       * tags ahead of the plain one (`lentil` answers eight `en:lentil-*` suggestions with
+       * `en:lentils` last; `cheese` puts `en:cheeses` 37th of 69), so a limit-sized request never
+       * receives the tag the term names and no reordering can reach it. An E-number term answers
+       * the whole 650-tag additive vocabulary, where a real tag can sit past any smaller request:
+       * `en:e314` is 229th. It costs at most about 119 KB and no extra request, and the endpoint
+       * has no offset, so reading everything is what makes the match count below exact.
        */
-      live = await this.off.suggestTaxonomy(taxonomyName, term, MAX_AUTOCOMPLETE_SIZE, ctx);
+      live = await this.off.suggestTaxonomy(taxonomyName, term, ctx);
     } catch (error) {
       if (ctx.signal.aborted) throw error;
       const cause = error instanceof Error ? error.message : String(error);
@@ -676,7 +669,7 @@ export class TaxonomyService {
     /**
      * Held to the same substring rule the facet documents. Upstream matches whole words against
      * display names and falls back to loosely-related suggestions when nothing matches — an
-     * E-number query returns a page of unrelated E-numbers — so unfiltered pass-through would
+     * E-number query returns the whole additive vocabulary — so unfiltered pass-through would
      * answer `e330` with tags that do not contain it. Measured across ordinary terms (cheese,
      * kombucha, olive oil, organic, tofu, …) this drops nothing and removes only that noise.
      *

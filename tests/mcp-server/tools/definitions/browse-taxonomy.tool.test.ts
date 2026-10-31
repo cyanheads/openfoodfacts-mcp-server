@@ -2,7 +2,7 @@
  * @fileoverview Tests for off_browse_taxonomy — live taxonomy resolution against the
  * search-a-licious autocomplete endpoint, the offline-sample merge and fallback (GH issue #14),
  * bare NOVA group tag IDs (GH issue #15), exact-term ranking of live suggestions (GH issue #42),
- * the tag output shape (GH issue #43), the per-call limit cap (GH issue #57), and caller
+ * the tag output shape (GH issue #43), the per-call limit cap (GH issues #57 and #70), and caller
  * cancellation (GH issue #60).
  *
  * The taxonomy service now makes an HTTP call for the five open facets, so these stub global
@@ -11,7 +11,7 @@
  * @module tests/mcp-server/tools/definitions/browse-taxonomy.tool.test
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -47,6 +47,17 @@ function mockResponse(body: unknown, status = 200): Response {
 /** Stub the autocomplete endpoint with a fixed option list. */
 function stubAutocomplete(options: Option[]): void {
   global.fetch = vi.fn().mockResolvedValue(mockResponse({ took: 1, timed_out: false, options }));
+}
+
+/** Stub the autocomplete endpoint as it answers live: the first `size` of the whole answer. */
+function stubWholeAnswer(options: Option[]): void {
+  global.fetch = vi.fn(async (input: unknown) =>
+    mockResponse({
+      took: 1,
+      timed_out: false,
+      options: options.slice(0, Number(new URL(String(input)).searchParams.get('size'))),
+    }),
+  );
 }
 
 /** The URL the stubbed fetch was called with, parsed. */
@@ -228,10 +239,10 @@ describe('off_browse_taxonomy', () => {
       expect(url.pathname).toBe('/autocomplete');
       expect(url.searchParams.get('q')).toBe('organic');
       expect(url.searchParams.get('taxonomy_names')).toBe('label');
-      // The most the endpoint honors, not limit + 1: upstream lists compound tags ahead of the
-      // plain one, so a request sized to the limit misses the exact tag (#42). Anything past the
-      // limit still reads as truncation.
-      expect(url.searchParams.get('size')).toBe('200');
+      // The whole answer, not limit + 1: upstream lists compound tags ahead of the plain one, so a
+      // request sized to the limit misses the exact tag (#42). Anything past the limit still reads
+      // as truncation.
+      expect(url.searchParams.get('size')).toBe('2000');
     });
 
     it('maps each open facet to its upstream taxonomy name', async () => {
@@ -954,12 +965,12 @@ describe('off_browse_taxonomy', () => {
     expect(() => getTaxonomyService()).not.toThrow();
   });
 
-  // ── #57: a limit above 100 returns the first 100 ─────────────────────────
+  // ── #57, #70: a limit above 200 returns the first 200 ────────────────────
 
   describe('limit above the per-call cap (#57)', () => {
     /** `count` live suggestions for "zork", a term the offline sample holds nothing for. */
     function stubZorkMatches(count: number): void {
-      stubAutocomplete(
+      stubWholeAnswer(
         Array.from({ length: count }, (_, i) => ({ id: `en:zork-${i}`, text: `Zork ${i}` })),
       );
     }
@@ -967,49 +978,119 @@ describe('off_browse_taxonomy', () => {
     /** The truncation and notice keys a complete answer must not carry. */
     const TRUNCATION_KEYS = ['truncated', 'shown', 'cap', 'notice'] as const;
 
-    it('accepts limit 200 and rejects 201 before any lookup', async () => {
-      expect(offBrowseTaxonomyTool.input.safeParse({ facet: 'labels', limit: 200 }).success).toBe(
-        true,
-      );
+    it.each([201, 10_000, 1e21])('serves limit %d rather than refusing it', async (limit) => {
+      stubZorkMatches(3);
+
       const result = await runToolContract(offBrowseTaxonomyTool, {
         facet: 'categories',
         search: 'zork',
-        limit: 201,
+        limit,
       });
-      expect(result.isError).toBe(true);
-      expect(global.fetch).not.toHaveBeenCalled();
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { tags: unknown[] }).tags).toHaveLength(3);
     });
 
-    it('returns the first 100 of 120 matches for limit 150, naming both on both surfaces', async () => {
-      stubZorkMatches(120);
+    // 20.000000000000004 sits inside multipleOf's float tolerance, which alone would pass it.
+    it.each([0, -1, 1.5, 20.000000000000004])(
+      'refuses limit %d before any lookup',
+      async (limit) => {
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: 'zork',
+          limit,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(global.fetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([1.5, 20.000000000000004])(
+      'names the fix for fractional limit %d on both surfaces',
+      async (limit) => {
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: 'zork',
+          limit,
+        });
+
+        const { error } = result.structuredContent as {
+          error: { message: string; data?: { issues?: unknown[]; recovery?: { hint?: string } } };
+        };
+        expect(error.message).toContain('Send limit as a whole number, not a fractional one.');
+        expect(error.data?.issues).toHaveLength(1);
+        expect(error.data?.recovery?.hint).toContain('whole number');
+        expect(contractText(result)).toContain('whole number');
+      },
+    );
+
+    it('advertises a whole-number limit with no maximum', () => {
+      const { properties } = z.toJSONSchema(offBrowseTaxonomyTool.input, { io: 'input' });
+
+      expect(properties?.limit).toMatchObject({
+        type: 'number',
+        minimum: 1,
+        multipleOf: 1,
+        default: 20,
+      });
+      expect(properties?.limit).not.toHaveProperty('maximum');
+    });
+
+    it('returns the first 200 of 250 matches for limit 500, naming both on both surfaces', async () => {
+      stubZorkMatches(250);
 
       const result = await runToolContract(offBrowseTaxonomyTool, {
         facet: 'categories',
         search: 'zork',
-        limit: 150,
+        limit: 500,
       });
 
       const structured = result.structuredContent as {
         tags: { id: string }[];
         notice?: string;
       } & Record<string, unknown>;
-      expect(structured.tags).toHaveLength(100);
-      expect(structured.tags[99]?.id).toBe('en:zork-99');
-      expect(structured).toMatchObject({ truncated: true, shown: 100, cap: 100 });
+      expect(structured.tags).toHaveLength(200);
+      expect(structured.tags[199]?.id).toBe('en:zork-199');
+      expect(structured).toMatchObject({ truncated: true, shown: 200, cap: 200 });
       expect(structured.notice).toBe(
-        'limit 150 is above the 100 tags one call returns; the term matched 120 tags, and these are the first 100. Narrow the search term with a more specific word to bring the tag you need into the first 100 — there is no offset to page past them.',
+        'limit 500 is above the 200 tags one call returns; the term matched 250 tags, and these are the first 200. Narrow the search term with a more specific word to bring the tag you need into the first 200 — there is no offset to page past them.',
       );
-      // Still one lookup, at the whole pool, not sized to the limit.
+      // Still one lookup, for the whole answer, not sized to the limit.
       expect(global.fetch).toHaveBeenCalledOnce();
-      expect(fetchedUrl().searchParams.get('size')).toBe('200');
+      expect(fetchedUrl().searchParams.get('size')).toBe('2000');
       const text = contractText(result);
-      expect(text).toContain('## categories (100 entries)');
-      expect(text).toContain('limit 150 is above the 100 tags one call returns');
+      expect(text).toContain('## categories (200 entries)');
+      expect(text).toContain('limit 500 is above the 200 tags one call returns');
+    });
+
+    it('names 201 when one over the cap cuts matches', async () => {
+      stubZorkMatches(201);
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        search: 'zork',
+        limit: 201,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as {
+        tags: unknown[];
+        notice?: string;
+      } & Record<string, unknown>;
+      expect(structured.tags).toHaveLength(200);
+      expect(structured).toMatchObject({ truncated: true, shown: 200, cap: 200 });
+      expect(structured.notice).toContain('limit 201 is above the 200 tags one call returns');
+      expect(structured.notice).toContain('the term matched 201 tags');
     });
 
     it.each([
       { limit: 150, matches: 30 },
       { limit: 20, matches: 10 },
+      { limit: 150, matches: 114 },
+      { limit: 200, matches: 200 },
+      { limit: 201, matches: 200 },
+      { limit: 10_000, matches: 150 },
     ])(
       'adds no truncation fields for limit $limit when all $matches matches fit',
       async ({ limit, matches }) => {
@@ -1030,21 +1111,21 @@ describe('off_browse_taxonomy', () => {
       },
     );
 
-    it('points at a narrower term, not a larger limit, when the cap cuts matches at limit 100', async () => {
-      // A limit of 101–200 returns these same 100 tags, so "raise the cap" is a call that cannot
-      // bring the 101st match forward; only a narrower term can.
-      stubZorkMatches(120);
+    it('points at a narrower term, not a larger limit, when the cap cuts matches at limit 200', async () => {
+      // A larger limit returns these same 200 tags, so "raise the cap" is a call that cannot bring
+      // the 201st match forward; only a narrower term can.
+      stubZorkMatches(209);
 
       const result = await runToolContract(offBrowseTaxonomyTool, {
         facet: 'categories',
         search: 'zork',
-        limit: 100,
+        limit: 200,
       });
 
       const structured = result.structuredContent as { notice?: string } & Record<string, unknown>;
-      expect(structured).toMatchObject({ truncated: true, shown: 100, cap: 100 });
+      expect(structured).toMatchObject({ truncated: true, shown: 200, cap: 200 });
       expect(structured.notice).toBe(
-        'The term matched 120 tags, and these are the first 100. Narrow the search term with a more specific word to bring the tag you need into the first 100 — there is no offset to page past them.',
+        'The term matched 209 tags, and these are the first 200. Narrow the search term with a more specific word to bring the tag you need into the first 200 — there is no offset to page past them.',
       );
     });
 
@@ -1057,9 +1138,9 @@ describe('off_browse_taxonomy', () => {
       },
       {
         label: 'more matched than one call returns',
-        matches: 120,
+        matches: 250,
         notice:
-          'The term matched 120 tags, and these are the first 20. Raise limit to 100 for the first 100, or narrow the search term with a more specific word.',
+          'The term matched 250 tags, and these are the first 20. Raise limit to 200 for the first 200, or narrow the search term with a more specific word.',
       },
     ])(
       'names the match count and a real next step when limit 20 cuts matches and $label',
@@ -1114,8 +1195,110 @@ describe('off_browse_taxonomy', () => {
 
     it('says what happens above the cap in the limit description', () => {
       expect(offBrowseTaxonomyTool.input.shape.limit.description).toMatch(
-        /up to 200[^.]*returns the first 100/,
+        /at most 200: a larger value returns the first 200/,
       );
+    });
+
+    it('moves every figure in the enrichment descriptions with the cap', () => {
+      const { notice, cap } = offBrowseTaxonomyTool.enrichment ?? {};
+      expect(notice?.description).toContain('the only route past the first 200');
+      expect(notice?.description).not.toContain('100');
+      expect(cap?.description).toBe('The limit that was applied — at most 200.');
+    });
+  });
+
+  // ── #70: a lookup reads the whole answer ─────────────────────────────────
+
+  describe('the whole suggestion answer (#70)', () => {
+    /**
+     * What an E-number term answers: the 650-tag additive vocabulary, in one fixed order, with
+     * `en:e314` 229th and `en:e330` 248th (live, 2026-10-30). The rest is filler that no term here
+     * matches, so only those two can pass the substring gate.
+     */
+    const ADDITIVE_VOCABULARY = Array.from({ length: 650 }, (_, i) => {
+      if (i === 228) return { id: 'en:e314', text: 'E 314' };
+      if (i === 247) return { id: 'en:e330', text: 'E 330' };
+      return { id: `en:zz-${i}`, text: `Filler ${i}` };
+    });
+
+    /** Complete answers carry none of these. */
+    const TRUNCATION_KEYS = ['truncated', 'shown', 'cap', 'notice'] as const;
+
+    it('finds an additive past the 200th suggestion, with no notice', async () => {
+      stubWholeAnswer(ADDITIVE_VOCABULARY);
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'additives',
+        search: 'e314',
+      });
+
+      const structured = result.structuredContent as { tags: { id: string }[] } & Record<
+        string,
+        unknown
+      >;
+      expect(structured.tags).toEqual([{ id: 'en:e314', name: 'E 314' }]);
+      for (const key of TRUNCATION_KEYS) expect(structured).not.toHaveProperty(key);
+      expect(contractText(result)).toContain('en:e314');
+      expect(contractText(result)).not.toContain('tag matched');
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it('reads a full pool the gate cuts to one tag as one tag, not as truncated', async () => {
+      stubWholeAnswer(ADDITIVE_VOCABULARY);
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'additives',
+        search: 'e330',
+      });
+
+      const structured = result.structuredContent as { tags: { id: string }[] } & Record<
+        string,
+        unknown
+      >;
+      expect(structured.tags.map((tag) => tag.id)).toEqual(['en:e330']);
+      for (const key of TRUNCATION_KEYS) expect(structured).not.toHaveProperty(key);
+    });
+
+    it('counts every match a term has, past 200', async () => {
+      stubWholeAnswer(
+        Array.from({ length: 1_313 }, (_, i) => ({ id: `en:zork-${i}`, text: `Zork ${i}` })),
+      );
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        search: 'zork',
+      });
+
+      expect((result.structuredContent as { notice?: string }).notice).toContain(
+        'The term matched 1313 tags',
+      );
+    });
+
+    it('returns all 114 matches for limit 150, with no truncation fields', async () => {
+      stubWholeAnswer(
+        Array.from({ length: 114 }, (_, i) =>
+          i === 0
+            ? { id: 'en:chocolates', text: 'Chocolates' }
+            : { id: `en:chocolate-${i}`, text: `Chocolate ${i}` },
+        ),
+      );
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        search: 'chocolate',
+        limit: 150,
+      });
+
+      const structured = result.structuredContent as { tags: unknown[] } & Record<string, unknown>;
+      expect(structured.tags).toHaveLength(114);
+      for (const key of TRUNCATION_KEYS) expect(structured).not.toHaveProperty(key);
+    });
+
+    it('leaves unfiltered and closed-vocabulary calls without a lookup', async () => {
+      await runToolContract(offBrowseTaxonomyTool, { facet: 'nova_groups', limit: 500 });
+      await runToolContract(offBrowseTaxonomyTool, { facet: 'labels', limit: 500 });
+
+      expect(global.fetch).not.toHaveBeenCalled();
     });
   });
 

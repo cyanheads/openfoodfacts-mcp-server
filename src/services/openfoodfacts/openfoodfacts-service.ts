@@ -10,6 +10,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   defaultIsTransient,
   fetchWithTimeout,
+  type RetryAttempt,
   withExtra,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
@@ -20,6 +21,7 @@ import {
   type IndexedNutriments,
   indexedNutrientKey,
   type NutrientField,
+  type NutrientFilter,
   type NutrientOperator,
   type RawAutocompleteResponse,
   type RawNutriments,
@@ -33,6 +35,7 @@ import {
   type SearchParams,
   type SearchResult,
   type SearchRow,
+  WHOLE_NUMBER_NUTRIENTS,
 } from './types.js';
 
 /**
@@ -51,6 +54,19 @@ const USER_AGENT = `openfoodfacts-mcp-server/${PACKAGE_VERSION} (casey@caseyjhan
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
+/**
+ * Total budget of one autocomplete lookup, every attempt and backoff included. `REQUEST_TIMEOUT_MS`
+ * bounds one attempt only, and left alone a hung upstream holds a read for over 60 s, the default
+ * request timeout of MCP SDK clients, so the caller gives up before a typed failure reaches it.
+ * A search runs its lookups in parallel and then one search read, so one caller's longest chain
+ * is this plus `READ_RETRY_DEADLINE_MS`: 55 s. A search that joined a lookup whose first caller
+ * cancelled restarts it and can run past that (#75).
+ */
+const TAXONOMY_RETRY_DEADLINE_MS = 20_000;
+
+/** Total budget of one product or search read. See `TAXONOMY_RETRY_DEADLINE_MS`. */
+const READ_RETRY_DEADLINE_MS = 35_000;
+
 /** Headers sent on every upstream request. The identifying User-Agent is required by OFF terms. */
 const REQUEST_HEADERS: Record<string, string> = {
   'User-Agent': USER_AGENT,
@@ -59,7 +75,7 @@ const REQUEST_HEADERS: Record<string, string> = {
 
 /**
  * search.openfoodfacts.org (search-a-licious) refuses any request whose `page * page_size` exceeds
- * this many results, with an HTTP 400 naming the window. Exported so the search tool can reject
+ * this many results, with an HTTP 422 naming the window. Exported so the search tool can reject
  * those requests before they are sent. Scoped to the text path; the tag-only backend has its own,
  * page-based bound (`TAG_SEARCH_MAX_PAGE`).
  *
@@ -229,10 +245,18 @@ function publishedErrorData(data: Record<string, unknown> | undefined): Record<s
  * calling `response.json()` would fail on the already-consumed stream. A body that does not parse
  * is the same retryable `upstream_error`: left as a bare `SyntaxError`, it reached the caller as a
  * `ValidationError` naming no reason, as though the caller's input were at fault.
+ *
+ * `fetchWithTimeout` returns at the headers and hands its deadline to the body, so a body that
+ * stalls or drops fails here, outside the `toContractError` around the fetch, and is mapped here
+ * instead (see `bodyReadFailure`).
  */
 async function parseJsonBody<T>(response: Response, data: Record<string, unknown>): Promise<T> {
   const isJson = (response.headers.get('content-type') ?? '').includes('application/json');
-  const body = isJson ? undefined : await response.text();
+  const body = isJson
+    ? undefined
+    : await response.text().catch((error: unknown) => {
+        throw bodyReadFailure(error, data);
+      });
   if (body !== undefined && looksLikeHtml(body)) {
     throw contractError(
       'upstream_error',
@@ -243,7 +267,7 @@ async function parseJsonBody<T>(response: Response, data: Record<string, unknown
   try {
     return (body === undefined ? await response.json() : JSON.parse(body)) as T;
   } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
+    if (!(error instanceof SyntaxError)) throw bodyReadFailure(error, data);
     throw contractError(
       'upstream_error',
       'Open Food Facts answered with a body that is not valid JSON — the service is likely degraded.',
@@ -251,6 +275,27 @@ async function parseJsonBody<T>(response: Response, data: Record<string, unknown
       error,
     );
   }
+}
+
+/**
+ * The failure for a rejected body read. The framework's body deadline has already turned a stall
+ * and a caller abort into an `McpError`, so those keep their own paths and a cancellation stays one.
+ * Anything else is the runtime's own error for a connection closed part-way through the body: a
+ * retryable `upstream_error`, its text kept to `cause` because it names this runtime rather than
+ * Open Food Facts and can carry advice meant for fetch's caller.
+ *
+ * Mapped here, not in `toContractError`, which also catches around the fetch: everything the network
+ * can do there already arrives as an `McpError`, so what it passes through is a programming error
+ * (in `JSON.stringify` of a request body, say) that must not read as a dropped connection.
+ */
+function bodyReadFailure(error: unknown, data: Record<string, unknown>): unknown {
+  if (error instanceof McpError) return toContractError(error, data);
+  return contractError(
+    'upstream_error',
+    'Open Food Facts closed the connection before finishing its answer.',
+    data,
+    error,
+  );
 }
 
 /** A JSON object — not `null`, not an array. */
@@ -274,6 +319,20 @@ function malformedEnvelope(
   return contractError(
     'upstream_error',
     `Open Food Facts answered the ${read} with a malformed response (expected ${expected}) — the service is likely degraded.`,
+    data,
+  );
+}
+
+/**
+ * The failure for a search-a-licious answer flagged `timed_out`. Elasticsearch stopped collecting
+ * early, so the 200 carries the whole success shape over a partial or empty result, and a page or
+ * count read from it would be wrong however complete it looks. It is the retryable
+ * `upstream_timeout`, raised inside the retry boundary like an `errors` envelope.
+ */
+function timedOutAnswer(read: string, data: Record<string, unknown>): McpError {
+  return contractError(
+    'upstream_timeout',
+    `Open Food Facts timed out inside its search engine while answering the ${read}, so the answer is incomplete.`,
     data,
   );
 }
@@ -555,12 +614,13 @@ function wordGroup(word: string): string {
 }
 
 /**
- * Largest `size` the autocomplete endpoint honors. Live-verified: it returns exactly the requested
- * option count up to 200 and caps below the request above that (500 answered 249), so a request is
- * clamped here rather than sent and silently under-served. Exported because the taxonomy service
- * asks for the whole pool to rank it.
+ * Most suggestions one autocomplete lookup asks for. The endpoint honors any `size` and answers
+ * everything it matched below that (live, 2026-10-30: `a` on categories is 249 at every size from
+ * 500 to 20,000, and `size=201` answers 201). This sits above the largest answer measured, 1,313
+ * for `c` on categories, so a lookup reads a term's whole answer in one request and a count taken
+ * from it is exact.
  */
-export const MAX_AUTOCOMPLETE_SIZE = 200;
+const MAX_AUTOCOMPLETE_SIZE = 2000;
 
 /**
  * Reserved characters in search-a-licious's Lucene-style `q` syntax (field:value clauses, boolean
@@ -588,6 +648,21 @@ const NUTRIENT_RANGE_FORMS: Record<NutrientOperator, (value: number) => string> 
   gt: (value) => `{${value} TO *}`,
   gte: (value) => `[${value} TO *]`,
 };
+
+/**
+ * The clause a nutrient constraint sends. On a `WHOLE_NUMBER_NUTRIENTS` field the index rounds a
+ * fractional lower bound up and stores 3.53 as 3, so `gte 3.5` and `gt 3` both exclude real matches
+ * (`sugars gt 3` lost 290 of 938 skyr rows, live 2026-10-30). Those two go out as
+ * `[floor(value) TO *]`, which loses none, and `meetsConstraints` removes the rows that widening
+ * lets in. `lt` and `lte` already return a superset there, and the other nutrients compare exactly.
+ */
+function nutrientClause({ nutrient, operator, value }: NutrientFilter): string {
+  const widened = WHOLE_NUMBER_NUTRIENTS.has(nutrient) && (operator === 'gt' || operator === 'gte');
+  const range = widened
+    ? NUTRIENT_RANGE_FORMS.gte(Math.floor(value))
+    : NUTRIENT_RANGE_FORMS[operator](value);
+  return `nutriments.${nutrient}_100g:${range}`;
+}
 
 /**
  * Keeps the search rows whose `code` a product lookup can serve — one matching `BARCODE_PATTERN`,
@@ -634,6 +709,33 @@ function pickIndexedNutriments(
   return picked;
 }
 
+/** The comparison each nutrient operator expresses. */
+const NUTRIENT_COMPARISONS: Record<NutrientOperator, (held: number, bound: number) => boolean> = {
+  lt: (held, bound) => held < bound,
+  lte: (held, bound) => held <= bound,
+  gt: (held, bound) => held > bound,
+  gte: (held, bound) => held >= bound,
+};
+
+/**
+ * Whether a row's indexed values meet every constraint. Both sides compare at 32-bit precision, the
+ * index's own: its floats reach JSON widened to double, so `salt_100g: 0.10000000149012` equals a
+ * caller's `0.1` on the index and exceeds it as a double (`salt lte 0.1` live 577, double 569,
+ * `Math.fround` 577, 2026-10-30). A nutrient with no indexed value is no evidence against the row,
+ * so it stays.
+ */
+function meetsConstraints(
+  indexed: IndexedNutriments | undefined,
+  filters: readonly NutrientFilter[],
+): boolean {
+  return filters.every(({ nutrient, operator, value }) => {
+    const held = indexed?.[indexedNutrientKey(nutrient)];
+    return (
+      held === undefined || NUTRIENT_COMPARISONS[operator](Math.fround(held), Math.fround(value))
+    );
+  });
+}
+
 /**
  * This server's own budget refusal, raised before anything is sent. It is an ordinary
  * `rate_limited` failure on the wire — retryable, carrying `retryAfter` — and a distinct type only
@@ -650,6 +752,72 @@ class BudgetExhaustedError extends McpError {}
  */
 function isRetryableUpstreamFailure(error: unknown): boolean {
   return !(error instanceof BudgetExhaustedError) && defaultIsTransient(error);
+}
+
+/** How one read retries, and the per-call fields its failures carry. */
+type ReadRetry = {
+  operation: string;
+  baseDelayMs: number;
+  deadlineMs: number;
+  data: Record<string, unknown>;
+};
+
+/**
+ * Runs one upstream read under `withRetry`, bounded by `deadlineMs` across every attempt and
+ * backoff. `attempt` threads the `signal` it receives into its request, so an expiry cuts off the
+ * request in flight rather than overshooting by it.
+ *
+ * No tool declares the framework's `retry_deadline_exceeded`, so an expiry leaves as
+ * `upstream_timeout`, shaped like a ladder that exhausted on timeouts. The exception is a read whose
+ * last finished attempt answered 429: that is a limit to wait out, not an outage, so its own failure
+ * is raised, `retryAfter` included. An attempt the expiry cut off finished nothing, so it leaves the
+ * 429 standing, and any attempt that did finish replaces it, its own 15 s timeout included. A caller
+ * abort never gets here: `withRetry` ranks it above the deadline on the attempt and backoff paths.
+ */
+async function retryRead<T>(
+  attempt: (retry: RetryAttempt) => Promise<T>,
+  { operation, baseDelayMs, deadlineMs, data }: ReadRetry,
+  ctx: Context,
+): Promise<T> {
+  let lastRateLimit: McpError | undefined;
+  try {
+    return await withRetry(
+      async (retry) => {
+        try {
+          return await attempt(retry);
+        } catch (error) {
+          if (!retry.signal.aborted) {
+            lastRateLimit =
+              error instanceof McpError && error.data?.reason === 'rate_limited'
+                ? error
+                : undefined;
+          }
+          throw error;
+        }
+      },
+      {
+        operation,
+        context: ctx,
+        baseDelayMs,
+        deadlineMs,
+        signal: ctx.signal,
+        isTransient: isRetryableUpstreamFailure,
+      },
+    );
+  } catch (error) {
+    if (!(error instanceof McpError) || error.data?.reason !== 'retry_deadline_exceeded') {
+      throw error;
+    }
+    throw (
+      lastRateLimit ??
+      contractError(
+        'upstream_timeout',
+        `Open Food Facts did not respond within the ${deadlineMs / 1000} s retry deadline.`,
+        { ...data, ...publishedErrorData(error.data), operation },
+        error,
+      )
+    );
+  }
 }
 
 /** Token bucket rate limiter — tracks request timestamps to enforce per-minute limits. */
@@ -716,20 +884,20 @@ export class OpenFoodFactsService {
    * The caller is responsible for surfacing the not-found condition via ctx.fail.
    */
   async getProduct(barcode: string, ctx: Context): Promise<RawProduct | null> {
-    return await withRetry(
-      () => {
+    return await retryRead(
+      ({ signal }) => {
         this.productLimiter.check('product');
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${PRODUCT_FIELDS}`;
         ctx.log.debug('Fetching product', { barcode });
-        return this.fetchProduct(url, barcode, ctx);
+        return this.fetchProduct(url, barcode, ctx, signal);
       },
       {
         operation: `OFF:getProduct:${barcode}`,
-        context: ctx,
         baseDelayMs: 500,
-        signal: ctx.signal,
-        isTransient: isRetryableUpstreamFailure,
+        deadlineMs: READ_RETRY_DEADLINE_MS,
+        data: { barcode },
       },
+      ctx,
     );
   }
 
@@ -742,20 +910,20 @@ export class OpenFoodFactsService {
     fields: string,
     ctx: Context,
   ): Promise<RawProduct | null> {
-    return await withRetry(
-      () => {
+    return await retryRead(
+      ({ signal }) => {
         this.productLimiter.check('product');
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${fields}`;
         ctx.log.debug('Fetching product fields', { barcode, fields });
-        return this.fetchProduct(url, barcode, ctx);
+        return this.fetchProduct(url, barcode, ctx, signal);
       },
       {
         operation: `OFF:getProductFields:${barcode}`,
-        context: ctx,
         baseDelayMs: 500,
-        signal: ctx.signal,
-        isTransient: isRetryableUpstreamFailure,
+        deadlineMs: READ_RETRY_DEADLINE_MS,
+        data: { barcode },
       },
+      ctx,
     );
   }
 
@@ -771,6 +939,7 @@ export class OpenFoodFactsService {
     url: string,
     barcode: string,
     ctx: Context,
+    signal: AbortSignal,
   ): Promise<RawProduct | null> {
     let response: Response;
     try {
@@ -779,7 +948,7 @@ export class OpenFoodFactsService {
         REQUEST_TIMEOUT_MS,
         withExtra(ctx, { upstreamOperation: 'OFF:product' }),
         {
-          signal: ctx.signal,
+          signal,
           headers: REQUEST_HEADERS,
           expectedStatuses: [404],
         },
@@ -815,6 +984,7 @@ export class OpenFoodFactsService {
   private async fetchSearch(
     url: string,
     ctx: Context,
+    signal: AbortSignal,
     operation: string,
     data: Record<string, unknown>,
     jsonBody?: Record<string, unknown>,
@@ -825,9 +995,9 @@ export class OpenFoodFactsService {
         REQUEST_TIMEOUT_MS,
         withExtra(ctx, { upstreamOperation: operation }),
         jsonBody === undefined
-          ? { signal: ctx.signal, headers: REQUEST_HEADERS }
+          ? { signal, headers: REQUEST_HEADERS }
           : {
-              signal: ctx.signal,
+              signal,
               method: 'POST',
               headers: { ...REQUEST_HEADERS, 'Content-Type': 'application/json' },
               body: JSON.stringify(jsonBody),
@@ -874,15 +1044,23 @@ export class OpenFoodFactsService {
    * answers identically (live: the same hits for the same `sort_by`, `page`, `page_size`, and
    * `fields`), but the per-word groups repeat every searched field for each word, and at 30
    * languages a 12-word query was already a 23.6 KB URL the host refused with HTTP 414.
+   *
+   * The index compares some nutrients as whole numbers, so each returned row is checked against
+   * every constraint here, and failing rows leave the page. `count`, `count_is_exact`, and paging
+   * stay the backend's: they describe its whole-number answer, and a page keeps its offset however
+   * many rows it lost. Nothing else can do this upstream: no indexed field holds the fraction, and
+   * `sort_by` on a nutrient answers HTTP 422.
    */
   private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
+    const nutrientFilters = params.nutrient_filters ?? [];
     // The nutrients a filter constrains, once each: a range pair names its nutrient twice.
-    const constrained = [...new Set((params.nutrient_filters ?? []).map((f) => f.nutrient))];
-    return await withRetry(
-      async () => {
+    const constrained = [...new Set(nutrientFilters.map((f) => f.nutrient))];
+    const page = params.page ?? 1;
+    const pageSize = params.page_size ?? 20;
+    const pageData = { page, page_size: pageSize };
+    return await retryRead(
+      async ({ signal }) => {
         this.searchLimiter.check('search');
-        const page = params.page ?? 1;
-        const pageSize = params.page_size ?? 20;
         const body = {
           q: this.buildTextSearchQuery(params),
           langs: TEXT_SEARCH_LANGS,
@@ -893,7 +1071,7 @@ export class OpenFoodFactsService {
           page,
           page_size: pageSize,
           // search-a-licious sorts on a bare field name ascending and on a `-` prefix descending,
-          // and rejects an unknown field with HTTP 400. /api/v2/search reads the same bare value
+          // and rejects an unknown field with HTTP 422. /api/v2/search reads the same bare value
           // as descending, so the prefix keeps one enum value meaning one thing on both paths.
           ...(params.sort_by && { sort_by: `-${params.sort_by}` }),
         };
@@ -903,12 +1081,13 @@ export class OpenFoodFactsService {
         const response = await this.fetchSearch(
           `${TEXT_SEARCH_BASE_URL}/search`,
           ctx,
+          signal,
           'OFF:searchProductsByText',
-          { page, page_size: pageSize },
+          pageData,
           body,
         );
 
-        const parsed = await parseJsonBody<unknown>(response, { page });
+        const parsed = await parseJsonBody<unknown>(response, pageData);
         // Every field is still checked below; the cast only names the keys to read.
         const data = (isRecord(parsed) ? parsed : {}) as RawTextSearchResponse;
 
@@ -919,15 +1098,17 @@ export class OpenFoodFactsService {
           throw contractError(
             'upstream_error',
             `Open Food Facts text search failed inside its search engine${detail ? `: ${detail}` : '.'}`,
-            { page, page_size: pageSize },
+            pageData,
           );
         }
+
+        if (data.timed_out === true) throw timedOutAnswer('text search', pageData);
 
         if (!isTextSearchEnvelope(data)) {
           throw malformedEnvelope(
             'text search',
             'a hits list, a numeric count, and a boolean is_count_exact',
-            { page, page_size: pageSize },
+            pageData,
           );
         }
 
@@ -941,7 +1122,7 @@ export class OpenFoodFactsService {
         // Normalize text search hits to the row shape (brands is array → join to string).
         // Use spread of defined-only fields to satisfy exactOptionalPropertyTypes.
         const { hits } = data;
-        const products: SearchRow[] = withBarcodes(hits, ctx).map((hit) => {
+        const rows: SearchRow[] = withBarcodes(hits, ctx).map((hit) => {
           const brands = Array.isArray(hit.brands) ? hit.brands.join(', ') : hit.brands;
           return {
             code: hit.code,
@@ -956,6 +1137,11 @@ export class OpenFoodFactsService {
             }),
           };
         });
+        // After the barcode filter, so `dropped` stays barcode-only and a row that is both
+        // unservable and failing counts once, there.
+        const products = rows.filter((row) =>
+          meetsConstraints(row.indexed_nutriments, nutrientFilters),
+        );
 
         return {
           count: data.count,
@@ -968,16 +1154,19 @@ export class OpenFoodFactsService {
           page_count: products.length,
           page_size: pageSize,
           products,
-          dropped: hits.length - products.length,
+          dropped: hits.length - rows.length,
+          ...(products.length < rows.length && {
+            outside_constraints: rows.length - products.length,
+          }),
         };
       },
       {
         operation: 'OFF:searchProductsByText',
-        context: ctx,
         baseDelayMs: 1_000,
-        signal: ctx.signal,
-        isTransient: isRetryableUpstreamFailure,
+        deadlineMs: READ_RETRY_DEADLINE_MS,
+        data: pageData,
       },
+      ctx,
     );
   }
 
@@ -987,23 +1176,24 @@ export class OpenFoodFactsService {
    * folds the tag facets into the Lucene `q`.
    */
   private async searchProductsByTags(params: SearchParams, ctx: Context): Promise<SearchResult> {
-    return await withRetry(
-      async () => {
+    const pageData = { page: params.page ?? 1, page_size: params.page_size ?? 20 };
+    return await retryRead(
+      async ({ signal }) => {
         this.searchLimiter.check('search');
         const url = this.buildSearchUrl(params);
         ctx.log.debug('Searching products by tags', { params });
 
-        const response = await this.fetchSearch(url, ctx, 'OFF:searchProductsByTags', {
-          page: params.page ?? 1,
-          page_size: params.page_size ?? 20,
-        });
+        const response = await this.fetchSearch(
+          url,
+          ctx,
+          signal,
+          'OFF:searchProductsByTags',
+          pageData,
+        );
 
-        const data = await parseJsonBody<unknown>(response, { page: params.page ?? 1 });
+        const data = await parseJsonBody<unknown>(response, pageData);
         if (!isTagSearchEnvelope(data)) {
-          throw malformedEnvelope('tag search', 'a products list and a numeric count', {
-            page: params.page ?? 1,
-            page_size: params.page_size ?? 20,
-          });
+          throw malformedEnvelope('tag search', 'a products list and a numeric count', pageData);
         }
 
         ctx.log.debug('Tag search response received', {
@@ -1028,11 +1218,11 @@ export class OpenFoodFactsService {
       },
       {
         operation: 'OFF:searchProductsByTags',
-        context: ctx,
         baseDelayMs: 1_000,
-        signal: ctx.signal,
-        isTransient: isRetryableUpstreamFailure,
+        deadlineMs: READ_RETRY_DEADLINE_MS,
+        data: pageData,
       },
+      ctx,
     );
   }
 
@@ -1041,39 +1231,36 @@ export class OpenFoodFactsService {
    * autocomplete endpoint, returning its suggestions in upstream order. Ranking, filtering, and
    * what to do when the call fails are the caller's to decide — this method only fetches.
    *
-   * `size` caps the options returned and is the endpoint's only paging knob: it accepts no offset
-   * or cursor, and passing one is ignored rather than rejected, so there is no way to reach past
-   * the first `size` suggestions. The endpoint is a suggester over display names, not an
-   * enumerator — it reports no match total and answers an empty list for an empty term.
+   * Always asks for `MAX_AUTOCOMPLETE_SIZE`, the endpoint's only paging knob: it accepts no offset
+   * or cursor, and passing one is ignored rather than rejected, so a `size` above the term's whole
+   * answer is the only way to read all of it. The endpoint is a suggester over display names, not
+   * an enumerator — it reports no match total and answers an empty list for an empty term.
    */
   async suggestTaxonomy(
     taxonomyName: string,
     term: string,
-    size: number,
     ctx: Context,
   ): Promise<{ id: string; name: string }[]> {
-    return await withRetry(
-      async () => {
+    const lookup = { taxonomy_name: taxonomyName, term };
+    return await retryRead(
+      async ({ signal }) => {
         this.taxonomyLimiter.check('taxonomy');
         const url = new URL(`${TEXT_SEARCH_BASE_URL}/autocomplete`);
         url.searchParams.set('q', term);
         url.searchParams.set('taxonomy_names', taxonomyName);
-        url.searchParams.set('size', String(Math.min(size, MAX_AUTOCOMPLETE_SIZE)));
+        url.searchParams.set('size', String(MAX_AUTOCOMPLETE_SIZE));
 
         ctx.log.debug('Resolving taxonomy term', { taxonomyName, term });
 
         const data = await parseJsonBody<unknown>(
-          await this.fetchSearch(url.toString(), ctx, 'OFF:suggestTaxonomy', {
-            taxonomy_name: taxonomyName,
-            term,
-          }),
-          { taxonomy_name: taxonomyName, term },
+          await this.fetchSearch(url.toString(), ctx, signal, 'OFF:suggestTaxonomy', lookup),
+          lookup,
         );
+        if (isRecord(data) && data.timed_out === true) {
+          throw timedOutAnswer('taxonomy autocomplete', lookup);
+        }
         if (!isAutocompleteEnvelope(data)) {
-          throw malformedEnvelope('taxonomy autocomplete', 'an options list', {
-            taxonomy_name: taxonomyName,
-            term,
-          });
+          throw malformedEnvelope('taxonomy autocomplete', 'an options list', lookup);
         }
 
         // An option missing either half is unusable as a filter value or a display name, so it is
@@ -1084,11 +1271,11 @@ export class OpenFoodFactsService {
       },
       {
         operation: `OFF:suggestTaxonomy:${taxonomyName}`,
-        context: ctx,
         baseDelayMs: 500,
-        signal: ctx.signal,
-        isTransient: isRetryableUpstreamFailure,
+        deadlineMs: TAXONOMY_RETRY_DEADLINE_MS,
+        data: lookup,
       },
+      ctx,
     );
   }
 
@@ -1127,7 +1314,8 @@ export class OpenFoodFactsService {
    *
    * Nutrient constraints become nested range clauses under the `nutriments.` prefix, which is not
    * optional: a clause naming a bare `sugars_100g` answers HTTP 200 with zero hits and no error —
-   * the same silent-empty failure `additives_tag` has to be refused for.
+   * the same silent-empty failure `additives_tag` has to be refused for. `nutrientClause` widens the
+   * lower bounds the index would otherwise cut matches from.
    */
   private buildTextSearchQuery(params: SearchParams): string {
     const clauses: string[] = [];
@@ -1146,11 +1334,7 @@ export class OpenFoodFactsService {
       clauses.push(`-allergens_tags:"${allergen}"`);
     }
     for (const trace of params.exclude_traces ?? []) clauses.push(`-traces_tags:"${trace}"`);
-    for (const filter of params.nutrient_filters ?? []) {
-      clauses.push(
-        `nutriments.${filter.nutrient}_100g:${NUTRIENT_RANGE_FORMS[filter.operator](filter.value)}`,
-      );
-    }
+    clauses.push(...(params.nutrient_filters ?? []).map(nutrientClause));
     if (params.query) {
       const query = params.query.toLowerCase();
       clauses.push(...requiredWords(query).map(wordGroup), escapeLuceneQueryText(query));

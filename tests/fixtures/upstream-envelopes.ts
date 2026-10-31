@@ -3,6 +3,8 @@
  * from live captures on 2026-10-13. Hit lists and nested product objects are trimmed and the
  * search-a-licious `debug` echo is dropped; every remaining key and value is as the upstream sent
  * it. Tests that tighten envelope validation run these to prove a real answer is still accepted.
+ * The two `*_TIMED_OUT` envelopes are the exception: no live answer has carried the flag, so they
+ * are built from the fields search-a-licious v1.4.0's `postprocessing.py` emits.
  * @module tests/fixtures/upstream-envelopes
  */
 
@@ -121,6 +123,18 @@ export const TEXT_SEARCH_EMPTY = {
   warnings: null,
 };
 
+/** A text search Elasticsearch stopped collecting early. The whole success shape, count exact. */
+export const TEXT_SEARCH_TIMED_OUT = {
+  hits: [],
+  count: 0,
+  is_count_exact: true,
+  page: 1,
+  page_size: 20,
+  page_count: 0,
+  took: 15000,
+  timed_out: true,
+};
+
 /** GET https://search.openfoodfacts.org/autocomplete?q=hummus&taxonomy_names=category */
 export const AUTOCOMPLETE_HITS = {
   took: 2,
@@ -130,3 +144,6 @@ export const AUTOCOMPLETE_HITS = {
 
 /** GET https://search.openfoodfacts.org/autocomplete for a term nothing matches. */
 export const AUTOCOMPLETE_EMPTY = { took: 1, timed_out: false, options: [] };
+
+/** An autocomplete Elasticsearch stopped collecting early. */
+export const AUTOCOMPLETE_TIMED_OUT = { took: 15000, timed_out: true, options: [] };

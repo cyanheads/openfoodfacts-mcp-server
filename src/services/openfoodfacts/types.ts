@@ -88,7 +88,7 @@ export type RawSearchProduct = RawProduct & { code?: string };
  * A search result row the service hands on: its barcode matches `BARCODE_PATTERN`. Rows without
  * one are dropped before the page is counted — a row with nothing a product lookup can serve is not
  * a usable result. `indexed_nutriments` is set on every row of a search carrying nutrient
- * constraints, and on no other.
+ * constraints, and on no other; those are the values the row was checked against.
  */
 export type SearchRow = RawProduct & { code: string; indexed_nutriments?: IndexedNutriments };
 
@@ -126,6 +126,12 @@ export type RawTextSearchResponse = {
    * service refuses a success envelope missing any of the three as malformed.
    */
   is_count_exact?: boolean;
+  /**
+   * True when Elasticsearch stopped collecting before the search finished. The answer still has the
+   * whole success shape, but its hits are partial or empty and `count` and `is_count_exact` describe
+   * only what was collected, so the service refuses it however complete it looks.
+   */
+  timed_out?: boolean;
   page?: number;
   page_size?: number;
   /** Total number of pages (not products on this page — differs from /api/v2/search). */
@@ -168,10 +174,12 @@ export type RawTaxonomyOption = {
  * Response envelope from GET https://search.openfoodfacts.org/autocomplete. The endpoint is a
  * suggester, not an enumerator: it reports no match total, accepts no offset or cursor, and answers
  * HTTP 200 with an empty `options` list for an empty query or an unknown taxonomy name. A body with
- * no `options` list is malformed, not an empty answer.
+ * no `options` list is malformed, not an empty answer, and one with `timed_out: true` is not an
+ * answer at all, whatever `options` holds.
  */
 export type RawAutocompleteResponse = {
   options?: RawTaxonomyOption[];
+  timed_out?: boolean;
 };
 
 /**
@@ -191,6 +199,22 @@ export const NUTRIENT_FIELDS = [
   'salt',
   'sodium',
 ] as const;
+
+/**
+ * Nutrients the text index compares as truncated whole numbers (`long`), so `sugars lte 3` matches
+ * a row at 3.53 while `indexed_nutriments` shows the full value. Fitted against the complete
+ * `en:skyrs` corpus, 94 exact-count probes of the live index, 2026-10-30; the other four compare as
+ * 32-bit floats. The mapping is dynamic, so a re-import can change this set, which is why the row
+ * check covers every nutrient. Upstream `main` maps all nine as `float`
+ * (openfoodfacts/search-a-licious#301), and once that is deployed this set comes out.
+ */
+export const WHOLE_NUMBER_NUTRIENTS: ReadonlySet<NutrientField> = new Set([
+  'energy-kcal',
+  'fat',
+  'saturated-fat',
+  'carbohydrates',
+  'sugars',
+]);
 
 /** Comparisons a nutrient constraint may express, each mapping to one Lucene range form. */
 export const NUTRIENT_OPERATORS = ['lt', 'lte', 'gt', 'gte'] as const;
@@ -327,12 +351,18 @@ export type SearchResult = {
   count_is_exact: boolean;
   page: number;
   /**
-   * Rows on this page after rows without a servable barcode are dropped — always
-   * `products.length`.
+   * Rows on this page after rows without a servable barcode are dropped and rows outside the
+   * nutrient constraints leave — always `products.length`.
    */
   page_count: number;
   page_size: number;
   products: SearchRow[];
   /** Rows the upstream returned on this page that were dropped for lacking a servable barcode. */
   dropped: number;
+  /**
+   * Servable rows the text index returned on this page that fail a nutrient constraint at its own
+   * 32-bit precision, which left the page. Distinct from `dropped`, whose rows are matches: `count`
+   * includes these only because the index compares whole numbers. Absent when none left.
+   */
+  outside_constraints?: number;
 };

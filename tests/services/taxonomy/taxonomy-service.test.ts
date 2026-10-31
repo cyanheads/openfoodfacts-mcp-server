@@ -1,9 +1,10 @@
 /**
  * @fileoverview Tests for the tag-value canonicalizer the text search path runs every tag filter
  * through (GH issue #39): brand slugging, offline-sample and live-autocomplete resolution under the
- * exact-match rule, best-effort fallback, the in-process cache, and caller cancellation (GH issue
- * #60). Driven through the real OpenFoodFactsService with a stubbed global fetch, so the rate
- * limiter, retry classification, and option parsing on the lookup path all run.
+ * exact-match rule, best-effort fallback (timed-out answers from GH issue #68, the retry deadline
+ * from GH issue #72), the in-process cache, and caller cancellation (GH issue #60). Driven through
+ * the real OpenFoodFactsService with a stubbed global fetch, so the rate limiter, retry
+ * classification, and option parsing on the lookup path all run.
  * @module tests/services/taxonomy/taxonomy-service.test
  */
 
@@ -12,6 +13,7 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { slugTagValue, TaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import { AUTOCOMPLETE_TIMED_OUT } from '../../fixtures/upstream-envelopes.js';
 
 /** Wrap a body + status in a minimal Response-like mock, as a real fetch would resolve. */
 function mockResponse(body: unknown, status = 200): Response {
@@ -32,6 +34,19 @@ function stubOptions(options: { id: string; text: string }[]): void {
 /** The autocomplete URL the stubbed fetch received on a given call. */
 function lookupUrl(call = 0): URL {
   return new URL(String(vi.mocked(global.fetch).mock.calls[call]?.[0]));
+}
+
+/** Run a call to settlement with the retry backoff collapsed onto fake timers. */
+async function onFakeTimers<T>(run: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers();
+  try {
+    const pending = run();
+    pending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    return await pending;
+  } finally {
+    vi.useRealTimers();
+  }
 }
 
 /** A taxonomy service over a real Open Food Facts client with the given taxonomy budget. */
@@ -190,6 +205,26 @@ describe('TaxonomyService.canonicalizeTag', () => {
       });
     });
 
+    it('confirms a tag past the first 200 suggestions, sharing the whole-answer size (#70)', async () => {
+      // Live 2026-10-30: `en:e314` is the 229th of the 650 suggestions an E-number term answers.
+      const vocabulary = Array.from({ length: 650 }, (_, i) =>
+        i === 228 ? { id: 'en:e314', text: 'E 314' } : { id: `en:zz-${i}`, text: `Filler ${i}` },
+      );
+      global.fetch = vi.fn(async (input: unknown) =>
+        mockResponse({
+          took: 1,
+          timed_out: false,
+          options: vocabulary.slice(0, Number(new URL(String(input)).searchParams.get('size'))),
+        }),
+      );
+
+      await expect(taxonomy.canonicalizeTag('additives', 'en:e314', ctx)).resolves.toEqual({
+        value: 'en:e314',
+        resolution: 'vocabulary',
+      });
+      expect(lookupUrl().searchParams.get('size')).toBe('2000');
+    });
+
     it('accepts the option whose ID is the value plus "s" (live response for "nut")', async () => {
       stubOptions([{ id: 'en:nuts', text: 'Nuts' }]);
 
@@ -308,6 +343,64 @@ describe('TaxonomyService.canonicalizeTag', () => {
       stubOptions([{ id: 'en:united-states', text: 'US' }]);
       await expect(taxonomy.canonicalizeTag('countries', 'US', ctx)).resolves.toMatchObject({
         value: 'en:united-states',
+      });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it('reads a timed-out autocomplete as lookup_failed, never no_match, and caches nothing (#68)', async () => {
+      global.fetch = vi.fn(async () => mockResponse(AUTOCOMPLETE_TIMED_OUT));
+
+      const refused = await onFakeTimers(() =>
+        taxonomy.canonicalizeTag('allergens', 'en:kiwi', ctx),
+      );
+
+      expect(refused).toEqual({
+        value: 'en:kiwi',
+        resolution: 'normalized',
+        reason: 'lookup_failed',
+      });
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+
+      // A cached answer would resolve without this stub ever being called.
+      stubOptions([{ id: 'en:kiwi', text: 'Kiwi' }]);
+      await expect(taxonomy.canonicalizeTag('allergens', 'en:kiwi', ctx)).resolves.toEqual({
+        value: 'en:kiwi',
+        resolution: 'vocabulary',
+      });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it('reads a lookup past its retry deadline as lookup_failed and caches nothing (#72)', async () => {
+      global.fetch = vi.fn(
+        (_input: unknown, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      ) as typeof fetch;
+      vi.useFakeTimers();
+      let settledAtMs = -1;
+      try {
+        const start = Date.now();
+        const pending = taxonomy.canonicalizeTag('allergens', 'en:kiwi', ctx).then((result) => {
+          settledAtMs = Date.now() - start;
+          return result;
+        });
+        await vi.advanceTimersByTimeAsync(120_000);
+
+        await expect(pending).resolves.toEqual({
+          value: 'en:kiwi',
+          resolution: 'normalized',
+          reason: 'lookup_failed',
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(settledAtMs).toBe(20_000);
+
+      stubOptions([{ id: 'en:kiwi', text: 'Kiwi' }]);
+      await expect(taxonomy.canonicalizeTag('allergens', 'en:kiwi', ctx)).resolves.toEqual({
+        value: 'en:kiwi',
+        resolution: 'vocabulary',
       });
       expect(global.fetch).toHaveBeenCalledOnce();
     });
@@ -515,6 +608,133 @@ describe('TaxonomyService — caller cancellation (#60)', () => {
 
     expect(result.tags.map((tag) => tag.id)).toEqual(['en:cheeses', 'en:fresh-cheeses']);
     expect(result.notice).toContain('could not be reached or gave no usable answer');
+  });
+
+  describe.each([
+    ['a timed-out answer', () => mockResponse(AUTOCOMPLETE_TIMED_OUT)],
+    ['a 503', () => mockResponse('unavailable', 503)],
+  ])('an abort during the backoff after %s', (_label, answer) => {
+    /** Runs `run` until its first attempt failed and it is sleeping, then aborts the controller. */
+    async function abortDuringBackoff(
+      controller: AbortController,
+      run: () => Promise<unknown>,
+    ): Promise<unknown> {
+      global.fetch = vi.fn(async () => answer());
+      vi.useFakeTimers();
+      try {
+        const settled = run().then(
+          () => {
+            throw new Error('Expected the aborted call to reject.');
+          },
+          (error: unknown) => error,
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        expect(global.fetch).toHaveBeenCalledOnce();
+
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(0);
+        return await settled;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it('ends canonicalizeTag as cancelled, never as lookup_failed, and caches nothing', async () => {
+      const taxonomy = makeTaxonomy();
+      const controller = new AbortController();
+
+      const error = await abortDuringBackoff(controller, () =>
+        taxonomy.canonicalizeTag(
+          'allergens',
+          'en:kiwi',
+          createMockContext({ signal: controller.signal }),
+        ),
+      );
+
+      expect(error).toMatchObject({ name: 'AbortError' });
+      expect(global.fetch).toHaveBeenCalledOnce();
+
+      stubOptions([{ id: 'en:kiwi', text: 'Kiwi' }]);
+      await expect(
+        taxonomy.canonicalizeTag('allergens', 'en:kiwi', createMockContext()),
+      ).resolves.toEqual({ value: 'en:kiwi', resolution: 'vocabulary' });
+    });
+
+    it('ends search() as cancelled, never as the offline sample', async () => {
+      const taxonomy = makeTaxonomy();
+      const controller = new AbortController();
+
+      const error = await abortDuringBackoff(controller, () =>
+        taxonomy.search(
+          'categories',
+          'cheese',
+          20,
+          createMockContext({ signal: controller.signal }),
+        ),
+      );
+
+      expect(error).toMatchObject({ name: 'AbortError' });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('an abort in a retried attempt (#72)', () => {
+    /** Answers 503, then holds the retry open and aborts the controller from inside it. */
+    function stub503ThenAbort(controller: AbortController): void {
+      let calls = 0;
+      global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve(mockResponse('unavailable', 503));
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('The operation was aborted.', 'AbortError')),
+          );
+          controller.abort();
+        });
+      }) as typeof fetch;
+    }
+
+    it('ends canonicalizeTag as cancelled on the second attempt', async () => {
+      const taxonomy = makeTaxonomy();
+      const controller = new AbortController();
+      stub503ThenAbort(controller);
+
+      const error = await onFakeTimers(() =>
+        taxonomy
+          .canonicalizeTag('allergens', 'en:kiwi', createMockContext({ signal: controller.signal }))
+          .then(
+            () => {
+              throw new Error('Expected the aborted call to reject.');
+            },
+            (rejection: unknown) => rejection,
+          ),
+      );
+
+      expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      expect((error as Error).message).toContain('was aborted');
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('ends search() as cancelled on the second attempt', async () => {
+      const taxonomy = makeTaxonomy();
+      const controller = new AbortController();
+      stub503ThenAbort(controller);
+
+      const error = await onFakeTimers(() =>
+        taxonomy
+          .search('categories', 'cheese', 20, createMockContext({ signal: controller.signal }))
+          .then(
+            () => {
+              throw new Error('Expected the aborted call to reject.');
+            },
+            (rejection: unknown) => rejection,
+          ),
+      );
+
+      expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      expect((error as Error).message).toContain('was aborted');
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
   });
 });
 

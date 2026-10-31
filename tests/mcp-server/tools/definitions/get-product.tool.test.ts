@@ -583,7 +583,9 @@ describe('off_get_product', () => {
       ctx,
     );
 
-    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('serving_size,serving_quantity');
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe(
+      'serving_size,serving_quantity,serving_quantity_unit',
+    );
   });
 
   // ── #23: a requested field arrives with the fields it depends on ───────────
@@ -652,6 +654,116 @@ describe('off_get_product', () => {
     );
     expect(result.product?.serving_quantity_unit).toBe('ml');
     expect(firstText(offGetProductTool.format!(result))).toContain('parsed: 330 ml');
+  });
+
+  it('adds no serving field to a subset that names none', async () => {
+    mockGetProductFields.mockResolvedValue({ product_name: 'Nutella', brands: 'Ferrero' });
+
+    const result = await offGetProductTool.handler(
+      { barcode: '3017620422003', fields: ['product_name', 'brands', 'allergens_tags'] },
+      ctx,
+    );
+
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('product_name,brands,allergens_tags');
+    expect(result.requested_fields).toEqual(['product_name', 'brands', 'allergens_tags']);
+  });
+
+  it('leaves serving_size alone, since it claims nothing about a quantity', async () => {
+    mockGetProductFields.mockResolvedValue({ serving_size: '28 g' });
+
+    const result = await offGetProductTool.handler(
+      { barcode: '0028400157827', fields: ['serving_size'] },
+      ctx,
+    );
+
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('serving_size');
+    expect(firstText(offGetProductTool.format!(result))).toContain('**Serving size:** 28 g\n');
+  });
+
+  it('expands serving_quantity_unit exactly as before (#69)', async () => {
+    mockGetProductFields.mockResolvedValue({ serving_quantity: 330, serving_quantity_unit: 'ml' });
+
+    await offGetProductTool.handler(
+      { barcode: '5449000000996', fields: ['serving_quantity_unit'] },
+      ctx,
+    );
+
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe(
+      'serving_quantity_unit,serving_quantity,serving_size',
+    );
+  });
+
+  it('expands serving_quantity with its unit and its printed size (#69)', async () => {
+    // Values mirror barcode 0049000042566 as the live API answers the combined request. The unit
+    // was never asked for, so the text blamed Open Food Facts for a field the server left out.
+    mockGetProductFields.mockResolvedValue({
+      serving_size: '1 can (12 fl oz)',
+      serving_quantity: 354.882,
+      serving_quantity_unit: 'ml',
+    });
+
+    const result = await runToolContract(offGetProductTool, {
+      barcode: '0049000042566',
+      fields: ['serving_quantity'],
+    });
+
+    expect(mockGetProductFields.mock.calls[0]?.[1]).toBe(
+      'serving_quantity,serving_size,serving_quantity_unit',
+    );
+    expect(result.structuredContent).toEqual({
+      barcode: '0049000042566',
+      product: {
+        serving_size: '1 can (12 fl oz)',
+        serving_quantity: 354.882,
+        serving_quantity_unit: 'ml',
+      },
+      requested_fields: ['serving_quantity', 'serving_size', 'serving_quantity_unit'],
+    });
+    const text = contractText(result);
+    expect(text).toContain('**Serving size:** 1 can (12 fl oz) (parsed: 354.882 ml)');
+    expect(text).not.toContain('unit not recorded');
+  });
+
+  it('keeps "unit not recorded" for a quantity fetched with its unit and none came (#69)', async () => {
+    mockGetProductFields.mockResolvedValue({
+      serving_size: '1 can (12 fl oz)',
+      serving_quantity: 354.882,
+    });
+
+    const result = await offGetProductTool.handler(
+      { barcode: '0049000042566', fields: ['serving_quantity'] },
+      ctx,
+    );
+
+    // The claim is true only because the unit was asked for and did not come back.
+    expect(String(mockGetProductFields.mock.calls[0]?.[1]).split(',')).toContain(
+      'serving_quantity_unit',
+    );
+    expect(firstText(offGetProductTool.format!(result))).toContain(
+      '(parsed: 354.882 — unit not recorded)',
+    );
+  });
+
+  it.each([['nutriments'], ['serving_quantity'], ['serving_quantity_unit']] as const)(
+    'brings the whole serving group with %s, so no claim rests on a field left out (#69)',
+    async (field) => {
+      mockGetProductFields.mockResolvedValue({});
+
+      const result = await offGetProductTool.handler(
+        { barcode: '0049000042566', fields: [field] },
+        ctx,
+      );
+
+      expect(result.requested_fields).toEqual(
+        expect.arrayContaining(['serving_size', 'serving_quantity', 'serving_quantity_unit']),
+      );
+    },
+  );
+
+  it('says on the fields description that a quantity brings its unit (#69)', () => {
+    expect(offGetProductTool.input.shape.fields.description).toContain(
+      'serving_quantity and serving_quantity_unit each bring the other',
+    );
   });
 
   it('does not re-request a dependency the caller already named', async () => {
@@ -1897,6 +2009,398 @@ describe('off_get_product', () => {
         /read the unit rather than assuming/,
       );
       expect(nutriments.properties?.additional_serving?.description).toMatch(/concentration/i);
+    });
+  });
+
+  // ── #59: prepared figures render under their own headings ─────────────────
+
+  describe('prepared figures (#59)', () => {
+    const OTHER_PER_100 = '**Other nutrients per 100 g / 100 ml:**';
+    const OTHER_PER_SERVING = '**Other nutrients per serving:**';
+    const AS_SOLD_PER_100 = '### Nutrition per 100 g / 100 ml';
+    const PREPARED_PER_100 = '### Nutrition per 100 g / 100 ml, as prepared';
+    const PREPARED_PER_SERVING = '### Nutrition per serving, as prepared (per 210 g (portion))';
+    const ONLY_PREPARED =
+      '**As-sold nutrition:** This read returned only prepared figures. Open Food Facts returns one preparation state per read, so the record can still hold as-sold figures.';
+    const FOOTER =
+      '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. Missing fields = not yet entered.*';
+    const FOOTER_ONLY_PREPARED =
+      '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. Other missing fields = not yet entered.*';
+
+    /** 7613035530799 from the v2 product route: per-100 and per-serving keys, prepared alone. */
+    const NESQUIK: RawProduct = {
+      product_name: 'NESQUIK Moins de Sucres',
+      nutriments: {
+        calcium_prepared_100g: 0.12,
+        calcium_prepared_serving: 0.252,
+        carbohydrates_prepared_100g: 7.6,
+        carbohydrates_prepared_serving: 16,
+        'energy-kcal_prepared_100g': 68,
+        'energy-kcal_prepared_serving': 143,
+        'energy-kj_prepared_100g': 287,
+        'energy-kj_prepared_serving': 603,
+        energy_prepared_100g: 287,
+        energy_prepared_serving: 603,
+        fat_prepared_100g: 1.9,
+        fat_prepared_serving: 3.99,
+        fiber_prepared_100g: 1.9,
+        fiber_prepared_serving: 3.99,
+        iron_prepared_100g: 0.0017,
+        iron_prepared_serving: 0.00357,
+        phosphorus_prepared_100g: 0.0997,
+        phosphorus_prepared_serving: 0.209,
+        potassium_prepared_100g: 0.2,
+        potassium_prepared_serving: 0.42,
+        proteins_prepared_100g: 3.8,
+        proteins_prepared_serving: 7.98,
+        salt_prepared_100g: 0.12,
+        salt_prepared_serving: 0.252,
+        'saturated-fat_prepared_100g': 1.1,
+        'saturated-fat_prepared_serving': 2.31,
+        sodium_prepared_100g: 0.048,
+        sodium_prepared_serving: 0.101,
+        sugars_prepared_100g: 6.3,
+        sugars_prepared_serving: 13.2,
+        'vitamin-c_prepared_100g': 0.011,
+        'vitamin-c_prepared_serving': 0.0231,
+        'vitamin-d_prepared_100g': 7.3e-7,
+        'vitamin-d_prepared_serving': 0.00000153,
+        zinc_prepared_100g: 0.00095,
+        zinc_prepared_serving: 0.002,
+      },
+      serving_size: '210 g (portion)',
+      serving_quantity: 210,
+      serving_quantity_unit: 'g',
+    };
+
+    /** The lines under `heading`, up to the blank line that closes the section. */
+    function sectionUnder(text: string, heading: string): string[] | undefined {
+      const lines = text.split('\n');
+      const at = lines.indexOf(heading);
+      if (at === -1) return;
+      const end = lines.findIndex((line, i) => i > at && line === '');
+      return lines.slice(at + 1, end === -1 ? undefined : end);
+    }
+
+    /** The bullets that follow a bold "Other nutrients" lead-in. */
+    function bulletsUnder(lines: string[], lead: string): string[] {
+      const at = lines.indexOf(lead);
+      if (at === -1) return [];
+      const rest = lines.slice(at + 1);
+      const end = rest.findIndex((line) => !line.startsWith('  - '));
+      return end === -1 ? rest : rest.slice(0, end);
+    }
+
+    it('keeps "Other nutrients" in map order, every key rendered, on both bases', async () => {
+      mockGetProduct.mockResolvedValue({
+        nutriments: {
+          zinc_100g: 0.001,
+          calcium_100g: 0.071,
+          'vitamin-c_100g': 0.01,
+          zinc_serving: 0.0002,
+          calcium_serving: 0.02,
+        },
+        serving_size: '28 g',
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '12345678' }, ctx);
+      const lines = firstText(offGetProductTool.format!(result)).split('\n');
+
+      expect(bulletsUnder(lines, OTHER_PER_100)).toEqual([
+        '  - zinc: 0.001 g',
+        '  - calcium: 0.071 g',
+        '  - vitamin_c: 0.01 g',
+      ]);
+      expect(bulletsUnder(lines, OTHER_PER_SERVING)).toEqual([
+        '  - zinc: 0.0002 g',
+        '  - calcium: 0.02 g',
+      ]);
+    });
+
+    it('prints no as-prepared wording for a record with no _prepared keys', async () => {
+      mockGetProduct.mockResolvedValue({
+        product_name: 'Plain',
+        nutriments: { 'energy-kcal_100g': 100, calcium_100g: 0.1, calcium_serving: 0.03 },
+        serving_size: '30 g',
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '12345678' }, ctx);
+      const text = firstText(offGetProductTool.format!(result));
+
+      expect(text).not.toMatch(/prepared/i);
+      expect(text.split('\n').at(-1)).toBe(FOOTER);
+    });
+
+    it('moves all 36 figures of the live record, leaving the values in place', async () => {
+      mockGetProductFields.mockResolvedValue(NESQUIK);
+
+      const result = await runToolContract(offGetProductTool, {
+        barcode: '7613035530799',
+        fields: ['product_name', 'nutriments'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const { nutriments } = (
+        result.structuredContent as {
+          product: {
+            nutriments: {
+              additional_100g: Record<string, unknown>;
+              additional_serving: Record<string, unknown>;
+            };
+          };
+        }
+      ).product;
+      expect(Object.keys(nutriments).sort()).toEqual(['additional_100g', 'additional_serving']);
+      expect(Object.keys(nutriments.additional_100g)).toHaveLength(18);
+      expect(Object.keys(nutriments.additional_serving)).toHaveLength(18);
+      expect(nutriments.additional_100g.carbohydrates_prepared).toEqual({ value: 7.6, unit: 'g' });
+      expect(nutriments.additional_serving.energy_kcal_prepared).toEqual({
+        value: 143,
+        unit: 'kcal',
+      });
+
+      const text = contractText(result);
+      expect(sectionUnder(text, PREPARED_PER_100)).toEqual([
+        '  - calcium_prepared: 0.12 g',
+        '  - carbohydrates_prepared: 7.6 g',
+        '  - energy_kcal_prepared: 68 kcal',
+        '  - energy_kj_prepared: 287 kJ',
+        '  - energy_prepared: 287 kJ',
+        '  - fat_prepared: 1.9 g',
+        '  - fiber_prepared: 1.9 g',
+        '  - iron_prepared: 0.0017 g',
+        '  - phosphorus_prepared: 0.0997 g',
+        '  - potassium_prepared: 0.2 g',
+        '  - proteins_prepared: 3.8 g',
+        '  - salt_prepared: 0.12 g',
+        '  - saturated_fat_prepared: 1.1 g',
+        '  - sodium_prepared: 0.048 g',
+        '  - sugars_prepared: 6.3 g',
+        '  - vitamin_c_prepared: 0.011 g',
+        '  - vitamin_d_prepared: 7.3e-7 g',
+        '  - zinc_prepared: 0.00095 g',
+      ]);
+      expect(sectionUnder(text, PREPARED_PER_SERVING)?.filter((l) => l.startsWith('  - '))).toEqual(
+        [
+          '  - calcium_prepared: 0.252 g',
+          '  - carbohydrates_prepared: 16 g',
+          '  - energy_kcal_prepared: 143 kcal',
+          '  - energy_kj_prepared: 603 kJ',
+          '  - energy_prepared: 603 kJ',
+          '  - fat_prepared: 3.99 g',
+          '  - fiber_prepared: 3.99 g',
+          '  - iron_prepared: 0.00357 g',
+          '  - phosphorus_prepared: 0.209 g',
+          '  - potassium_prepared: 0.42 g',
+          '  - proteins_prepared: 7.98 g',
+          '  - salt_prepared: 0.252 g',
+          '  - saturated_fat_prepared: 2.31 g',
+          '  - sodium_prepared: 0.101 g',
+          '  - sugars_prepared: 13.2 g',
+          '  - vitamin_c_prepared: 0.0231 g',
+          '  - vitamin_d_prepared: 0.00000153 g',
+          '  - zinc_prepared: 0.002 g',
+        ],
+      );
+    });
+
+    it('prints no empty as-sold heading and says what the read returned', async () => {
+      mockGetProductFields.mockResolvedValue(NESQUIK);
+
+      const result = await runToolContract(offGetProductTool, {
+        barcode: '7613035530799',
+        fields: ['product_name', 'nutriments'],
+      });
+
+      const text = contractText(result);
+      const lines = text.split('\n');
+      expect(lines).toContain(ONLY_PREPARED);
+      expect(lines).not.toContain(AS_SOLD_PER_100);
+      expect(lines).not.toContain('### Nutrition per serving (per 210 g (portion))');
+      expect(text).not.toContain('Other nutrients');
+      expect(text).not.toMatch(/(record|product) (has|holds|carries) no/i);
+      expect(lines.at(-1)).toBe(FOOTER_ONLY_PREPARED);
+    });
+
+    it('warns where a prepared per-serving figure comes from', () => {
+      const section = sectionUnder(
+        firstText(
+          offGetProductTool.format!({
+            barcode: '3700278400881',
+            product: {
+              nutriments: {
+                additional_serving: {
+                  energy_kcal_prepared: { value: 11.2, unit: 'kcal' },
+                },
+              },
+              serving_size: '15g',
+              serving_quantity: 15,
+              serving_quantity_unit: 'g',
+            },
+          }),
+        ),
+        '### Nutrition per serving, as prepared (per 15g)',
+      );
+
+      expect(section).toEqual([
+        "*Open Food Facts scales these from the per-100 figures by serving_quantity, which is often a powder's dry portion rather than the prepared serving.*",
+        '  - energy_kcal_prepared: 11.2 kcal',
+      ]);
+    });
+
+    it('says when prepared per-serving figures have no recorded serving size', () => {
+      const text = firstText(
+        offGetProductTool.format!({
+          barcode: '12345678',
+          product: {
+            nutriments: { additional_serving: { fat_prepared: { value: 4, unit: 'g' } } },
+          },
+        }),
+      );
+
+      expect(sectionUnder(text, '### Nutrition per serving, as prepared')?.[0]).toBe(
+        '*Serving size not recorded by Open Food Facts — the figures below have no stated denominator.*',
+      );
+      expect(text).not.toContain('per undefined');
+    });
+
+    it('renders a read holding per-serving prepared figures alone', async () => {
+      mockGetProduct.mockResolvedValue({
+        nutriments: { 'energy-kcal_prepared_serving': 143 },
+        serving_size: '210 g (portion)',
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '12345678' }, ctx);
+      const lines = firstText(offGetProductTool.format!(result)).split('\n');
+
+      expect(lines).toContain(PREPARED_PER_SERVING);
+      expect(lines).not.toContain(PREPARED_PER_100);
+      expect(lines).toContain(ONLY_PREPARED);
+    });
+
+    it('renders a read holding per-100 prepared figures alone', async () => {
+      mockGetProduct.mockResolvedValue({
+        nutriments: { fat_prepared_100g: 1.9 },
+        serving_size: '210 g (portion)',
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '12345678' }, ctx);
+      const text = firstText(offGetProductTool.format!(result));
+
+      expect(sectionUnder(text, PREPARED_PER_100)).toEqual(['  - fat_prepared: 1.9 g']);
+      expect(text).not.toContain('### Nutrition per serving');
+    });
+
+    it('keeps every non-prepared key in place, in order, in a mixed map', async () => {
+      const nutriments = {
+        zinc_100g: 0.001,
+        fat_prepared_100g: 2,
+        calcium_100g: 0.071,
+        calcium_prepared_100g: 0.12,
+        'vitamin-c_100g': 0.01,
+        'energy-kcal_100g': 400,
+        zinc_serving: 0.0002,
+        fat_prepared_serving: 4,
+        calcium_serving: 0.02,
+        'energy-kcal_serving': 80,
+      };
+      mockGetProduct.mockResolvedValue({ nutriments, serving_size: '20 g' });
+
+      const result = await runToolContract(offGetProductTool, { barcode: '12345678' });
+
+      expect(
+        (result.structuredContent as { product: { nutriments: object } }).product.nutriments,
+      ).toEqual({
+        energy_kcal_100g: 400,
+        energy_kcal_serving: 80,
+        additional_100g: {
+          zinc: { value: 0.001, unit: 'g' },
+          fat_prepared: { value: 2, unit: 'g' },
+          calcium: { value: 0.071, unit: 'g' },
+          calcium_prepared: { value: 0.12, unit: 'g' },
+          vitamin_c: { value: 0.01, unit: 'g' },
+        },
+        additional_serving: {
+          zinc: { value: 0.0002, unit: 'g' },
+          fat_prepared: { value: 4, unit: 'g' },
+          calcium: { value: 0.02, unit: 'g' },
+        },
+      });
+      const text = contractText(result);
+      const lines = text.split('\n');
+      expect(sectionUnder(text, AS_SOLD_PER_100)).toEqual([
+        '**Energy:** 400 kcal',
+        OTHER_PER_100,
+        '  - zinc: 0.001 g',
+        '  - calcium: 0.071 g',
+        '  - vitamin_c: 0.01 g',
+      ]);
+      expect(sectionUnder(text, '### Nutrition per serving (per 20 g)')).toEqual([
+        '**Energy:** 80 kcal',
+        OTHER_PER_SERVING,
+        '  - zinc: 0.0002 g',
+        '  - calcium: 0.02 g',
+      ]);
+      expect(sectionUnder(text, PREPARED_PER_100)).toEqual([
+        '  - fat_prepared: 2 g',
+        '  - calcium_prepared: 0.12 g',
+      ]);
+      expect(sectionUnder(text, '### Nutrition per serving, as prepared (per 20 g)')).toContain(
+        '  - fat_prepared: 4 g',
+      );
+      // Both states came back, so nothing here says only prepared figures did.
+      expect(lines).not.toContain(ONLY_PREPARED);
+      expect(lines.at(-1)).toBe(FOOTER);
+    });
+
+    it('counts as-sold per-serving figures against the only-prepared statement', async () => {
+      mockGetProduct.mockResolvedValue({
+        nutriments: { fat_prepared_100g: 2, 'energy-kcal_serving': 80 },
+        serving_size: '20 g',
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '12345678' }, ctx);
+      const lines = firstText(offGetProductTool.format!(result)).split('\n');
+
+      expect(lines).toContain('### Nutrition per serving (per 20 g)');
+      expect(lines).toContain(PREPARED_PER_100);
+      expect(lines).not.toContain(AS_SOLD_PER_100);
+      expect(lines).not.toContain(ONLY_PREPARED);
+    });
+
+    it('stays out of a subset that excludes nutriments', async () => {
+      mockGetProductFields.mockResolvedValue({ product_name: 'NESQUIK Moins de Sucres' });
+
+      const result = await offGetProductTool.handler(
+        { barcode: '7613035530799', fields: ['product_name'] },
+        ctx,
+      );
+      const text = firstText(offGetProductTool.format!(result));
+
+      expect(text).toContain('**Nutrition:** Not requested');
+      expect(text).not.toMatch(/prepared/i);
+      expect(text.split('\n').at(-1)).toBe(FOOTER);
+    });
+
+    it('names _prepared keys and the serving scale in the descriptions', () => {
+      const nutriments = nutrimentsSchema();
+
+      expect(nutriments.description).toContain('_prepared');
+      expect(nutriments.description).toContain('one preparation state per read');
+      expect(nutriments.properties?.additional_100g?.description).toContain('_prepared');
+      expect(nutriments.properties?.additional_serving?.description).toContain('_prepared');
+      expect(nutriments.properties?.additional_serving?.description).toContain('serving_quantity');
+      expect(nutriments.properties?.additional_serving?.description).toContain('dry portion');
+      expect(offGetProductTool.description).toContain('one preparation state per read');
+    });
+
+    it('never says a record has no as-sold figures in any advertised description', () => {
+      for (const text of [
+        offGetProductTool.description,
+        ...schemaDescriptions(offGetProductTool.output),
+      ]) {
+        expect(text).not.toMatch(/(record|product)s? (has|have|holds?|carr(y|ies)) no as-sold/i);
+      }
     });
   });
 });

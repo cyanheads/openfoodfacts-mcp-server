@@ -9,6 +9,7 @@ import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-
 import {
   BARCODE_PATTERN,
   BARCODE_PATTERN_MESSAGE,
+  type RawNutriments,
   type RawProduct,
 } from '@/services/openfoodfacts/types.js';
 import { mdInline } from '@/utils/markdown.js';
@@ -31,7 +32,50 @@ function unprocessedNextStep(count: number): string {
     : `compare them in another off_compare_products call, up to ${COMPARE_BARCODE_CAP} barcodes at a time.`;
 }
 
-type CompareRow = {
+/**
+ * The nutrition columns of a comparison, in table order. This one list drives the row type, the
+ * figures read from the raw map, the output schema, and the text tables. `raw` is the Open Food
+ * Facts nutrient name, which a suffix turns into a key of its nutriments map.
+ */
+const NUTRITION_COLUMNS = [
+  {
+    key: 'energy_kcal_100g',
+    raw: 'energy-kcal',
+    header: 'Energy (kcal)',
+    measure: 'Energy in kcal',
+  },
+  { key: 'fat_100g', raw: 'fat', header: 'Fat (g)', measure: 'Total fat in grams' },
+  {
+    key: 'saturated_fat_100g',
+    raw: 'saturated-fat',
+    header: 'Sat. Fat (g)',
+    measure: 'Saturated fat in grams',
+  },
+  {
+    key: 'carbohydrates_100g',
+    raw: 'carbohydrates',
+    header: 'Carbohydrates (g)',
+    measure: 'Total carbohydrates in grams',
+  },
+  { key: 'sugars_100g', raw: 'sugars', header: 'Sugars (g)', measure: 'Total sugars in grams' },
+  { key: 'salt_100g', raw: 'salt', header: 'Salt (g)', measure: 'Salt in grams' },
+  { key: 'proteins_100g', raw: 'proteins', header: 'Protein (g)', measure: 'Protein in grams' },
+  { key: 'fiber_100g', raw: 'fiber', header: 'Fiber (g)', measure: 'Dietary fiber in grams' },
+] as const;
+
+type NutritionKey = (typeof NUTRITION_COLUMNS)[number]['key'];
+
+/** Figures keyed by column. A key is absent when the read carried no number for that column. */
+type NutritionFigures = Partial<Record<NutritionKey, number>>;
+
+/**
+ * Figures as `format()` receives them. Differs from `NutritionFigures` in allowing `undefined`,
+ * since `format()` is typed from the output schema and the project runs
+ * `exactOptionalPropertyTypes`.
+ */
+type RenderedFigures = Partial<Record<NutritionKey, number | undefined>>;
+
+type CompareRow = NutritionFigures & {
   barcode: string;
   product_name?: string;
   brands?: string;
@@ -39,13 +83,7 @@ type CompareRow = {
   nutriscore_grade?: string;
   nova_group?: number;
   ecoscore_grade?: string;
-  energy_kcal_100g?: number;
-  fat_100g?: number;
-  saturated_fat_100g?: number;
-  sugars_100g?: number;
-  salt_100g?: number;
-  proteins_100g?: number;
-  fiber_100g?: number;
+  prepared?: NutritionFigures;
   completeness?: number;
 };
 
@@ -53,6 +91,50 @@ type CompareRow = {
 function n(raw: Record<string, number | string | undefined>, key: string): number | undefined {
   const v = raw[key];
   return typeof v === 'number' ? v : undefined;
+}
+
+/** Read every column under `suffix`. One raw key per column, so nothing is derived or converted. */
+function readFigures(raw: RawNutriments, suffix: string): NutritionFigures {
+  const figures: NutritionFigures = {};
+  for (const { key, raw: nutrient } of NUTRITION_COLUMNS) {
+    const value = n(raw, `${nutrient}${suffix}`);
+    if (value !== undefined) figures[key] = value;
+  }
+  return figures;
+}
+
+/**
+ * Output fields for a set of figures, one per column. A factory so each use gets its own schema
+ * instances. `Object.fromEntries` widens its keys to `string`, so the cast restores the columns.
+ */
+const nutritionFields = (describe: (measure: string) => string) =>
+  Object.fromEntries(
+    NUTRITION_COLUMNS.map(({ key, measure }) => [
+      key,
+      z.number().optional().describe(describe(measure)),
+    ]),
+  ) as Record<NutritionKey, z.ZodOptional<z.ZodNumber>>;
+
+/** Whether any column holds a figure. */
+function hasFigure(figures: RenderedFigures): boolean {
+  return NUTRITION_COLUMNS.some(({ key }) => figures[key] !== undefined);
+}
+
+/** A nutrition table with one row per entry, `N/A` where an entry has no figure for a column. */
+function nutritionTable(
+  heading: string,
+  rows: readonly { label: string; figures: RenderedFigures }[],
+): string[] {
+  const headers = NUTRITION_COLUMNS.map((column) => column.header);
+  return [
+    heading,
+    `| Product | ${headers.join(' | ')} |`,
+    `|:--------|${headers.map((header) => `:${'-'.repeat(header.length + 1)}|`).join('')}`,
+    ...rows.map(({ label, figures }) => {
+      const cells = NUTRITION_COLUMNS.map(({ key }) => figures[key] ?? 'N/A');
+      return `| ${label} | ${cells.join(' | ')} |`;
+    }),
+  ];
 }
 
 /** The failure reasons this tool declares — the four the service raises for a product fetch. */
@@ -161,21 +243,9 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
   if (typeof raw.completeness === 'number') row.completeness = raw.completeness;
 
   if (raw.nutriments) {
-    const nm = raw.nutriments;
-    const energy = n(nm, 'energy-kcal_100g');
-    if (energy !== undefined) row.energy_kcal_100g = energy;
-    const fat = n(nm, 'fat_100g');
-    if (fat !== undefined) row.fat_100g = fat;
-    const satFat = n(nm, 'saturated-fat_100g');
-    if (satFat !== undefined) row.saturated_fat_100g = satFat;
-    const sugars = n(nm, 'sugars_100g');
-    if (sugars !== undefined) row.sugars_100g = sugars;
-    const salt = n(nm, 'salt_100g');
-    if (salt !== undefined) row.salt_100g = salt;
-    const proteins = n(nm, 'proteins_100g');
-    if (proteins !== undefined) row.proteins_100g = proteins;
-    const fiber = n(nm, 'fiber_100g');
-    if (fiber !== undefined) row.fiber_100g = fiber;
+    Object.assign(row, readFigures(raw.nutriments, '_100g'));
+    const prepared = readFigures(raw.nutriments, '_prepared_100g');
+    if (Object.keys(prepared).length > 0) row.prepared = prepared;
   }
 
   return row;
@@ -184,7 +254,7 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
 export const offCompareProductsTool = tool('off_compare_products', {
   title: 'Compare Food Products Side-by-Side',
   description:
-    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, carbohydrates, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score, NOVA group, and Green-Score. Open Food Facts returns one preparation state per read, so figures for the prepared product arrive in a prepared object on the row, with the same columns and basis, and never fill an as-sold field. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -233,47 +303,20 @@ export const offCompareProductsTool = tool('off_compare_products', {
               .describe(
                 'Green-Score (formerly Eco-Score) environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Often absent.',
               ),
-            energy_kcal_100g: z
-              .number()
+            ...nutritionFields(
+              (measure) =>
+                `${measure} per 100 g, or per 100 ml for liquids, as sold. Absent when not entered, or when this read returned only prepared figures (see prepared).`,
+            ),
+            prepared: z
+              .object(
+                nutritionFields(
+                  (measure) =>
+                    `${measure} per 100 g, or per 100 ml for liquids, as prepared. Absent when this read returned no such figure.`,
+                ),
+              )
               .optional()
               .describe(
-                'Energy in kcal per 100 g, or per 100 ml for liquids. Absent when not entered.',
-              ),
-            fat_100g: z
-              .number()
-              .optional()
-              .describe(
-                'Total fat in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
-              ),
-            saturated_fat_100g: z
-              .number()
-              .optional()
-              .describe(
-                'Saturated fat in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
-              ),
-            sugars_100g: z
-              .number()
-              .optional()
-              .describe(
-                'Total sugars in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
-              ),
-            salt_100g: z
-              .number()
-              .optional()
-              .describe(
-                'Salt in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
-              ),
-            proteins_100g: z
-              .number()
-              .optional()
-              .describe(
-                'Protein in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
-              ),
-            fiber_100g: z
-              .number()
-              .optional()
-              .describe(
-                'Dietary fiber in grams per 100 g, or per 100 ml for liquids. Often absent.',
+                "Figures for the prepared product, on the same columns and basis as the as-sold fields, read from Open Food Facts' *_prepared_100g keys and never derived or substituted for an as-sold figure. Open Food Facts returns one preparation state per read, so as-sold fields absent beside this object mean this read returned none, not that the record holds none. Absent when the read carried none of these figures.",
               ),
             completeness: z
               .number()
@@ -321,7 +364,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, answers 2xx with a malformed envelope, or is unreachable for a barcode — reported in that barcode's failed entry rather than failing the call",
+      when: "Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, answers 2xx with a malformed envelope, closes the connection before finishing its answer, or is unreachable for a barcode — reported in that barcode's failed entry rather than failing the call",
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -330,7 +373,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: "Open Food Facts did not answer a barcode within the request deadline, or answered 408, 425, or 504 — reported in that barcode's failed entry rather than failing the call",
+      when: "Open Food Facts did not answer a barcode within the request or retry deadline, or answered 408, 425, or 504 — reported in that barcode's failed entry rather than failing the call",
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -470,19 +513,33 @@ export const offCompareProductsTool = tool('off_compare_products', {
       );
     }
 
-    // Nutrition table
-    lines.push('\n### Nutrition per 100 g / 100 ml');
-    lines.push(
-      '| Product | Energy (kcal) | Fat (g) | Sat. Fat (g) | Sugars (g) | Salt (g) | Protein (g) | Fiber (g) |',
+    // Nutrition tables. Each block stands alone, since a batch can fall entirely to one side. A row
+    // with prepared figures and no as-sold one leaves the as-sold table: its N/As would sit under a
+    // footer reading "not yet entered", which is false of a record that holds those figures on a
+    // preparation state this read did not return.
+    const asSold = found.filter((p) => !p.prepared || hasFigure(p));
+    const asPrepared = found.flatMap((p) =>
+      p.prepared ? [{ label: rowLabel(p), figures: p.prepared }] : [],
     );
-    lines.push(
-      '|:--------|:-------------|:--------|:-------------|:-----------|:---------|:------------|:----------|',
-    );
-    for (const p of found) {
-      const name = rowLabel(p);
-      const fmt = (v: number | undefined) => (v !== undefined ? String(v) : 'N/A');
+    const preparedOnly = found.filter((p) => p.prepared && !hasFigure(p));
+
+    if (asSold.length > 0) {
       lines.push(
-        `| ${name} | ${fmt(p.energy_kcal_100g)} | ${fmt(p.fat_100g)} | ${fmt(p.saturated_fat_100g)} | ${fmt(p.sugars_100g)} | ${fmt(p.salt_100g)} | ${fmt(p.proteins_100g)} | ${fmt(p.fiber_100g)} |`,
+        ...nutritionTable(
+          '\n### Nutrition per 100 g / 100 ml',
+          asSold.map((p) => ({ label: rowLabel(p), figures: p })),
+        ),
+      );
+    }
+
+    if (asPrepared.length > 0) {
+      lines.push(...nutritionTable('\n### Nutrition per 100 g / 100 ml, as prepared', asPrepared));
+      lines.push('\n*In this table, "N/A" = no prepared figure in this read.*');
+    }
+
+    if (preparedOnly.length > 0) {
+      lines.push(
+        `*This read returned no as-sold figures for ${preparedOnly.map(rowLabel).join(', ')}. Open Food Facts returns one preparation state per read, so the record can still hold them.*`,
       );
     }
 
@@ -496,7 +553,12 @@ export const offCompareProductsTool = tool('off_compare_products', {
       );
     }
 
-    lines.push('\n*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered.*');
+    // Scoped rather than dropped when an "as prepared" table prints: Scores keeps its N/As even
+    // when no as-sold table does.
+    const naScope = asPrepared.length > 0 ? ' outside the "as prepared" table' : '';
+    lines.push(
+      `\n*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A"${naScope} = not yet entered.*`,
+    );
 
     return [{ type: 'text' as const, text: lines.join('\n') }];
   },

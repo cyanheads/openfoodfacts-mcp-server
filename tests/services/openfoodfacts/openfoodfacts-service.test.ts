@@ -3,7 +3,9 @@
  * (Bug #3), text search routing (Bug #2), score-filter query-param mapping (GH issue #3), the
  * declared error contract carried by every failure (GH issue #12), retry classification and
  * upstream-detail surfacing (GH issue #19), status-decided retryability (GH issue #37), malformed
- * success envelopes (GH issue #54), and User-Agent header verification.
+ * success envelopes (GH issue #54), answers flagged timed_out (GH issue #68), the total retry
+ * deadline (GH issue #72), the nutrient row check (GH issue #64), and User-Agent header
+ * verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
@@ -43,6 +45,7 @@ import {
 import {
   AUTOCOMPLETE_EMPTY,
   AUTOCOMPLETE_HITS,
+  AUTOCOMPLETE_TIMED_OUT,
   PRODUCT_FOUND,
   PRODUCT_FOUND_EMPTY,
   PRODUCT_NOT_FOUND_404,
@@ -50,6 +53,7 @@ import {
   TAG_SEARCH_HITS,
   TEXT_SEARCH_EMPTY,
   TEXT_SEARCH_HITS,
+  TEXT_SEARCH_TIMED_OUT,
 } from '../../fixtures/upstream-envelopes.js';
 
 /** The text search endpoint, which takes its parameters as a JSON body. */
@@ -439,7 +443,7 @@ describe('OpenFoodFactsService', () => {
 
     it('applies sort_by on the text-search URL with a descending prefix', async () => {
       // GH issue #33: search.openfoodfacts.org does sort — it accepts sort_by, orders descending
-      // on a "-" prefix, and rejects an unknown field with HTTP 400. The prefix is what makes each
+      // on a "-" prefix, and rejects an unknown field with HTTP 422. The prefix is what makes each
       // enum value mean the same thing here as the bare value means on /api/v2/search.
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
@@ -679,23 +683,50 @@ describe('OpenFoodFactsService', () => {
       return sentQ();
     }
 
-    it('builds the bracket form the backend parses for each operator', async () => {
-      // Live-verified against search-a-licious: square brackets parse to gte/lte, curly braces to
-      // gt/lt, and `*` is an open bound. Every field reference needs the `nutriments.` prefix — a
-      // bare `sugars_100g` clause answers HTTP 200 with zero hits and no error.
-      const cases = [
-        { operator: 'lte', expected: 'nutriments.sugars_100g:[* TO 2]' },
-        { operator: 'lt', expected: 'nutriments.sugars_100g:{* TO 2}' },
-        { operator: 'gte', expected: 'nutriments.sugars_100g:[2 TO *]' },
-        { operator: 'gt', expected: 'nutriments.sugars_100g:{2 TO *}' },
-      ] as const;
+    /**
+     * The clause for each bound, on a nutrient the index stores truncated and on one it stores as a
+     * float. Live-verified against search-a-licious: square brackets parse to gte/lte, curly braces
+     * to gt/lt, and `*` is an open bound. On the five truncated nutrients `gt` and `gte` widen to
+     * `[floor(value) TO *]`, since the index rounds a fractional lower bound up (sugars `gte 3.5`
+     * lost 173 of 821 skyr rows) and `gt 3` excludes every row truncated to 3 (lost 290 of 938).
+     * `lt` and `lte` already return a superset. Bounds from the validated table in the #64 evidence.
+     */
+    const RANGE_FORMS = [
+      ['lt', 3, '{* TO 3}', '{* TO 3}'],
+      ['lt', 3.5, '{* TO 3.5}', '{* TO 3.5}'],
+      ['lte', 3, '[* TO 3]', '[* TO 3]'],
+      ['lte', 3.5, '[* TO 3.5]', '[* TO 3.5]'],
+      ['lte', 0, '[* TO 0]', '[* TO 0]'],
+      ['gt', 3, '[3 TO *]', '{3 TO *}'],
+      ['gt', 3.5, '[3 TO *]', '{3.5 TO *}'],
+      ['gt', 0, '[0 TO *]', '{0 TO *}'],
+      ['gte', 3, '[3 TO *]', '[3 TO *]'],
+      ['gte', 3.5, '[3 TO *]', '[3.5 TO *]'],
+      ['gte', 0.5, '[0 TO *]', '[0.5 TO *]'],
+    ] as const;
 
-      for (const { operator, expected } of cases) {
-        const q = await queryFor({
-          nutrient_filters: [{ nutrient: 'sugars', operator, value: 2 }],
-        });
-        expect(q).toContain(expected);
-      }
+    it.each(RANGE_FORMS)(
+      'sends %s %d as %s on the five whole-number nutrients and %s on the rest',
+      async (operator, value, wholeNumberForm, floatForm) => {
+        // A bare `sugars_100g` clause answers HTTP 200 with zero hits and no error, so the exact `q`
+        // pins the `nutriments.` prefix too.
+        for (const nutrient of ['energy-kcal', 'fat', 'saturated-fat', 'carbohydrates', 'sugars']) {
+          const q = await queryFor({ nutrient_filters: [{ nutrient, operator, value }] });
+          expect(q).toBe(`nutriments.${nutrient}_100g:${wholeNumberForm}`);
+        }
+        for (const nutrient of ['fiber', 'proteins', 'salt', 'sodium']) {
+          const q = await queryFor({ nutrient_filters: [{ nutrient, operator, value }] });
+          expect(q).toBe(`nutriments.${nutrient}_100g:${floatForm}`);
+        }
+      },
+    );
+
+    it('sends energy-kcal gte 100.5 as [100 TO *]', async () => {
+      const q = await queryFor({
+        nutrient_filters: [{ nutrient: 'energy-kcal', operator: 'gte', value: 100.5 }],
+      });
+
+      expect(q).toBe('nutriments.energy-kcal_100g:[100 TO *]');
     });
 
     it('routes a nutrient-only search to the text backend', async () => {
@@ -824,6 +855,253 @@ describe('OpenFoodFactsService', () => {
       );
 
       expect(sentRequest().body?.sort_by).toBe('-unique_scans_n');
+    });
+
+    describe('the row check (#64)', () => {
+      /** One constrained search whose page holds these hits, at the service seam. */
+      async function searchHits(
+        nutrient_filters: unknown[],
+        hits: Record<string, unknown>[],
+        params: Record<string, unknown> = {},
+      ) {
+        global.fetch = vi.fn().mockResolvedValue(textHits(hits));
+        return await svc.searchProducts(
+          { page: 1, page_size: 20, nutrient_filters, ...params } as never,
+          createMockContext(),
+        );
+      }
+
+      /** A hit per value of one nutrient, each under its own servable code. */
+      function hitsAt(key: string, values: readonly number[]): Record<string, unknown>[] {
+        return values.map((value, i) => ({
+          code: String(3_017_620_422_003 + i),
+          nutriments: { [key]: value },
+        }));
+      }
+
+      /** The values of one key on the rows the search kept. */
+      function keptValues(result: Awaited<ReturnType<typeof searchHits>>, key: string): unknown[] {
+        return result.products.map(
+          (row) => (row.indexed_nutriments as Record<string, unknown>)[key],
+        );
+      }
+
+      /** Rows on both sides of every bound below, as the index returns them, full value intact. */
+      const SUGARS = [0, 0.4, 0.5, 0.6, 2.9, 3, 3.4, 3.5, 3.53, 3.6, 3.9, 4];
+
+      const ROW_CHECKS = [
+        ['lte', 3, [0, 0.4, 0.5, 0.6, 2.9, 3], 6],
+        ['lte', 3.5, [0, 0.4, 0.5, 0.6, 2.9, 3, 3.4, 3.5], 4],
+        ['lte', 0, [0], 11],
+        ['lt', 3, [0, 0.4, 0.5, 0.6, 2.9], 7],
+        ['lt', 3.5, [0, 0.4, 0.5, 0.6, 2.9, 3, 3.4], 5],
+        ['gt', 3, [3.4, 3.5, 3.53, 3.6, 3.9, 4], 6],
+        ['gt', 3.5, [3.53, 3.6, 3.9, 4], 8],
+        ['gt', 0, [0.4, 0.5, 0.6, 2.9, 3, 3.4, 3.5, 3.53, 3.6, 3.9, 4], 1],
+        ['gte', 3, [3, 3.4, 3.5, 3.53, 3.6, 3.9, 4], 5],
+        ['gte', 3.5, [3.5, 3.53, 3.6, 3.9, 4], 7],
+        ['gte', 0.5, [0.5, 0.6, 2.9, 3, 3.4, 3.5, 3.53, 3.6, 3.9, 4], 2],
+      ] as const;
+
+      it.each(ROW_CHECKS)(
+        'keeps only the rows sugars %s %d passes',
+        async (operator, value, kept, outside) => {
+          const result = await searchHits(
+            [{ nutrient: 'sugars', operator, value }],
+            hitsAt('sugars_100g', SUGARS),
+          );
+
+          expect(keptValues(result, 'sugars_100g')).toEqual(kept);
+          expect(result.outside_constraints).toBe(outside);
+          expect(result.page_count).toBe(kept.length);
+          expect(result.dropped).toBe(0);
+        },
+      );
+
+      it.each([
+        ['energy-kcal', 'energy-kcal_100g', 'energy_kcal_100g'],
+        ['fat', 'fat_100g', 'fat_100g'],
+        ['saturated-fat', 'saturated-fat_100g', 'saturated_fat_100g'],
+        ['carbohydrates', 'carbohydrates_100g', 'carbohydrates_100g'],
+        ['sugars', 'sugars_100g', 'sugars_100g'],
+        ['fiber', 'fiber_100g', 'fiber_100g'],
+        ['proteins', 'proteins_100g', 'proteins_100g'],
+        ['salt', 'salt_100g', 'salt_100g'],
+        ['sodium', 'sodium_100g', 'sodium_100g'],
+      ])('checks %s, not only the whole-number nutrients', async (nutrient, rawKey, key) => {
+        const result = await searchHits(
+          [{ nutrient, operator: 'lte', value: 3 }],
+          hitsAt(rawKey, [2.5, 3, 3.5]),
+        );
+
+        expect(keptValues(result, key)).toEqual([2.5, 3]);
+        expect(result.outside_constraints).toBe(1);
+      });
+
+      it.each([
+        // Floats the index holds widened to double, equal to the bound at its 32-bit precision and
+        // on the wrong side of it as doubles (`salt lte 0.1` live 577, double 569, 2026-10-30).
+        ['salt', 'lte', 0.1, 'salt_100g', 0.10000000149012, true],
+        ['salt', 'gte', 0.1, 'salt_100g', 0.10000000149012, true],
+        ['salt', 'gt', 0.1, 'salt_100g', 0.10000000149012, false],
+        ['salt', 'lt', 0.1, 'salt_100g', 0.10000000149012, false],
+        ['sugars', 'lte', 9.6, 'sugars_100g', 9.60000038146973, true],
+        ['sugars', 'gte', 3.3, 'sugars_100g', 3.29999995231628, true],
+        ['sugars', 'lt', 3.3, 'sugars_100g', 3.29999995231628, false],
+        ['sugars', 'gt', 9.6, 'sugars_100g', 9.60000038146973, false],
+        // A difference 32-bit precision still sees.
+        ['salt', 'lte', 0.1, 'salt_100g', 0.1000001, false],
+      ] as const)(
+        'compares %s %s %d at the index precision against a row at %s %d',
+        async (nutrient, operator, value, key, held, stays) => {
+          const result = await searchHits([{ nutrient, operator, value }], hitsAt(key, [held]));
+
+          expect(keptValues(result, key)).toEqual(stays ? [held] : []);
+          expect(result.outside_constraints).toBe(stays ? undefined : 1);
+        },
+      );
+
+      it('leaves rows it cannot judge on the page: no key, no map, no number', async () => {
+        const result = await searchHits(
+          [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
+          [
+            { code: '7771711000483', nutriments: { fat_100g: 30 } },
+            { code: '3017620422003' },
+            { code: '5413121361342', nutriments: { sugars_100g: '9' } },
+            { code: '8003288339765', nutriments: null },
+            { code: '8901262070676', nutriments: { sugars_100g: null } },
+          ],
+        );
+
+        expect(result.products.map((row) => row.code)).toEqual([
+          '7771711000483',
+          '3017620422003',
+          '5413121361342',
+          '8003288339765',
+          '8901262070676',
+        ]);
+        expect(result).not.toHaveProperty('outside_constraints');
+      });
+
+      it('counts a row that is unservable and failing once, in dropped', async () => {
+        const result = await searchHits(
+          [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
+          [
+            { code: '00000636', nutriments: { sugars_100g: 9 } },
+            { code: '3017620422003', nutriments: { sugars_100g: 9 } },
+            { code: '7771711000483', nutriments: { sugars_100g: 2 } },
+          ],
+        );
+
+        expect(result.dropped).toBe(1);
+        expect(result.outside_constraints).toBe(1);
+        expect(result.products.map((row) => row.code)).toEqual(['7771711000483']);
+      });
+
+      it('holds a range pair inside one whole number to both bounds, sending the wide band', async () => {
+        const result = await searchHits(
+          [
+            { nutrient: 'sugars', operator: 'gte', value: 3.5 },
+            { nutrient: 'sugars', operator: 'lte', value: 3.9 },
+          ],
+          hitsAt('sugars_100g', [3, 3.4, 3.5, 3.7, 3.9, 3.95]),
+        );
+
+        expect(sentQ()).toBe('nutriments.sugars_100g:[3 TO *] nutriments.sugars_100g:[* TO 3.9]');
+        expect(keptValues(result, 'sugars_100g')).toEqual([3.5, 3.7, 3.9]);
+        expect(result.outside_constraints).toBe(3);
+      });
+
+      it('holds a row to every constraint on two nutrients, counting it once', async () => {
+        const result = await searchHits(
+          [
+            { nutrient: 'sugars', operator: 'lte', value: 3 },
+            { nutrient: 'proteins', operator: 'gte', value: 5 },
+          ],
+          [
+            { code: '1000000000001', nutriments: { sugars_100g: 2, proteins_100g: 6 } },
+            { code: '1000000000002', nutriments: { sugars_100g: 3.5, proteins_100g: 6 } },
+            { code: '1000000000003', nutriments: { sugars_100g: 2, proteins_100g: 4 } },
+            { code: '1000000000004', nutriments: { sugars_100g: 3.5, proteins_100g: 4 } },
+            { code: '1000000000005', nutriments: { sugars_100g: 2 } },
+            { code: '1000000000006', nutriments: { sugars_100g: 3.5 } },
+          ],
+        );
+
+        expect(sentQ()).toBe('nutriments.sugars_100g:[* TO 3] nutriments.proteins_100g:[5 TO *]');
+        expect(result.products.map((row) => row.code)).toEqual(['1000000000001', '1000000000005']);
+        expect(result.outside_constraints).toBe(4);
+      });
+
+      it('applies alongside a tag filter, leaving the tag clause alone', async () => {
+        const result = await searchHits(
+          [{ nutrient: 'sugars', operator: 'gt', value: 3 }],
+          hitsAt('sugars_100g', [3, 3.2]),
+          { categories_tag: 'en:skyrs' },
+        );
+
+        expect(sentQ()).toBe('categories_tags:"en:skyrs" nutriments.sugars_100g:[3 TO *]');
+        expect(keptValues(result, 'sugars_100g')).toEqual([3.2]);
+        expect(result.outside_constraints).toBe(1);
+      });
+
+      it('keeps the backend count, exactness, and full row values', async () => {
+        global.fetch = vi.fn().mockResolvedValue(
+          mockResponse({
+            count: 10_000,
+            is_count_exact: false,
+            page: 2,
+            page_size: 20,
+            page_count: 500,
+            hits: hitsAt('salt_100g', [0.10000000149012, 0.2]),
+          }),
+        );
+
+        const result = await svc.searchProducts(
+          {
+            nutrient_filters: [{ nutrient: 'salt', operator: 'lte', value: 0.1 }],
+            page: 2,
+            page_size: 20,
+          },
+          createMockContext(),
+        );
+
+        expect(result).toMatchObject({
+          count: 10_000,
+          count_is_exact: false,
+          page: 2,
+          page_size: 20,
+          page_count: 1,
+          dropped: 0,
+          outside_constraints: 1,
+        });
+        // The row shows the value the index holds, not the value the check compared.
+        expect(keptValues(result, 'salt_100g')).toEqual([0.10000000149012]);
+      });
+
+      it('takes every row off a page none passes, keeping dropped at zero', async () => {
+        const result = await searchHits(
+          [{ nutrient: 'sugars', operator: 'gt', value: 3.9 }],
+          hitsAt('sugars_100g', [3, 3.5, 3.9]),
+        );
+
+        expect(result).toMatchObject({ products: [], page_count: 0, dropped: 0 });
+        expect(result.outside_constraints).toBe(3);
+      });
+
+      it('makes no check on a text search without nutrient filters', async () => {
+        // Characterization: the rows a query-only search returned before the check existed.
+        global.fetch = vi.fn().mockResolvedValue(textHits(hitsAt('sugars_100g', [3, 3.5])));
+
+        const result = await svc.searchProducts(
+          { query: 'skyr', page: 1, page_size: 20 },
+          createMockContext(),
+        );
+
+        expect(result.products).toHaveLength(2);
+        expect(result).not.toHaveProperty('outside_constraints');
+        expect(sentRequest().body?.fields).toEqual(SEARCH_FIELD_LIST);
+      });
     });
   });
 
@@ -1154,7 +1432,7 @@ describe('OpenFoodFactsService', () => {
       const taxonomyCtx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(mockResponse(loadShedHtml, 400));
       const taxonomyError = await captureError(
-        svc.suggestTaxonomy('category', 'hummus', 10, taxonomyCtx),
+        svc.suggestTaxonomy('category', 'hummus', taxonomyCtx),
       );
       const taxonomyData = (taxonomyError.data ?? {}) as Record<string, unknown>;
       expect(taxonomyData.taxonomy_name).toBe('category');
@@ -1379,7 +1657,7 @@ describe('OpenFoodFactsService', () => {
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(mockResponse('Service Unavailable', 503));
 
-      const error = await captureError(limited.suggestTaxonomy('category', 'hummus', 10, ctx));
+      const error = await captureError(limited.suggestTaxonomy('category', 'hummus', ctx));
 
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
@@ -1517,7 +1795,7 @@ describe('OpenFoodFactsService', () => {
 
       global.fetch = vi.fn().mockResolvedValue(mockResponse('Not Implemented', 501));
       const taxonomyError = await settle(() =>
-        svc.suggestTaxonomy('category', 'hummus', 10, createMockContext()),
+        svc.suggestTaxonomy('category', 'hummus', createMockContext()),
       );
       expect(global.fetch).toHaveBeenCalledOnce();
       expect(taxonomyError.data?.reason).toBe('upstream_rejected');
@@ -1751,12 +2029,21 @@ describe('OpenFoodFactsService', () => {
       it('reads autocomplete hits and an empty option list as answers', async () => {
         const ctx = createMockContext();
         answerAll(AUTOCOMPLETE_HITS);
-        await expect(svc.suggestTaxonomy('category', 'hummus', 3, ctx)).resolves.toEqual([
+        await expect(svc.suggestTaxonomy('category', 'hummus', ctx)).resolves.toEqual([
           { id: 'en:hummus', name: 'Hummus' },
         ]);
 
         answerAll(AUTOCOMPLETE_EMPTY);
-        await expect(svc.suggestTaxonomy('category', 'zzqxwvplmk', 3, ctx)).resolves.toEqual([]);
+        await expect(svc.suggestTaxonomy('category', 'zzqxwvplmk', ctx)).resolves.toEqual([]);
+      });
+
+      it('asks for the whole answer, a lookup size of 2000 (#70)', async () => {
+        answerAll(AUTOCOMPLETE_EMPTY);
+
+        await svc.suggestTaxonomy('category', 'hummus', createMockContext());
+
+        const [input] = vi.mocked(global.fetch).mock.calls[0] ?? [];
+        expect(new URL(String(input)).searchParams.get('size')).toBe('2000');
       });
     });
 
@@ -1820,7 +2107,7 @@ describe('OpenFoodFactsService', () => {
       answerAll({ took: 1, timed_out: false });
 
       const error = await settle(() =>
-        svc.suggestTaxonomy('category', 'brokenac', 10, createMockContext()),
+        svc.suggestTaxonomy('category', 'brokenac', createMockContext()),
       );
 
       expectMalformedFailure(error, '/autocomplete');
@@ -1928,6 +2215,175 @@ describe('OpenFoodFactsService', () => {
           ({ reason }) => reason === 'unrecognized_exclusion',
         );
         expect(entry?.when).toContain('could not be reached or gave no usable answer');
+      });
+    });
+
+    describe('answers flagged timed_out (#68)', () => {
+      /** Assert the declared retryable timeout, raised for a flagged body, after a full retry budget. */
+      function expectTimedOutFailure(error: McpErrorish, path: string): void {
+        expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error.data?.reason).toBe('upstream_timeout');
+        expect(error.data?.retryable).toBe(true);
+        expect(error.message).toContain('timed out inside its search engine');
+        expect(requestedPaths()).toEqual([path, path, path, path]);
+      }
+
+      it.each([
+        ['an empty page', TEXT_SEARCH_TIMED_OUT],
+        // A partial page is the dangerous one: its count and is_count_exact look complete.
+        ['hits and an exact count', { ...TEXT_SEARCH_HITS, timed_out: true }],
+        // The flag is read ahead of the shape, so it is not reported as a malformed body.
+        ['no result fields at all', { took: 15000, timed_out: true }],
+      ])('raises upstream_timeout for a text search carrying %s', async (_label, body) => {
+        answerAll(body);
+
+        const error = await settle(() =>
+          svc.searchProducts(
+            { query: 'pasta', page: 1, page_size: 20 },
+            createMockContext({ errors: offSearchProductsTool.errors }),
+          ),
+        );
+
+        expectTimedOutFailure(error, '/search');
+      });
+
+      it.each([
+        ['no options', AUTOCOMPLETE_TIMED_OUT],
+        ['partial options', { ...AUTOCOMPLETE_HITS, timed_out: true }],
+        ['no options key', { took: 15000, timed_out: true }],
+      ])('raises upstream_timeout for an autocomplete carrying %s', async (_label, body) => {
+        answerAll(body);
+
+        const error = await settle(() =>
+          svc.suggestTaxonomy('category', 'hummus', createMockContext()),
+        );
+
+        expectTimedOutFailure(error, '/autocomplete');
+      });
+
+      it('reports the search-engine failure, not the timeout, when a body carries both', async () => {
+        answerAll({ errors: [{ title: 'Too many clauses' }], timed_out: true });
+
+        const error = await settle(() =>
+          svc.searchProducts({ query: 'pasta', page: 1, page_size: 20 }, createMockContext()),
+        );
+
+        expect(error.data?.reason).toBe('upstream_error');
+        expect(error.message).toContain('Too many clauses');
+      });
+
+      it('returns the page a retry brings back once the search stops timing out', async () => {
+        global.fetch = vi
+          .fn()
+          .mockResolvedValueOnce(mockResponse(TEXT_SEARCH_TIMED_OUT))
+          .mockResolvedValue(mockResponse(TEXT_SEARCH_HITS));
+
+        const result = await onFakeTimers(() =>
+          svc.searchProducts({ query: 'nutella', page: 1, page_size: 2 }, createMockContext()),
+        );
+
+        expect(result).toMatchObject({ count: 631, count_is_exact: true, page_count: 2 });
+        expect(requestedPaths()).toEqual(['/search', '/search']);
+      });
+
+      it.each([
+        ['false', false],
+        ['absent', undefined],
+        ['the string "true"', 'true'],
+        ['1', 1],
+        ['null', null],
+      ])('reads an answer whose flag is %s as it always has', async (_label, timed_out) => {
+        const ctx = createMockContext();
+        answerAll({ ...TEXT_SEARCH_EMPTY, timed_out });
+        await expect(
+          svc.searchProducts({ query: 'zzqxwvplmk', page: 1, page_size: 2 }, ctx),
+        ).resolves.toMatchObject({ count: 0, count_is_exact: true, products: [] });
+
+        answerAll({ ...AUTOCOMPLETE_HITS, timed_out });
+        await expect(svc.suggestTaxonomy('category', 'hummus', ctx)).resolves.toEqual([
+          { id: 'en:hummus', name: 'Hummus' },
+        ]);
+        expect(requestedPaths()).toEqual(['/autocomplete']);
+      });
+
+      describe('through the tools', () => {
+        beforeEach(() => {
+          initOpenFoodFactsService();
+          initTaxonomyService();
+        });
+
+        it('fails off_search_products as upstream_timeout, with no rows and no zero-match claim', async () => {
+          answerAll({ ...TEXT_SEARCH_HITS, timed_out: true });
+
+          const result = await onFakeTimers(() =>
+            runToolContract(offSearchProductsTool, { query: 'nutella' }),
+          );
+
+          expect(result.isError).toBe(true);
+          const error = (result.structuredContent as { error: McpErrorish }).error;
+          expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+          expect(error.data?.reason).toBe('upstream_timeout');
+          expect(error.data?.retryable).toBe(true);
+          const text = JSON.stringify(result.content);
+          expect(text).toContain('timed out inside its search engine');
+          expect(text).not.toContain('No products found');
+          expect(text).not.toContain('Nutella');
+        });
+
+        it('answers off_browse_taxonomy from the offline sample, never as no match', async () => {
+          answerAll(AUTOCOMPLETE_TIMED_OUT);
+
+          const result = await onFakeTimers(() =>
+            runToolContract(offBrowseTaxonomyTool, { facet: 'categories', search: 'cheese' }),
+          );
+
+          expect(result.isError).toBeFalsy();
+          const output = result.structuredContent as { tags: { id: string }[]; notice?: string };
+          expect(output.tags.map((tag) => tag.id)).toEqual(['en:cheeses', 'en:fresh-cheeses']);
+          expect(output.notice).toContain('could not be reached or gave no usable answer');
+          expect(output.notice).toContain('timed out inside its search engine');
+          expect(JSON.stringify(result.content)).toContain('offline sample');
+          expect(JSON.stringify(result)).not.toContain('tag matched');
+        });
+
+        it('reads a timed-out lookup of a term the sample lacks as unreachable, not as no match', async () => {
+          answerAll(AUTOCOMPLETE_TIMED_OUT);
+
+          const result = await onFakeTimers(() =>
+            runToolContract(offBrowseTaxonomyTool, { facet: 'categories', search: 'kombucha' }),
+          );
+
+          const output = result.structuredContent as { tags: unknown[]; notice?: string };
+          expect(output.tags).toEqual([]);
+          expect(output.notice).toContain('could not be reached or gave no usable answer');
+          expect(output.notice).not.toContain('tag matched');
+        });
+
+        it('refuses an exclusion it could not confirm as retryable, then confirms it on the next call', async () => {
+          const input = { categories_tag: 'en:yogurts', exclude_allergens: ['en:kiwi'] };
+          answerAll(AUTOCOMPLETE_TIMED_OUT);
+
+          const refused = await onFakeTimers(() => runToolContract(offSearchProductsTool, input));
+
+          expect(refused.isError).toBe(true);
+          const error = (refused.structuredContent as { error: McpErrorish }).error;
+          expect(error.data?.reason).toBe('unrecognized_exclusion');
+          expect(error.data?.retryable).toBe(true);
+          expect(requestedPaths()).toEqual(Array(4).fill('/autocomplete'));
+
+          global.fetch = vi.fn(async (input_: unknown) =>
+            mockResponse(
+              new URL(String(input_)).pathname === '/autocomplete'
+                ? { ...AUTOCOMPLETE_EMPTY, options: [{ id: 'en:kiwi', text: 'Kiwi' }] }
+                : TAG_SEARCH_HITS,
+            ),
+          );
+
+          const confirmed = await runToolContract(offSearchProductsTool, input);
+
+          expect(confirmed.isError).toBeFalsy();
+          expect(requestedPaths()).toEqual(['/autocomplete', '/api/v2/search']);
+        });
       });
     });
   });
@@ -3387,6 +3843,414 @@ describe('OpenFoodFactsService', () => {
       );
       expect(global.fetch).not.toHaveBeenCalled();
     });
+
+    describe('rows outside the constraints, through the tool (#64)', () => {
+      /** Hits from one live capture, as `[code, sugars_100g]`. */
+      function sugarHits(rows: readonly (readonly [string, number])[]): Record<string, unknown>[] {
+        return rows.map(([code, sugars_100g]) => ({ code, nutriments: { sugars_100g } }));
+      }
+
+      /** Page 1 of `yogurt` with `sugars lte 3` at page_size 30, live 2026-10-30: count 5126. */
+      const YOGURT_LTE_3 = [
+        ['0894700010137', 3.53],
+        ['5202234145877', 3.4],
+        ['4056489055952', 3.5],
+        ['8012666051236', 3.9],
+        ['5201054015124', 3],
+        ['0056800828917', 2.86],
+        ['0851463005053', 3.08],
+        ['7613196008656', 3.7000000476837],
+        ['7702001146208', 3.33],
+        ['0851463005015', 3.52],
+        ['0851463005022', 2.64],
+        ['7802930005352', 1.4],
+        ['00957328', 2.94],
+        ['0851463005329', 2.2],
+        ['7702001155439', 3.33],
+        ['5201054015452', 3],
+        ['7707799412009', 2],
+        ['0816284020067', 3.53],
+        ['0096619483556', 1.76],
+        ['15565754', 3.5],
+        ['7613404845844', 3.9],
+        ['4099936000273', 3.7],
+        ['0894700010014', 3.33],
+        ['5201083425130', 3.5],
+        ['4056489056201', 3.9],
+        ['5201054016503', 3],
+        ['7709468612017', 1.4],
+        ['7862126490676', 2.8],
+        ['0193968024680', 3.53],
+        ['1014015040639', 2.5],
+      ] as const;
+
+      /** Page 1 of the `[3,4)` control at page_size 10, live 2026-10-30: count 10000, inexact. */
+      const SUGARS_3_TO_4 = [
+        ['3338310018864', 3.7],
+        ['20534585', 3.6],
+        ['5201310003230', 3.1],
+        ['3263859715410', 3.9],
+        ['3263859715311', 3.9],
+        ['3061432116063', 3.9],
+        ['3021690011111', 3.2],
+        ['8888339005123', 3.4],
+        ['3350030163297', 3.5],
+        ['3171939907825', 3],
+      ] as const;
+
+      /** The band page, clipped the way the live control answered. */
+      function clippedBand(page: number, hits: Record<string, unknown>[]): Response {
+        return mockResponse({
+          count: 10_000,
+          is_count_exact: false,
+          page,
+          page_size: 10,
+          page_count: 1000,
+          hits,
+        });
+      }
+
+      type SearchOutput = {
+        total: number;
+        total_is_lower_bound: boolean;
+        last_page?: number;
+        page_count: number;
+        omitted?: number;
+        outside_constraints?: number;
+        products: { barcode: string; indexed_nutriments?: { sugars_100g?: number } }[];
+        notice?: string;
+        text_index_snapshot?: string;
+        truncated?: boolean;
+      };
+
+      /** Every sugars value a result lists. */
+      function listedSugars(output: SearchOutput): (number | undefined)[] {
+        return output.products.map((row) => row.indexed_nutriments?.sugars_100g);
+      }
+
+      it('filed repro 3: no row above 3, the rows at exactly 3 kept, and the rest counted', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits(YOGURT_LTE_3), 5126));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          query: 'yogurt',
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
+          page_size: 30,
+        });
+
+        expect(result.isError).toBeFalsy();
+        const output = result.structuredContent as SearchOutput;
+        expect(listedSugars(output).every((value) => value !== undefined && value <= 3)).toBe(true);
+        expect(output.products.map((row) => row.barcode)).toEqual(
+          expect.arrayContaining(['5201054015124', '5201054015452', '5201054016503']),
+        );
+        expect(output.products.map((row) => row.barcode)).not.toContain('0894700010137');
+        expect(output).toMatchObject({
+          total: 5126,
+          total_is_lower_bound: false,
+          last_page: 171,
+          page_count: 13,
+          outside_constraints: 17,
+        });
+        expect(output).not.toHaveProperty('omitted');
+        expect(allText(result)).toContain('17 rows on this page were left off');
+        // The row keeps the value the index holds, unrounded.
+        expect(allText(result)).toContain('sugars_100g 2.86 g');
+      });
+
+      it('filed repro 2: a band the old clause emptied now returns its rows', async () => {
+        global.fetch = vi.fn().mockResolvedValue(clippedBand(1, sugarHits(SUGARS_3_TO_4)));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [
+            { nutrient: 'sugars', operator: 'gte', value: 3.5 },
+            { nutrient: 'sugars', operator: 'lte', value: 3.9 },
+          ],
+          page_size: 10,
+        });
+
+        expect(sentQ()).toBe('nutriments.sugars_100g:[3 TO *] nutriments.sugars_100g:[* TO 3.9]');
+        const output = result.structuredContent as SearchOutput;
+        expect(listedSugars(output)).toEqual([3.7, 3.6, 3.9, 3.9, 3.9, 3.5]);
+        expect(output).toMatchObject({ total: 10_000, outside_constraints: 4 });
+        expect(allText(result)).not.toContain('At least 10000 products match');
+      });
+
+      it('sugars gt 3 returns the 3.x rows above 3 and none at or below it', async () => {
+        global.fetch = vi.fn().mockResolvedValue(clippedBand(1, sugarHits(SUGARS_3_TO_4)));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'gt', value: 3 }],
+          page_size: 10,
+        });
+
+        expect(sentQ()).toBe('nutriments.sugars_100g:[3 TO *]');
+        expect(listedSugars(result.structuredContent as SearchOutput)).toEqual([
+          3.7, 3.6, 3.1, 3.9, 3.9, 3.9, 3.2, 3.4, 3.5,
+        ]);
+      });
+
+      it('agrees on outside_constraints across both surfaces on a partly failing page', async () => {
+        global.fetch = vi.fn().mockResolvedValue(
+          textHits(
+            sugarHits([
+              ['3338310018864', 3.7],
+              ['3171939907825', 3],
+            ]),
+            40,
+          ),
+        );
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
+        });
+
+        const output = result.structuredContent as SearchOutput;
+        expect(output.outside_constraints).toBe(1);
+        expect(allText(result)).toContain('1 row on this page was left off');
+        expect(listedSugars(output)).toEqual([3]);
+      });
+
+      it('agrees on outside_constraints across both surfaces on an all-fail page', async () => {
+        global.fetch = vi.fn().mockResolvedValue(clippedBand(1, sugarHits(SUGARS_3_TO_4)));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [
+            { nutrient: 'sugars', operator: 'gt', value: 3.9 },
+            { nutrient: 'sugars', operator: 'lt', value: 4 },
+          ],
+          page_size: 10,
+        });
+
+        const output = result.structuredContent as SearchOutput;
+        expect(output).toMatchObject({ products: [], page_count: 0, outside_constraints: 10 });
+        const text = allText(result);
+        expect(text).toContain('**Page 1 lists no products**');
+        expect(text).toContain('10 rows on this page were left off');
+        expect(output.notice).toContain('Request page 2');
+        expect(text).not.toMatch(/No products found|past the end/);
+      });
+
+      it('pages contiguously past a page that lost rows, keeping offset and total', async () => {
+        const page = (number: number, rows: readonly (readonly [string, number])[]) =>
+          mockResponse({
+            count: 40,
+            is_count_exact: true,
+            page: number,
+            page_size: 20,
+            page_count: 2,
+            hits: sugarHits(rows),
+          });
+        global.fetch = vi
+          .fn()
+          .mockResolvedValueOnce(
+            page(1, [
+              ['3338310018864', 3.7],
+              ['3171939907825', 3],
+            ]),
+          )
+          .mockResolvedValueOnce(
+            page(2, [
+              ['20534585', 2],
+              ['5201310003230', 3.1],
+            ]),
+          );
+
+        const nutrient_filters = [
+          { nutrient: 'sugars' as const, operator: 'lte' as const, value: 3 },
+        ];
+        const first = await runToolContract(offSearchProductsTool, { nutrient_filters });
+        const second = await runToolContract(offSearchProductsTool, { nutrient_filters, page: 2 });
+
+        expect([sentRequest(0).body?.page, sentRequest(1).body?.page]).toEqual([1, 2]);
+        expect([sentRequest(0).body?.page_size, sentRequest(1).body?.page_size]).toEqual([20, 20]);
+        const outputs = [first, second].map(({ structuredContent }) => structuredContent);
+        expect(outputs).toMatchObject([
+          { total: 40, last_page: 2, outside_constraints: 1, truncated: true },
+          { total: 40, last_page: 2, outside_constraints: 1 },
+        ]);
+        expect(outputs[1]).not.toHaveProperty('truncated');
+        expect(listedSugars(outputs[0] as SearchOutput)).toEqual([3]);
+        expect(listedSugars(outputs[1] as SearchOutput)).toEqual([2]);
+      });
+
+      it('fills a capped 50-row page from an over-cap page_size, then reports what it lost', async () => {
+        const hits = Array.from({ length: 50 }, (_, i) => ({
+          code: String(3_017_620_422_003 + i),
+          nutriments: { sugars_100g: i % 2 === 0 ? 2 : 3.5 },
+        }));
+        global.fetch = vi.fn().mockResolvedValue(textHits(hits, 1813));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
+          page_size: 80,
+        });
+
+        expect(sentRequest().body?.page_size).toBe(50);
+        expect(result.structuredContent).toMatchObject({
+          page_size: 50,
+          page_count: 25,
+          outside_constraints: 25,
+          last_page: 37,
+          truncated: true,
+          shown: 25,
+          cap: 50,
+        });
+        expect((result.structuredContent as { page_size_capped?: string }).page_size_capped).toBe(
+          'page_size 80 is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 2 for results 51–100.',
+        );
+        expect(allText(result)).toContain('showing 25)');
+      });
+
+      it('adds neither the field nor its line on a clean constrained page', async () => {
+        global.fetch = vi.fn().mockResolvedValue(
+          textHits(
+            sugarHits([
+              ['3338310018864', 2.7],
+              ['3171939907825', 3],
+            ]),
+            2,
+          ),
+        );
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
+        });
+
+        const output = result.structuredContent as SearchOutput;
+        expect(output).not.toHaveProperty('outside_constraints');
+        expect(listedSugars(output)).toEqual([2.7, 3]);
+        const text = allText(result);
+        expect(text).not.toMatch(/on this page (was|were) left off/);
+        expect(text).toContain('**2 whole-number matches**');
+        expect(text).not.toContain('total products');
+      });
+
+      /** A clipped page of one row at 2, under `nutrient`'s upstream key. */
+      function cleanClippedPage(nutrient: string): Response {
+        return clippedBand(1, [{ code: '3338310018864', nutriments: { [`${nutrient}_100g`]: 2 } }]);
+      }
+
+      it.each(['energy-kcal', 'fat', 'saturated-fat', 'carbohydrates', 'sugars'] as const)(
+        'reads a clean page constrained on %s as the whole-number answer',
+        async (nutrient) => {
+          global.fetch = vi.fn().mockResolvedValue(cleanClippedPage(nutrient));
+
+          const result = await runToolContract(offSearchProductsTool, {
+            nutrient_filters: [{ nutrient, operator: 'lte', value: 3 }],
+          });
+
+          expect(result.structuredContent).not.toHaveProperty('outside_constraints');
+          const text = allText(result);
+          expect(text).toContain('**10000+ whole-number matches**');
+          expect(text).toContain(
+            '*Open Food Facts stops counting its whole-number answer at 10000',
+          );
+          expect(text).not.toContain('At least 10000 products match');
+        },
+      );
+
+      it.each(['fiber', 'proteins', 'salt', 'sodium'] as const)(
+        'keeps the product count on a clean page constrained only on %s',
+        async (nutrient) => {
+          global.fetch = vi.fn().mockResolvedValue(cleanClippedPage(nutrient));
+
+          const result = await runToolContract(offSearchProductsTool, {
+            nutrient_filters: [{ nutrient, operator: 'lte', value: 3 }],
+          });
+
+          const text = allText(result);
+          expect(text).toContain('**10000+ total products**');
+          expect(text).toContain('*At least 10000 products match');
+          expect(text).not.toContain('whole-number');
+        },
+      );
+
+      it('reads a page constrained on both kinds of nutrient as the whole-number answer', async () => {
+        global.fetch = vi
+          .fn()
+          .mockResolvedValue(
+            textHits(
+              [{ code: '3338310018864', nutriments: { salt_100g: 0.1, sugars_100g: 2 } }],
+              7,
+            ),
+          );
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [
+            { nutrient: 'salt', operator: 'lte', value: 1 },
+            { nutrient: 'sugars', operator: 'lte', value: 3 },
+          ],
+        });
+
+        expect(allText(result)).toContain('**7 whole-number matches**');
+      });
+
+      it('keeps the product count on an unconstrained page', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits([{ code: '3338310018864' }], 7));
+
+        const result = await runToolContract(offSearchProductsTool, { query: 'yogurt' });
+
+        const text = allText(result);
+        expect(text).toContain('**7 total products**');
+        expect(text).not.toContain('whole-number');
+      });
+
+      it('states what the totals describe in the snapshot note, naming the nutrients once', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits(SUGARS_3_TO_4), 40));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [
+            { nutrient: 'sugars', operator: 'gte', value: 3.5 },
+            { nutrient: 'sugars', operator: 'lte', value: 3.9 },
+          ],
+        });
+
+        const sentence =
+          'The index compares sugars as whole numbers, so total, total_is_lower_bound, and last_page describe its whole-number answer, and rows of that answer outside these constraints are left off each page and counted in outside_constraints.';
+        expect((result.structuredContent as SearchOutput).text_index_snapshot).toContain(sentence);
+        expect(allText(result)).toContain(sentence);
+      });
+
+      it('names each whole-number nutrient in the snapshot note, and skips the float ones', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits([], 0));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [
+            { nutrient: 'fat', operator: 'gte', value: 1 },
+            { nutrient: 'sugars', operator: 'lt', value: 8 },
+            { nutrient: 'fiber', operator: 'gte', value: 6 },
+          ],
+        });
+
+        expect((result.structuredContent as SearchOutput).text_index_snapshot).toContain(
+          'The index compares fat, sugars as whole numbers,',
+        );
+      });
+
+      it('says nothing of whole numbers on a search constraining only float nutrients', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits([['3338310018864', 7]]), 1));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          nutrient_filters: [{ nutrient: 'fiber', operator: 'gte', value: 6 }],
+        });
+
+        expect((result.structuredContent as SearchOutput).text_index_snapshot).not.toContain(
+          'whole numbers',
+        );
+      });
+
+      it('sends what it always sent, and adds nothing, on a search without nutrient filters', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits(SUGARS_3_TO_4), 10));
+
+        const result = await runToolContract(offSearchProductsTool, { query: 'skyr' });
+
+        const output = result.structuredContent as SearchOutput;
+        expect(sentRequest().body?.fields).toEqual(SEARCH_FIELD_LIST);
+        expect(output.products).toHaveLength(10);
+        expect(output).not.toHaveProperty('outside_constraints');
+        expect(output.text_index_snapshot).not.toContain('whole numbers');
+      });
+    });
   });
 
   // ── #60: a cancellation during tag resolution ends the search ─────────────
@@ -3431,6 +4295,769 @@ describe('OpenFoodFactsService', () => {
       expect(
         vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname),
       ).toEqual(['/autocomplete']);
+    });
+  });
+
+  // ── #72: every read is bounded by one total deadline ──────────────────────
+
+  describe('retry deadline (#72)', () => {
+    const BARCODE = '3017620422003';
+
+    /** One attempt: `hang` holds the request until a signal aborts it; otherwise an HTTP answer. */
+    type Step =
+      | 'hang'
+      | { status: number; body?: unknown; retryAfter?: string; afterMs?: number }
+      | { stalledBody: 'application/json' | 'text/plain' }
+      | { droppedBody: 'application/json' | 'text/plain' };
+
+    /** What Bun raises for a socket closed mid-body, runtime advice included. */
+    const RUNTIME_SOCKET_ERROR =
+      'ECONNRESET: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()';
+
+    /** Scripts fetch attempt by attempt, repeating the last step, and logs each abort reason seen. */
+    function scriptFetch(...steps: Step[]): { abortReasons: unknown[] } {
+      const abortReasons: unknown[] = [];
+      let call = 0;
+      global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+        const step = steps[Math.min(call, steps.length - 1)] as Step;
+        call += 1;
+        return new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal as AbortSignal;
+          let stalled: ReadableStreamDefaultController<Uint8Array> | undefined;
+          signal.addEventListener('abort', () => {
+            abortReasons.push(signal.reason);
+            stalled?.error(signal.reason);
+            reject(signal.reason);
+          });
+          if (step === 'hang') return;
+          if ('stalledBody' in step) {
+            const body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                stalled = controller;
+                controller.enqueue(new TextEncoder().encode('{"status":1,'));
+              },
+            });
+            resolve(new Response(body, { headers: { 'content-type': step.stalledBody } }));
+            return;
+          }
+          if ('droppedBody' in step) {
+            const body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"status":1,'));
+              },
+              pull(controller) {
+                controller.error(new Error(RUNTIME_SOCKET_ERROR));
+              },
+            });
+            resolve(new Response(body, { headers: { 'content-type': step.droppedBody } }));
+            return;
+          }
+          const answer = () => {
+            const response = mockResponse(step.body ?? { detail: 'refused' }, step.status);
+            if (step.retryAfter !== undefined) response.headers.set('retry-after', step.retryAfter);
+            resolve(response);
+          };
+          // A zero timer costs a fake millisecond, which the exact-time assertions would see.
+          if (step.afterMs === undefined) answer();
+          else setTimeout(answer, step.afterMs);
+        });
+      }) as typeof fetch;
+      return { abortReasons };
+    }
+
+    /** Drives `run` on fake timers with jitter off, reporting how it settled and when. */
+    async function clocked<T>(
+      run: () => Promise<T>,
+    ): Promise<{ settledAtMs: number; value?: T; error?: McpErrorish }> {
+      vi.useFakeTimers();
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      try {
+        const start = Date.now();
+        const settled = run().then(
+          (value) => ({ settledAtMs: Date.now() - start, value }),
+          (error: McpErrorish) => ({ settledAtMs: Date.now() - start, error }),
+        );
+        await vi.advanceTimersByTimeAsync(200_000);
+        return await settled;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    /** `clocked` for a tool call, which resolves with a result even when the call failed. */
+    async function clockedTool<T>(
+      run: () => Promise<T>,
+    ): Promise<{ settledAtMs: number; result: T }> {
+      const { settledAtMs, value } = await clocked(run);
+      if (value === undefined) throw new Error('Expected the tool call to resolve.');
+      return { settledAtMs, result: value };
+    }
+
+    /** The pathname of every request the stubbed fetch received, in order. */
+    function requestedPaths(): string[] {
+      return vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname);
+    }
+
+    /** Every read, its budget, and the per-call fields its failures carry. */
+    const READS = [
+      {
+        label: 'getProduct',
+        deadlineMs: 35_000,
+        attempts: 3,
+        operation: `OFF:getProduct:${BARCODE}`,
+        carried: { barcode: BARCODE },
+        read: (ctx: ReturnType<typeof createMockContext>, off: OpenFoodFactsService) =>
+          off.getProduct(BARCODE, ctx),
+      },
+      {
+        label: 'getProductFields',
+        deadlineMs: 35_000,
+        attempts: 3,
+        operation: `OFF:getProductFields:${BARCODE}`,
+        carried: { barcode: BARCODE },
+        read: (ctx: ReturnType<typeof createMockContext>, off: OpenFoodFactsService) =>
+          off.getProductFields(BARCODE, 'product_name', ctx),
+      },
+      {
+        label: 'a text search',
+        deadlineMs: 35_000,
+        attempts: 3,
+        operation: 'OFF:searchProductsByText',
+        carried: { page: 2, page_size: 5 },
+        read: (ctx: ReturnType<typeof createMockContext>, off: OpenFoodFactsService) =>
+          off.searchProducts({ query: 'pasta', page: 2, page_size: 5 }, ctx),
+      },
+      {
+        label: 'a tag search',
+        deadlineMs: 35_000,
+        attempts: 3,
+        operation: 'OFF:searchProductsByTags',
+        carried: { page: 3, page_size: 5 },
+        read: (ctx: ReturnType<typeof createMockContext>, off: OpenFoodFactsService) =>
+          off.searchProducts({ categories_tag: 'en:pastas', page: 3, page_size: 5 }, ctx),
+      },
+      {
+        label: 'suggestTaxonomy',
+        deadlineMs: 20_000,
+        attempts: 2,
+        operation: 'OFF:suggestTaxonomy:category',
+        carried: { taxonomy_name: 'category', term: 'pasta' },
+        read: (ctx: ReturnType<typeof createMockContext>, off: OpenFoodFactsService) =>
+          off.suggestTaxonomy('category', 'pasta', ctx),
+      },
+    ];
+
+    describe('expiry', () => {
+      it.each(READS)(
+        'fails $label at its $deadlineMs ms deadline, as the declared upstream_timeout',
+        async ({ deadlineMs, attempts, operation, carried, read }) => {
+          const { abortReasons } = scriptFetch('hang');
+
+          const { settledAtMs, error } = await clocked<unknown>(() =>
+            read(createMockContext(), svc),
+          );
+
+          expect(settledAtMs).toBe(deadlineMs);
+          expect(error?.code).toBe(JsonRpcErrorCode.Timeout);
+          expect(error?.message).toBe(
+            `Open Food Facts did not respond within the ${deadlineMs / 1000} s retry deadline.`,
+          );
+          expect(error?.data).toMatchObject({
+            ...carried,
+            reason: 'upstream_timeout',
+            retryable: true,
+            retryAttempts: attempts,
+            operation,
+          });
+          // Every attempt but the last hit its own 15 s stall; the clock cut the last one off.
+          expect(global.fetch).toHaveBeenCalledTimes(attempts);
+          expect(abortReasons.at(-1)).toMatchObject({
+            name: 'TimeoutError',
+            message: `${operation} exceeded its ${deadlineMs}ms retry deadline.`,
+          });
+        },
+      );
+
+      it('bounds a ladder of timed-out answers too (#68), each one slow to arrive', async () => {
+        scriptFetch({ status: 200, body: TEXT_SEARCH_TIMED_OUT, afterMs: 14_000 });
+
+        const { settledAtMs, error } = await clocked(() =>
+          svc.searchProducts({ query: 'pasta', page: 1, page_size: 20 }, createMockContext()),
+        );
+
+        expect(settledAtMs).toBe(35_000);
+        expect(error?.data?.reason).toBe('upstream_timeout');
+        expect(global.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('bounds a response body that stalls after its headers arrive', async () => {
+        scriptFetch({ stalledBody: 'application/json' });
+
+        const { settledAtMs, error } = await clocked(() =>
+          svc.getProduct(BARCODE, createMockContext()),
+        );
+
+        expect(settledAtMs).toBe(35_000);
+        expect(error?.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error?.data).toMatchObject({ reason: 'upstream_timeout', retryable: true });
+      });
+    });
+
+    describe('the ladder under the deadline', () => {
+      it('retries a per-attempt timeout, so the attempt signal does not cut the ladder to one', async () => {
+        scriptFetch('hang', { status: 200, body: PRODUCT_FOUND });
+
+        const { settledAtMs, value } = await clocked(() =>
+          svc.getProduct(BARCODE, createMockContext()),
+        );
+
+        expect(value).toMatchObject({ product_name: 'Nutella' });
+        expect(settledAtMs).toBe(15_500);
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('still recovers from a 503, then answers', async () => {
+        scriptFetch({ status: 503 }, { status: 200, body: PRODUCT_FOUND });
+
+        const { value } = await clocked(() => svc.getProduct(BARCODE, createMockContext()));
+
+        expect(value).toMatchObject({ product_name: 'Nutella' });
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('leaves a ladder that exhausts inside the deadline as it was', async () => {
+        scriptFetch({ status: 503 });
+
+        const { settledAtMs, error } = await clocked(() =>
+          svc.getProduct(BARCODE, createMockContext()),
+        );
+
+        expect(settledAtMs).toBe(3_500);
+        expect(error?.data?.reason).toBe('upstream_error');
+        expect(error?.message).toContain('(failed after 4 attempts)');
+        expect(global.fetch).toHaveBeenCalledTimes(4);
+      });
+
+      it.each(['application/json', 'text/plain'] as const)(
+        'declares the failure of a last attempt whose %s body stalled',
+        async (type) => {
+          scriptFetch({ status: 503 }, { status: 503 }, { status: 503 }, { stalledBody: type });
+
+          const { settledAtMs, error } = await clocked(() =>
+            svc.getProduct(BARCODE, createMockContext()),
+          );
+
+          expect(settledAtMs).toBe(18_500);
+          expect(error?.code).toBe(JsonRpcErrorCode.Timeout);
+          expect(error?.data).toMatchObject({
+            barcode: BARCODE,
+            reason: 'upstream_timeout',
+            retryable: true,
+            retryAttempts: 4,
+          });
+          expect(error?.message).toBe(
+            'Open Food Facts did not respond within the request deadline. (failed after 4 attempts)',
+          );
+        },
+      );
+    });
+
+    describe('a 429 the deadline outlives', () => {
+      /** A text search: backoffs of 1, 2, and 4 s with jitter off. */
+      const textSearch = () =>
+        svc.searchProducts({ query: 'pasta', page: 1, page_size: 20 }, createMockContext());
+
+      it.each([
+        {
+          label: 'the next attempt is in flight at expiry',
+          steps: [{ status: 429, retryAfter: '30' }, 'hang'] as Step[],
+          settledAtMs: 35_000,
+          attempts: 2,
+        },
+        {
+          label: 'the backoff would outlast what is left',
+          steps: [
+            { status: 429, afterMs: 14_000 },
+            { status: 429, afterMs: 14_000 },
+            { status: 429, afterMs: 3_500 },
+          ] as Step[],
+          settledAtMs: 34_500,
+          attempts: 3,
+        },
+        {
+          // The third 429 lands at 31 s, and its 4 s backoff ends exactly on the deadline.
+          label: 'the expiry lands during the backoff',
+          steps: [
+            { status: 429, afterMs: 14_000 },
+            { status: 429, afterMs: 14_000 },
+            { status: 429 },
+          ] as Step[],
+          settledAtMs: 35_000,
+          attempts: 3,
+        },
+      ])(
+        'reports the 429, not an outage, when $label',
+        async ({ steps, settledAtMs, attempts }) => {
+          scriptFetch(...steps);
+
+          const result = await clocked(textSearch);
+
+          expect(result.settledAtMs).toBe(settledAtMs);
+          expect(result.error?.code).toBe(JsonRpcErrorCode.RateLimited);
+          expect(result.error?.data).toMatchObject({
+            reason: 'rate_limited',
+            retryable: true,
+            status: 429,
+          });
+          expect(result.error?.message).toContain('is rate-limiting this client (HTTP 429)');
+          expect(global.fetch).toHaveBeenCalledTimes(attempts);
+        },
+      );
+
+      it('carries the Retry-After the upstream sent', async () => {
+        scriptFetch({ status: 429, retryAfter: '30' }, 'hang');
+
+        const { error } = await clocked(textSearch);
+
+        expect(error?.data).toMatchObject({ retryAfter: '30' });
+      });
+
+      it('reports the outage when a later attempt answered something else', async () => {
+        // 429 at 14 s, waits 5 s; 503 at 20 s, waits 2 s; in flight from 22 s until the clock.
+        scriptFetch(
+          { status: 429, retryAfter: '5', afterMs: 14_000 },
+          { status: 503, afterMs: 1_000 },
+          'hang',
+        );
+
+        const { settledAtMs, error } = await clocked(textSearch);
+
+        expect(settledAtMs).toBe(35_000);
+        expect(error?.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error?.data?.reason).toBe('upstream_timeout');
+      });
+
+      it('reports the outage when a later attempt went silent for its whole 15 s', async () => {
+        // 429 at once; then two 15 s stalls end at 33 s, and the 4 s backoff outlasts the rest.
+        scriptFetch({ status: 429 }, 'hang');
+
+        const { settledAtMs, error } = await clocked(textSearch);
+
+        expect(settledAtMs).toBe(33_000);
+        expect(error?.data?.reason).toBe('upstream_timeout');
+        expect(global.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('fails at once on a Retry-After longer than what is left', async () => {
+        scriptFetch('hang', { status: 429, retryAfter: '25' });
+
+        const { settledAtMs, error } = await clocked(() =>
+          svc.getProduct(BARCODE, createMockContext()),
+        );
+
+        expect(settledAtMs).toBe(15_500);
+        expect(error?.data).toMatchObject({ reason: 'rate_limited', retryAfter: '25' });
+      });
+
+      it('leaves the client-side budget refusal to fail at once, whatever came before it', async () => {
+        const budgeted = new OpenFoodFactsService({
+          baseUrl: 'https://world.openfoodfacts.org',
+          rateLimitProduct: 1,
+          rateLimitSearch: 100,
+          rateLimitTaxonomy: 100,
+        });
+        scriptFetch({ status: 429 });
+
+        const { settledAtMs, error } = await clocked(() =>
+          budgeted.getProduct(BARCODE, createMockContext()),
+        );
+
+        expect(settledAtMs).toBe(500);
+        expect(error?.message).toContain('its own client-side budget');
+        expect(global.fetch).toHaveBeenCalledOnce();
+      });
+    });
+
+    describe('through the tools', () => {
+      beforeEach(() => {
+        initOpenFoodFactsService();
+        initTaxonomyService();
+      });
+
+      it('fails off_get_product at 35 s with the declared reason and its recovery hint', async () => {
+        scriptFetch('hang');
+
+        const { settledAtMs, result } = await clockedTool(() =>
+          runToolContract(offGetProductTool, { barcode: BARCODE }),
+        );
+
+        expect(settledAtMs).toBe(35_000);
+        expect(result.isError).toBe(true);
+        const { error } = result.structuredContent as { error: McpErrorish };
+        expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error.data?.reason).toBe('upstream_timeout');
+        expect(error.data?.retryable).toBe(true);
+        const hint = offGetProductTool.errors?.find(
+          (e) => e.reason === 'upstream_timeout',
+        )?.recovery;
+        expect(error.data?.recovery?.hint).toBe(hint);
+        const text = JSON.stringify(result.content);
+        expect(text).toContain('did not respond within the 35 s retry deadline');
+        expect(text).toContain(String(hint));
+        expect(text).not.toContain('retry_deadline_exceeded');
+      });
+
+      it('lists a hung barcode in off_compare_products under its declared reason', async () => {
+        scriptFetch('hang');
+
+        const { settledAtMs, result } = await clockedTool(() =>
+          runToolContract(offCompareProductsTool, { barcodes: [BARCODE, '5449000000996'] }),
+        );
+
+        expect(settledAtMs).toBe(35_000);
+        const { failed } = result.structuredContent as { failed: { reason: string }[] };
+        expect(failed.map(({ reason }) => reason)).toEqual([
+          'upstream_timeout',
+          'upstream_timeout',
+        ]);
+      });
+
+      it('settles a search with tag filters at 55 s: parallel lookups, then one search', async () => {
+        scriptFetch('hang');
+
+        const { settledAtMs, result } = await clockedTool(() =>
+          runToolContract(offSearchProductsTool, {
+            query: 'soup',
+            categories_tag: 'lentil soups',
+            brands_tag: 'en:nowhere',
+            labels_tag: 'never heard of it',
+          }),
+        );
+
+        expect(settledAtMs).toBe(55_000);
+        const { error } = result.structuredContent as { error: McpErrorish };
+        expect(error.data?.reason).toBe('upstream_timeout');
+        const paths = requestedPaths();
+        expect(paths.filter((path) => path === '/autocomplete')).toHaveLength(4);
+        expect(paths.filter((path) => path === '/search')).toHaveLength(3);
+      });
+
+      it('refuses an unconfirmed exclusion at 20 s as retryable, sending no search', async () => {
+        scriptFetch('hang');
+
+        const { settledAtMs, result } = await clockedTool(() =>
+          runToolContract(offSearchProductsTool, {
+            categories_tag: 'en:yogurts',
+            exclude_allergens: ['en:kiwi'],
+          }),
+        );
+
+        expect(settledAtMs).toBe(20_000);
+        const { error } = result.structuredContent as { error: McpErrorish };
+        expect(error.data?.reason).toBe('unrecognized_exclusion');
+        expect(error.data?.retryable).toBe(true);
+        expect(requestedPaths()).toEqual(['/autocomplete', '/autocomplete']);
+      });
+
+      it('answers off_browse_taxonomy from the offline sample at 20 s', async () => {
+        scriptFetch('hang');
+
+        const { settledAtMs, result } = await clockedTool(() =>
+          runToolContract(offBrowseTaxonomyTool, { facet: 'categories', search: 'cheese' }),
+        );
+
+        expect(settledAtMs).toBe(20_000);
+        expect(result.isError).toBeFalsy();
+        const output = result.structuredContent as { tags: { id: string }[]; notice?: string };
+        expect(output.tags.map((tag) => tag.id)).toEqual(['en:cheeses', 'en:fresh-cheeses']);
+        expect(output.notice).toContain('could not be reached or gave no usable answer');
+        expect(output.notice).toContain('did not respond within the 20 s retry deadline');
+        expect(JSON.stringify(result)).not.toContain('tag matched');
+      });
+    });
+
+    describe('a connection dropped mid-body (#74)', () => {
+      const DROPPED_MESSAGE = 'Open Food Facts closed the connection before finishing its answer.';
+      /** Fragments of the runtime's error, none of which belongs on either surface. */
+      const RUNTIME_TEXT = /ECONNRESET|socket|verbose|second argument/;
+
+      describe.each(['application/json', 'text/plain'] as const)('on a %s body', (type) => {
+        it.each(READS)(
+          'fails $label as the retryable upstream_error after four attempts',
+          async ({ operation, carried, read }) => {
+            scriptFetch({ droppedBody: type });
+
+            const { error } = await clocked<unknown>(() => read(createMockContext(), svc));
+
+            expect(error?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+            expect(error?.message).toBe(`${DROPPED_MESSAGE} (failed after 4 attempts)`);
+            expect(error?.data).toMatchObject({
+              ...carried,
+              reason: 'upstream_error',
+              retryable: true,
+              retryAttempts: 4,
+              operation,
+            });
+            expect(global.fetch).toHaveBeenCalledTimes(4);
+            expect(JSON.stringify(error?.data)).not.toMatch(RUNTIME_TEXT);
+          },
+        );
+
+        it('keeps the runtime error as the cause, off the message and data', async () => {
+          scriptFetch({ droppedBody: type });
+
+          const { error } = await clocked(() => svc.getProduct(BARCODE, createMockContext()));
+
+          const chain: unknown[] = [];
+          for (let link: unknown = error; link instanceof Error; link = link.cause) {
+            chain.push(link);
+          }
+          expect(chain.at(-1)).toMatchObject({ message: RUNTIME_SOCKET_ERROR });
+        });
+
+        it('serves the answer of an attempt after the drop', async () => {
+          scriptFetch({ droppedBody: type }, { status: 200, body: PRODUCT_FOUND });
+
+          const { value } = await clocked(() => svc.getProduct(BARCODE, createMockContext()));
+
+          expect(value).toEqual(PRODUCT_FOUND.product);
+          expect(global.fetch).toHaveBeenCalledTimes(2);
+        });
+      });
+
+      describe('through the tools', () => {
+        beforeEach(() => {
+          initOpenFoodFactsService();
+          initTaxonomyService();
+        });
+
+        it('fails off_get_product with the declared reason and its recovery hint', async () => {
+          scriptFetch({ droppedBody: 'application/json' });
+
+          const { result } = await clockedTool(() =>
+            runToolContract(offGetProductTool, { barcode: BARCODE }),
+          );
+
+          expect(result.isError).toBe(true);
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+          expect(error.data).toMatchObject({
+            reason: 'upstream_error',
+            retryable: true,
+            retryAttempts: 4,
+          });
+          const hint = offGetProductTool.errors?.find(
+            (e) => e.reason === 'upstream_error',
+          )?.recovery;
+          expect(error.data?.recovery?.hint).toBe(hint);
+          const text = JSON.stringify(result.content);
+          expect(text).toContain(DROPPED_MESSAGE);
+          expect(text).toContain(String(hint));
+          expect(JSON.stringify(result)).not.toMatch(RUNTIME_TEXT);
+        });
+
+        it.each([
+          ['the text backend', { query: 'soup' }, '/search'],
+          ['the tag backend', { categories_tag: 'en:soups' }, '/api/v2/search'],
+        ])('fails off_search_products on %s the same way', async (_label, input, path) => {
+          scriptFetch({ droppedBody: 'application/json' });
+
+          const { result } = await clockedTool(() => runToolContract(offSearchProductsTool, input));
+
+          expect(result.isError).toBe(true);
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.data).toMatchObject({ reason: 'upstream_error', retryable: true });
+          expect(JSON.stringify(result.content)).toContain(DROPPED_MESSAGE);
+          expect(JSON.stringify(result)).not.toMatch(RUNTIME_TEXT);
+          expect(requestedPaths()).toEqual(Array(4).fill(path));
+        });
+
+        it('lists the barcode in off_compare_products failed, without the runtime text', async () => {
+          scriptFetch({ droppedBody: 'application/json' });
+
+          const { result } = await clockedTool(() =>
+            runToolContract(offCompareProductsTool, { barcodes: [BARCODE, '5449000000996'] }),
+          );
+
+          const { failed } = result.structuredContent as {
+            failed: { barcode: string; reason: string; error: string }[];
+          };
+          expect(failed.map(({ reason }) => reason)).toEqual(['upstream_error', 'upstream_error']);
+          expect(failed[0]?.error).toContain(DROPPED_MESSAGE);
+          expect(JSON.stringify(result)).not.toMatch(RUNTIME_TEXT);
+        });
+
+        it('answers off_browse_taxonomy from the offline sample, naming the dropped connection', async () => {
+          scriptFetch({ droppedBody: 'application/json' });
+
+          const { result } = await clockedTool(() =>
+            runToolContract(offBrowseTaxonomyTool, { facet: 'categories', search: 'cheese' }),
+          );
+
+          expect(result.isError).toBeFalsy();
+          const output = result.structuredContent as { tags: { id: string }[]; notice?: string };
+          expect(output.tags.map((tag) => tag.id)).toEqual(['en:cheeses', 'en:fresh-cheeses']);
+          expect(output.notice).toContain(DROPPED_MESSAGE);
+          expect(JSON.stringify(result)).not.toMatch(RUNTIME_TEXT);
+        });
+
+        it('sends a tag whose lookup dropped as unconfirmed, and the search still answers', async () => {
+          scriptFetch(...Array<Step>(4).fill({ droppedBody: 'application/json' }), {
+            status: 200,
+            body: { ...TEXT_SEARCH_HITS, hits: [], count: 0 },
+          });
+
+          const { result } = await clockedTool(() =>
+            runToolContract(offSearchProductsTool, {
+              query: 'soup',
+              categories_tag: 'lentil soups',
+            }),
+          );
+
+          expect(result.isError).toBeFalsy();
+          expect((result.structuredContent as { notice?: string }).notice).toContain(
+            'could not be reached or gave no usable answer, so it went unchecked',
+          );
+          expect(JSON.stringify(result)).not.toMatch(RUNTIME_TEXT);
+          expect(requestedPaths()).toEqual([...Array(4).fill('/autocomplete'), '/search']);
+        });
+
+        it('refuses an exclusion whose lookup dropped as retryable, sending no search', async () => {
+          scriptFetch({ droppedBody: 'application/json' });
+
+          const { result } = await clockedTool(() =>
+            runToolContract(offSearchProductsTool, {
+              categories_tag: 'en:yogurts',
+              exclude_allergens: ['en:kiwi'],
+            }),
+          );
+
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.data).toMatchObject({ reason: 'unrecognized_exclusion', retryable: true });
+          expect(JSON.stringify(result)).not.toMatch(RUNTIME_TEXT);
+          expect(requestedPaths()).toEqual(Array(4).fill('/autocomplete'));
+        });
+      });
+    });
+
+    describe('caller cancellation keeps precedence (#60)', () => {
+      beforeEach(() => {
+        initOpenFoodFactsService();
+      });
+
+      describe('mid-body', () => {
+        beforeEach(() => {
+          initTaxonomyService();
+        });
+
+        /** Answers with a body that errors as a real fetch does once `controller` aborts in its read. */
+        function abortMidBody(controller: AbortController, type: string): void {
+          global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+            const signal = init?.signal as AbortSignal;
+            const body = new ReadableStream<Uint8Array>({
+              start(stream) {
+                signal.addEventListener('abort', () => stream.error(signal.reason));
+                stream.enqueue(new TextEncoder().encode('{"status":1,'));
+              },
+              pull() {
+                controller.abort();
+              },
+            });
+            return Promise.resolve(new Response(body, { headers: { 'content-type': type } }));
+          }) as typeof fetch;
+        }
+
+        const JSON_BODY = 'application/json';
+
+        it.each([
+          { tool: offGetProductTool, input: { barcode: BARCODE }, type: JSON_BODY },
+          { tool: offGetProductTool, input: { barcode: BARCODE }, type: 'text/plain' },
+          { tool: offSearchProductsTool, input: { query: 'soup' }, type: JSON_BODY },
+          {
+            tool: offCompareProductsTool,
+            input: { barcodes: [BARCODE, '5449000000996'] },
+            type: JSON_BODY,
+          },
+          {
+            tool: offBrowseTaxonomyTool,
+            input: { facet: 'categories', search: 'cheese' },
+            type: JSON_BODY,
+          },
+        ])('ends $tool.name as cancelled on a $type body', async ({ tool, input, type }) => {
+          const controller = new AbortController();
+          abortMidBody(controller, type);
+
+          const { settledAtMs, result } = await clockedTool(() =>
+            runToolContract(tool as never, input as never, {
+              context: { signal: controller.signal },
+            }),
+          );
+
+          expect(settledAtMs).toBe(0);
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+          expect(error.message).toContain('aborted');
+          expect(JSON.stringify(result.content)).toContain('aborted');
+          expect(JSON.stringify(result)).not.toMatch(/closed the connection|upstream_error/);
+        });
+      });
+
+      it('ends as cancelled when the abort lands in a retried attempt', async () => {
+        const controller = new AbortController();
+        let calls = 0;
+        global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+          calls += 1;
+          if (calls === 1) return Promise.resolve(mockResponse('unavailable', 503));
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () =>
+              reject(new DOMException('The operation was aborted.', 'AbortError')),
+            );
+            controller.abort();
+          });
+        }) as typeof fetch;
+
+        const { settledAtMs, result } = await clockedTool(() =>
+          runToolContract(
+            offGetProductTool,
+            { barcode: BARCODE },
+            { context: { signal: controller.signal, errors: offGetProductTool.errors } },
+          ),
+        );
+
+        expect(settledAtMs).toBe(500);
+        const { error } = result.structuredContent as { error: McpErrorish };
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        expect(error.message).toContain('was aborted');
+        expect(JSON.stringify(result.content)).toContain('was aborted');
+        expect(JSON.stringify(result)).not.toContain('retry deadline');
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('ends as cancelled when the abort lands in a backoff', async () => {
+        const controller = new AbortController();
+        global.fetch = vi.fn(async () => mockResponse('unavailable', 503));
+
+        vi.useFakeTimers();
+        try {
+          const pending = runToolContract(
+            offGetProductTool,
+            { barcode: BARCODE },
+            { context: { signal: controller.signal, errors: offGetProductTool.errors } },
+          );
+          await vi.advanceTimersByTimeAsync(100);
+          controller.abort();
+          await vi.advanceTimersByTimeAsync(0);
+          const result = await pending;
+
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+          expect(JSON.stringify(result.content)).toContain('aborted');
+          expect(JSON.stringify(result)).not.toContain('retry deadline');
+          expect(global.fetch).toHaveBeenCalledOnce();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
     });
   });
 });

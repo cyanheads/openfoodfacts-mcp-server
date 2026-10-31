@@ -4,15 +4,14 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { MAX_AUTOCOMPLETE_SIZE } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
 import { mdInline, mdInlineCode } from '@/utils/markdown.js';
 
 /**
- * Most tags one call returns. A larger `limit`, up to the suggestions one live lookup reads
- * (`MAX_AUTOCOMPLETE_SIZE`), returns this many and discloses the cut when more matched.
+ * Most tags one call returns. A larger `limit` returns this many and discloses the cut when more
+ * matched.
  */
-const TAXONOMY_LIMIT_CAP = 100;
+const TAXONOMY_LIMIT_CAP = 200;
 
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
@@ -44,14 +43,20 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .describe(
         'Term to resolve. Matched case-insensitively as a substring of the tag ID, the display name, or a common synonym of either ("shellfish" resolves to en:crustaceans, "gluten free" to en:no-gluten). A single word works best ("hummus", not "hummus dip"). Omit only to see a small reference list — Open Food Facts cannot list the full vocabulary without a term, so an unfiltered call is not a view of the full facet.',
       ),
+    // `.int()` would advertise a `maximum` of 2^53 - 1 for a value the handler clamps to the cap.
     limit: z
       .number()
-      .int()
+      .multipleOf(1, 'Send limit as a whole number, not a fractional one.')
+      // multipleOf tolerates float noise (20.000000000000004). It stays for what it advertises; this
+      // closes the gap, only where it passed, so 1.5 reports once.
+      .refine(Number.isInteger, {
+        error: 'Send limit as a whole number, not a fractional one.',
+        when: ({ issues }) => issues.length === 0,
+      })
       .min(1)
-      .max(MAX_AUTOCOMPLETE_SIZE)
       .default(20)
       .describe(
-        `Maximum entries to return (default 20). One call returns at most ${TAXONOMY_LIMIT_CAP}: a larger value, up to ${MAX_AUTOCOMPLETE_SIZE} (the most suggestions one lookup reads), returns the first ${TAXONOMY_LIMIT_CAP} and, when more matched, says how many did. There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag spelling the term itself (e.g. "lentil" → en:lentils) is listed first among the live matches, so it is not the one a small limit cuts.`,
+        `Maximum entries to return (default 20). One call returns at most ${TAXONOMY_LIMIT_CAP}: a larger value returns the first ${TAXONOMY_LIMIT_CAP} and, when more matched, says how many did. There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag spelling the term itself (e.g. "lentil" → en:lentils) is listed first among the live matches, so it is not the one a small limit cuts.`,
       ),
   }),
 

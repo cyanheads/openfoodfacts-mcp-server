@@ -44,6 +44,102 @@ function contractText(result: { content?: { type: string; text?: string }[] }): 
     .join('\n');
 }
 
+/**
+ * The table printed under `heading`, one record per row keyed by column header, in column order.
+ * Undefined when the heading is not printed, so "no such table" and "an empty one" stay distinct.
+ */
+function tableUnder(text: string, heading: string): Record<string, string>[] | undefined {
+  const lines = text.split('\n');
+  const at = lines.indexOf(heading);
+  if (at === -1) return;
+  const cells = (line: string): string[] =>
+    line
+      .slice(1, -1)
+      .split(/(?<!\\)\|/)
+      .map((cell) => cell.trim());
+  const end = lines.findIndex((line, i) => i > at && !line.startsWith('|'));
+  const [header = '', , ...rows] = lines.slice(at + 1, end === -1 ? undefined : end);
+  const columns = cells(header);
+  return rows.map((row) => {
+    const values = cells(row);
+    return Object.fromEntries(columns.map((column, i) => [column, values[i] ?? '']));
+  });
+}
+
+/** The per-100 keys of 7310100605412, as sold, from the v2 product route. */
+const LINGUINE = {
+  product_name: 'Gluten-Free Linguine Pasta',
+  nutriments: {
+    'added-sugars_100g': 0,
+    carbohydrates_100g: 75,
+    'energy-kcal_100g': 359.5,
+    'energy-kj_100g': 1524,
+    energy_100g: 1524,
+    fat_100g: 2.5,
+    fiber_100g: 2.5,
+    proteins_100g: 8,
+    salt_100g: 0.03,
+    'saturated-fat_100g': 1,
+    sodium_100g: 0.012,
+    sugars_100g: 1,
+  },
+};
+
+/** The per-100 keys of 8076809545440, as sold, from the v2 product route. */
+const SPAGHETTI = {
+  product_name: 'Spaghetti senza glutine mais riso',
+  nutriments: {
+    carbohydrates_100g: 79,
+    'energy-kcal_100g': 358,
+    'energy-kj_100g': 1517.8,
+    energy_100g: 1517.8,
+    fat_100g: 1.5,
+    fiber_100g: 1.1,
+    proteins_100g: 6.5,
+    salt_100g: 0.01,
+    'saturated-fat_100g': 0.3,
+    sodium_100g: 0.004,
+    starch_100g: 0,
+    sugars_100g: 0.5,
+  },
+};
+
+/**
+ * The per-100 and per-serving keys of 7613035530799 from the v2 product route. The read carries the
+ * prepared set alone: the record stores as-sold figures too, 327 kcal among them, and API v2 returns
+ * one preparation state per record.
+ */
+const NESQUIK = {
+  product_name: 'NESQUIK Moins de Sucres',
+  brands: 'Société des Produits Nestlé S.A.',
+  nutriments: {
+    calcium_prepared_100g: 0.12,
+    calcium_prepared_serving: 0.252,
+    carbohydrates_prepared_100g: 7.6,
+    carbohydrates_prepared_serving: 16,
+    'energy-kcal_prepared_100g': 68,
+    'energy-kcal_prepared_serving': 143,
+    'energy-kj_prepared_100g': 287,
+    'energy-kj_prepared_serving': 603,
+    energy_prepared_100g: 287,
+    energy_prepared_serving: 603,
+    fat_prepared_100g: 1.9,
+    fat_prepared_serving: 3.99,
+    fiber_prepared_100g: 1.9,
+    fiber_prepared_serving: 3.99,
+    proteins_prepared_100g: 3.8,
+    proteins_prepared_serving: 7.98,
+    salt_prepared_100g: 0.12,
+    salt_prepared_serving: 0.252,
+    'saturated-fat_prepared_100g': 1.1,
+    'saturated-fat_prepared_serving': 2.31,
+    sodium_prepared_100g: 0.048,
+    sodium_prepared_serving: 0.101,
+    sugars_prepared_100g: 6.3,
+    sugars_prepared_serving: 13.2,
+  },
+};
+
 /** Wrap a JSON body + status in a minimal Response-like mock, as a real fetch would resolve. */
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -974,6 +1070,7 @@ describe('off_compare_products', () => {
         'energy_kcal_100g',
         'fat_100g',
         'saturated_fat_100g',
+        'carbohydrates_100g',
         'sugars_100g',
         'salt_100g',
         'proteins_100g',
@@ -1131,5 +1228,463 @@ describe('off_compare_products', () => {
         expect(output.products[0]?.brands).toBe(brands);
       },
     );
+  });
+
+  // ── the nutrition columns: one figure, one header, nothing derived ────────
+
+  describe('nutrition columns', () => {
+    const TABLE = '### Nutrition per 100 g / 100 ml';
+
+    it('keeps every figure under its own header, and N/A where one is absent', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [
+            {
+              barcode: '12345678',
+              product_name: 'Full',
+              found: true,
+              energy_kcal_100g: 1,
+              fat_100g: 2,
+              saturated_fat_100g: 3,
+              sugars_100g: 4,
+              salt_100g: 5,
+              proteins_100g: 6,
+              fiber_100g: 7,
+            },
+            { barcode: '87654321', product_name: 'Sparse', found: true, sugars_100g: 0 },
+          ],
+          succeeded: 2,
+          not_found: [],
+        }),
+      );
+
+      expect(tableUnder(text, TABLE)).toMatchObject([
+        {
+          Product: 'Full',
+          'Energy (kcal)': '1',
+          'Fat (g)': '2',
+          'Sat. Fat (g)': '3',
+          'Sugars (g)': '4',
+          'Salt (g)': '5',
+          'Protein (g)': '6',
+          'Fiber (g)': '7',
+        },
+        {
+          Product: 'Sparse',
+          'Energy (kcal)': 'N/A',
+          'Fat (g)': 'N/A',
+          'Sat. Fat (g)': 'N/A',
+          'Sugars (g)': '0',
+          'Salt (g)': 'N/A',
+          'Protein (g)': 'N/A',
+          'Fiber (g)': 'N/A',
+        },
+      ]);
+    });
+
+    it('leaves a non-numeric upstream figure absent rather than coercing it', async () => {
+      mockGetProductFields.mockResolvedValue({
+        product_name: 'Strings',
+        nutriments: { 'energy-kcal_100g': 10, fat_100g: '3.2', sugars_100g: '' },
+      });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['12345678', '87654321'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).toEqual({
+        barcode: '12345678',
+        product_name: 'Strings',
+        found: true,
+        energy_kcal_100g: 10,
+      });
+    });
+
+    it('closes a batch with no prepared figures on the crowd-sourced footer', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [{ barcode: '12345678', found: true, energy_kcal_100g: 1 }],
+          succeeded: 1,
+          not_found: [],
+        }),
+      );
+
+      expect(text.split('\n').at(-1)).toBe(
+        '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered.*',
+      );
+    });
+
+    // ── #71: total carbohydrates ────────────────────────────────────────────
+
+    it('carries both live carbohydrate figures on both surfaces, one fetch each (#71)', async () => {
+      mockGetProductFields.mockResolvedValueOnce(LINGUINE).mockResolvedValueOnce(SPAGHETTI);
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['7310100605412', '8076809545440'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows.map((row) => row.carbohydrates_100g)).toEqual([75, 79]);
+      expect(rows.map((row) => row.sugars_100g)).toEqual([1, 0.5]);
+      const table = tableUnder(contractText(result), TABLE);
+      expect(table?.map((row) => row['Carbohydrates (g)'])).toEqual(['75', '79']);
+      expect(mockGetProductFields).toHaveBeenCalledTimes(2);
+    });
+
+    it('prints the Carbohydrates column between Sat. Fat and Sugars (#71)', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [{ barcode: '12345678', found: true, carbohydrates_100g: 75 }],
+          succeeded: 1,
+          not_found: [],
+        }),
+      );
+
+      expect(Object.keys(tableUnder(text, TABLE)?.[0] ?? {})).toEqual([
+        'Product',
+        'Energy (kcal)',
+        'Fat (g)',
+        'Sat. Fat (g)',
+        'Carbohydrates (g)',
+        'Sugars (g)',
+        'Salt (g)',
+        'Protein (g)',
+        'Fiber (g)',
+      ]);
+    });
+
+    it('never derives carbohydrates: no key leaves the field absent and the text N/A (#71)', async () => {
+      mockGetProductFields.mockResolvedValue({
+        product_name: 'Sugars only',
+        nutriments: { sugars_100g: 12, fiber_100g: 3 },
+      });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['12345678', '87654321'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).not.toHaveProperty('carbohydrates_100g');
+      const table = tableUnder(contractText(result), TABLE);
+      expect(table?.[0]?.['Carbohydrates (g)']).toBe('N/A');
+    });
+
+    it('leaves a non-numeric carbohydrate figure absent, like the other columns (#71)', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce({
+          product_name: 'String carbs',
+          nutriments: { carbohydrates_100g: '75', sugars_100g: 1 },
+        })
+        .mockResolvedValueOnce(LINGUINE);
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['12345678', '7310100605412'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).not.toHaveProperty('carbohydrates_100g');
+      expect(rows[0]?.sugars_100g).toBe(1);
+      expect(rows[1]?.carbohydrates_100g).toBe(75);
+    });
+
+    it('never fills as-sold carbohydrates from a prepared figure (#71)', async () => {
+      mockGetProductFields.mockResolvedValueOnce(NESQUIK).mockResolvedValueOnce(SPAGHETTI);
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['7613035530799', '8076809545440'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).not.toHaveProperty('carbohydrates_100g');
+      expect(rows[1]?.carbohydrates_100g).toBe(79);
+    });
+
+    it('names carbohydrates in the tool description (#71)', () => {
+      expect(offCompareProductsTool.description).toContain(
+        'saturated fat, carbohydrates, sugars, salt, protein, and fiber',
+      );
+    });
+  });
+
+  // ── #59: prepared figures keep to their own object and table ──────────────
+
+  describe('prepared figures (#59)', () => {
+    const AS_SOLD = '### Nutrition per 100 g / 100 ml';
+    const AS_PREPARED = '### Nutrition per 100 g / 100 ml, as prepared';
+    const ROW = offCompareProductsTool.output.shape.products.element.shape;
+
+    /** The footer as printed when an "as prepared" table sits above it. */
+    const SCOPED_FOOTER =
+      '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" outside the "as prepared" table = not yet entered.*';
+
+    /** Run two records through the tool and return both surfaces. */
+    async function compareTwo(first: object, second: object) {
+      mockGetProductFields.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['7613035530799', '8076809545440'],
+      });
+      const { products } = result.structuredContent as { products: Record<string, unknown>[] };
+      return { rows: products, text: contractText(result) };
+    }
+
+    it('splits a prepared-only row from an as-sold row across the two tables', async () => {
+      const { rows, text } = await compareTwo(NESQUIK, SPAGHETTI);
+
+      expect(rows[0]).toEqual({
+        barcode: '7613035530799',
+        product_name: NESQUIK.product_name,
+        brands: NESQUIK.brands,
+        found: true,
+        prepared: {
+          energy_kcal_100g: 68,
+          fat_100g: 1.9,
+          saturated_fat_100g: 1.1,
+          carbohydrates_100g: 7.6,
+          sugars_100g: 6.3,
+          salt_100g: 0.12,
+          proteins_100g: 3.8,
+          fiber_100g: 1.9,
+        },
+      });
+      expect(rows[1]).not.toHaveProperty('prepared');
+      expect(rows[1]?.energy_kcal_100g).toBe(358);
+
+      const nesquik = 'NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.)';
+      expect(tableUnder(text, AS_SOLD)?.map((row) => row.Product)).toEqual([
+        SPAGHETTI.product_name,
+      ]);
+      expect(tableUnder(text, AS_PREPARED)).toEqual([
+        {
+          Product: nesquik,
+          'Energy (kcal)': '68',
+          'Fat (g)': '1.9',
+          'Sat. Fat (g)': '1.1',
+          'Carbohydrates (g)': '7.6',
+          'Sugars (g)': '6.3',
+          'Salt (g)': '0.12',
+          'Protein (g)': '3.8',
+          'Fiber (g)': '1.9',
+        },
+      ]);
+      // The Scores table still lists both.
+      expect(tableUnder(text, '### Scores')).toHaveLength(2);
+      expect(mockGetProductFields).toHaveBeenCalledTimes(2);
+    });
+
+    it('says the read returned no as-sold figures, never that the record has none', async () => {
+      const { text } = await compareTwo(NESQUIK, SPAGHETTI);
+
+      expect(text).toContain(
+        '*This read returned no as-sold figures for NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.). Open Food Facts returns one preparation state per read, so the record can still hold them.*',
+      );
+      expect(text).not.toMatch(/(record|product) (has|holds|carries) no/i);
+    });
+
+    it('gives the "as prepared" table N/A wording true of it, scoping the footer', async () => {
+      const { text } = await compareTwo(
+        { product_name: 'One figure', nutriments: { fat_prepared_100g: 1.9 } },
+        SPAGHETTI,
+      );
+      const lines = text.split('\n');
+
+      expect(lines).toContain('*In this table, "N/A" = no prepared figure in this read.*');
+      expect(lines.at(-1)).toBe(SCOPED_FOOTER);
+      expect(lines).not.toContain(
+        '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered.*',
+      );
+    });
+
+    it('renders a row with one prepared figure, N/A in every other column', async () => {
+      const { rows, text } = await compareTwo(
+        { product_name: 'One figure', nutriments: { fat_prepared_100g: 1.9 } },
+        SPAGHETTI,
+      );
+
+      expect(rows[0]?.prepared).toEqual({ fat_100g: 1.9 });
+      expect(tableUnder(text, AS_PREPARED)).toEqual([
+        {
+          Product: 'One figure',
+          'Energy (kcal)': 'N/A',
+          'Fat (g)': '1.9',
+          'Sat. Fat (g)': 'N/A',
+          'Carbohydrates (g)': 'N/A',
+          'Sugars (g)': 'N/A',
+          'Salt (g)': 'N/A',
+          'Protein (g)': 'N/A',
+          'Fiber (g)': 'N/A',
+        },
+      ]);
+    });
+
+    it('prints no as-sold table when every found row is prepared-only', async () => {
+      const { text } = await compareTwo(NESQUIK, {
+        product_name: 'Cacao',
+        nutriments: { 'energy-kcal_prepared_100g': 72 },
+      });
+
+      expect(tableUnder(text, AS_SOLD)).toBeUndefined();
+      expect(tableUnder(text, AS_PREPARED)).toHaveLength(2);
+      expect(tableUnder(text, '### Scores')).toHaveLength(2);
+      expect(text.split('\n').at(-1)).toBe(SCOPED_FOOTER);
+      expect(text).toContain(
+        '*This read returned no as-sold figures for NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.), Cacao.',
+      );
+    });
+
+    it('prints no "as prepared" table or wording when no row carries prepared figures', async () => {
+      mockGetProductFields.mockResolvedValueOnce(LINGUINE).mockResolvedValueOnce(SPAGHETTI);
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['7310100605412', '8076809545440'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).not.toHaveProperty('prepared');
+      expect(rows[1]).not.toHaveProperty('prepared');
+      const text = contractText(result);
+      expect(tableUnder(text, AS_SOLD)).toHaveLength(2);
+      expect(text).not.toMatch(/prepared/i);
+      expect(text.split('\n').at(-1)).toBe(
+        '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered.*',
+      );
+    });
+
+    it('keeps a row holding both states in both tables, with no read-only claim', async () => {
+      const { rows, text } = await compareTwo(
+        {
+          product_name: 'Both states',
+          nutriments: { fat_100g: 30, fat_prepared_100g: 2, sugars_prepared_100g: 1 },
+        },
+        NESQUIK,
+      );
+
+      expect(rows[0]?.fat_100g).toBe(30);
+      expect(rows[0]?.prepared).toEqual({ fat_100g: 2, sugars_100g: 1 });
+      expect(tableUnder(text, AS_SOLD)?.map((row) => [row.Product, row['Fat (g)']])).toEqual([
+        ['Both states', '30'],
+      ]);
+      expect(tableUnder(text, AS_PREPARED)?.[0]).toMatchObject({
+        Product: 'Both states',
+        'Fat (g)': '2',
+        'Sugars (g)': '1',
+      });
+      // Only the prepared-only row is named as having no as-sold figures.
+      expect(text).toContain('no as-sold figures for NESQUIK');
+      expect(text).not.toContain('no as-sold figures for Both states');
+    });
+
+    it('reads no figure the prepared columns do not name', async () => {
+      const { rows } = await compareTwo(
+        { product_name: 'kJ only', nutriments: { 'energy-kj_prepared_100g': 287 } },
+        {
+          product_name: 'kJ and fat',
+          nutriments: { 'energy-kj_prepared_100g': 287, fat_prepared_100g: 2 },
+        },
+      );
+
+      expect(rows[0]).not.toHaveProperty('prepared');
+      expect(rows[1]?.prepared).toEqual({ fat_100g: 2 });
+    });
+
+    it('builds no prepared object from per-serving figures alone', async () => {
+      const { rows, text } = await compareTwo(
+        {
+          product_name: 'Serving only',
+          nutriments: { 'energy-kcal_prepared_serving': 143, fat_prepared_serving: 3.99 },
+        },
+        SPAGHETTI,
+      );
+
+      expect(rows[0]).not.toHaveProperty('prepared');
+      expect(tableUnder(text, AS_PREPARED)).toBeUndefined();
+    });
+
+    it('leaves a non-numeric prepared figure absent', async () => {
+      const { rows } = await compareTwo(
+        {
+          product_name: 'Strings',
+          nutriments: { fat_prepared_100g: '1.9', sugars_prepared_100g: 6.3 },
+        },
+        SPAGHETTI,
+      );
+
+      expect(rows[0]?.prepared).toEqual({ sugars_100g: 6.3 });
+    });
+
+    it('keeps the settlement fields beside a prepared row', async () => {
+      mockGetProductFields.mockImplementation(async (barcode: string) => {
+        if (barcode === '7613035530799') return NESQUIK;
+        if (barcode === '8076809545440') return null;
+        throw serviceUnavailable('Open Food Facts is down.');
+      });
+      const failing = Array.from({ length: 10 }, (_, i) => String(1000000000001 + i));
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['7613035530799', '7613035530799', '8076809545440', ...failing],
+      });
+
+      const output = result.structuredContent as {
+        products: { barcode: string; prepared?: object }[];
+        not_found: string[];
+        failed?: { barcode: string; reason: string }[];
+        unprocessed?: string[];
+      };
+      expect(output.products.map((row) => row.barcode)).toEqual(['7613035530799', '8076809545440']);
+      expect(output.products[0]?.prepared).toMatchObject({ energy_kcal_100g: 68 });
+      expect(output.not_found).toEqual(['8076809545440']);
+      expect(output.failed?.map((entry) => entry.barcode)).toEqual(failing.slice(0, 8));
+      expect(output.unprocessed).toEqual(failing.slice(8));
+      // One fetch per distinct barcode compared: the repeat and the unprocessed two cost none.
+      expect(mockGetProductFields).toHaveBeenCalledTimes(10);
+    });
+
+    it('adds nothing to a batch in which no barcode resolved', async () => {
+      mockGetProductFields.mockResolvedValue(null);
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['12345678', '87654321'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const { products } = result.structuredContent as { products: object[] };
+      expect(products).toEqual([
+        { barcode: '12345678', found: false },
+        { barcode: '87654321', found: false },
+      ]);
+      const text = contractText(result);
+      expect(text).not.toMatch(/prepared|as-sold/i);
+      expect(text).not.toContain('### Nutrition');
+    });
+
+    it('escapes a prepared row label in its table and its note', async () => {
+      const { text } = await compareTwo(
+        { product_name: 'A | B', nutriments: { fat_prepared_100g: 1 } },
+        SPAGHETTI,
+      );
+
+      expect(tableUnder(text, AS_PREPARED)?.[0]?.Product).toBe('A \\| B');
+      expect(text).toContain('no as-sold figures for A \\| B.');
+    });
+
+    it('holds exactly the as-sold column keys, each on the stated basis', () => {
+      const prepared = ROW.prepared.unwrap().shape;
+      const columns = Object.keys(ROW).filter((key) => key.endsWith('_100g'));
+
+      expect(Object.keys(prepared)).toEqual(columns);
+      for (const key of Object.keys(prepared) as (keyof typeof prepared)[]) {
+        expect(prepared[key].description, key).toContain('per 100 g, or per 100 ml for liquids');
+        expect(prepared[key].description, key).toMatch(/prepared/);
+      }
+    });
+
+    it('states on the schema and the tool that an as-sold absence is about the read', () => {
+      for (const key of ['energy_kcal_100g', 'carbohydrates_100g', 'fiber_100g'] as const) {
+        expect(ROW[key].description, key).toContain('this read returned only prepared figures');
+      }
+      expect(ROW.prepared.description).toContain('*_prepared_100g');
+      expect(ROW.prepared.description).toContain('one preparation state per read');
+      expect(offCompareProductsTool.description).toContain('prepared object');
+    });
   });
 });

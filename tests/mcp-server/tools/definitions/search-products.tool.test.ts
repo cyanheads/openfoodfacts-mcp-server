@@ -3,6 +3,7 @@
  * @module tests/mcp-server/tools/definitions/search-products.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -53,7 +54,8 @@ async function captureError(value: unknown | Promise<unknown>): Promise<unknown>
  * Stubs one service response, filling the envelope fields a case doesn't set. `count_is_exact`
  * defaults to true because leaving it out reaches the handler as `undefined`, which reads as a
  * clipped count and flips `total_is_lower_bound` in cases that never meant to exercise it.
- * `dropped` defaults to 0, the service's answer for a page whose codes are all servable.
+ * `dropped` defaults to 0, the service's answer for a page whose codes are all servable, and
+ * `outside_constraints` stays unset, its answer for a page no row left.
  */
 function mockSearch(
   result: { count: number; products: unknown[] } & Record<string, unknown>,
@@ -322,7 +324,7 @@ describe('off_search_products', () => {
   // ── text-search result window (GH issue #19) ──────────────────────────────
 
   it('rejects a text search past the result window before sending a request', async () => {
-    // The text backend answers page * page_size > 10,000 with an HTTP 400 that no retry can clear.
+    // The text backend answers page * page_size > 10,000 with an HTTP 422 that no retry can clear.
     // Pre-flight rejection replaces four retries and a ServiceUnavailable with an actionable limit.
     await expect(
       offSearchProductsTool.handler({ query: 'chocolate', page: 5001, page_size: 2 }, ctx),
@@ -2449,7 +2451,7 @@ describe('off_search_products', () => {
         'Page 1 lists no products: 3 matches on this page were left off: Open Food Facts stores them under codes it cannot serve, so off_get_product could not look them up either. Request page 2 for further matches.',
       );
       const text = contractText(result);
-      expect(text).toContain('**Page 1 lists no products** (40 total products)');
+      expect(text).toContain('**Page 1 of 8 lists no products** (40 total products, 5 per page)');
       expect(text).toContain('3 matches on this page were left off');
       expect(text).not.toMatch(/No products found|past the end/);
     });
@@ -2491,7 +2493,7 @@ describe('off_search_products', () => {
           'Page 2 lists no products: 5 matches on this page were left off: Open Food Facts stores them under codes it cannot serve, so off_get_product could not look them up either. Request page 3 for further matches.',
       });
       const text = contractText(result);
-      expect(text).toContain('**Page 2 lists no products** (40 total products)');
+      expect(text).toContain('**Page 2 of 8 lists no products** (40 total products, 5 per page)');
       expect(text).toContain('Request page 3 for further matches.');
     });
 
@@ -2740,16 +2742,78 @@ describe('off_search_products', () => {
       });
     }
 
-    it('accepts page_size up to 10,000 and rejects 10,001 before any work', async () => {
-      expect(offSearchProductsTool.input.safeParse({ query: 'x', page_size: 10_000 }).success).toBe(
-        true,
-      );
+    it.each([10_001, 1e21])('serves page_size %d at 50 with its notice', async (size) => {
+      mockTagPage(163, 1, 50);
+
       const result = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
-        page_size: 10_001,
+        page_size: size,
       });
-      expect(result.isError).toBe(true);
+
+      expect(result.isError).toBeFalsy();
+      expect(mockSearchProducts).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 1, page_size: 50 }),
+        expect.anything(),
+      );
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ page_size: 50, last_page: 4 });
+      expect(structured.page_size_capped).toBe(
+        `page_size ${size} is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 2 for results 51–100.`,
+      );
+    });
+
+    it('rejects a text page past the window at the served size for a huge page_size', async () => {
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 201,
+        page_size: 1_000_000,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'page_out_of_range', page_size: 50, max_page: 200 } },
+      });
+      expect(contractHint(result)).toBe(
+        'Request page 200 or lower at page_size 50, or add filters so the products you need rank inside the first 10000 results.',
+      );
       expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('advertises page_size with no upper bound, and keeps it whole and at least 1', () => {
+      const { page_size } = z.toJSONSchema(offSearchProductsTool.input, { io: 'input' })
+        .properties as Record<string, Record<string, unknown>>;
+
+      expect(page_size).toMatchObject({ type: 'number', minimum: 1, multipleOf: 1 });
+      expect(page_size).not.toHaveProperty('maximum');
+    });
+
+    it.each([
+      [0.5, 'Send page_size as a whole number, not a fractional one.'],
+      [2.5, 'Send page_size as a whole number, not a fractional one.'],
+      // Inside multipleOf's float tolerance, which alone would pass it through to the POST body.
+      [20.000000000000004, 'Send page_size as a whole number, not a fractional one.'],
+      [0, 'Too small'],
+    ])('rejects page_size %d before any work', async (size, message) => {
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page_size: size,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(contractText(result)).toContain(message);
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it.each([2.5, 20.000000000000004])('reports fractional page_size %d once', async (size) => {
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page_size: size,
+      });
+
+      const { error } = result.structuredContent as {
+        error: { message: string; data?: { issues?: unknown[] } };
+      };
+      expect(error.data?.issues).toHaveLength(1);
+      expect(error.message.match(/whole number/g)).toHaveLength(1);
     });
 
     it('sends page_size 50 for page_size 51 and discloses it on both surfaces', async () => {
@@ -2929,7 +2993,385 @@ describe('off_search_products', () => {
 
     it('says what happens above the cap in the page_size description', () => {
       expect(inputDescription('page_size')).toMatch(/served at 50/);
+      expect(inputDescription('page_size')).not.toContain('10000');
       expect(inputDescription('page')).toMatch(/page 2 at page_size 80 is results 51–100/);
+    });
+  });
+
+  // ── #64: rows the whole-number index returned outside the constraints ─────
+
+  describe('rows outside the nutrient constraints (#64)', () => {
+    const SUGARS_LTE_3 = [{ nutrient: 'sugars' as const, operator: 'lte' as const, value: 3 }];
+    const ONE_ROW = [{ code: '3017620422003', indexed_nutriments: { sugars_100g: 2.5 } }];
+    const left = (count: number) =>
+      `${count} rows on this page were left off: their indexed values fall outside nutrient_filters. The text index compares some nutrients as whole numbers, so it returns such rows, and total still counts them.`;
+
+    it('reports them on both surfaces beside the rows that stayed, keeping the totals', async () => {
+      mockSearch({
+        count: 5126,
+        page: 1,
+        page_count: 13,
+        page_size: 30,
+        outside_constraints: 17,
+        products: ONE_ROW,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'yogurt',
+        nutrient_filters: SUGARS_LTE_3,
+        page_size: 30,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        total: 5126,
+        total_is_lower_bound: false,
+        last_page: 171,
+        page_count: 13,
+        outside_constraints: 17,
+      });
+      expect(result.structuredContent).not.toHaveProperty('omitted');
+      const text = contractText(result);
+      expect(text).toContain(left(17));
+      expect(text).toContain(
+        '**5126 whole-number matches** (page 1 of 171, 30 per page, showing 13)',
+      );
+    });
+
+    it('says 1 row, singular', async () => {
+      mockSearch({
+        count: 40,
+        page: 1,
+        page_count: 1,
+        page_size: 2,
+        outside_constraints: 1,
+        products: ONE_ROW,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page_size: 2,
+      });
+
+      expect(contractText(result)).toContain(
+        '1 row on this page was left off: its indexed value falls outside nutrient_filters. The text index compares some nutrients as whole numbers, so it returns such rows, and total still counts them.',
+      );
+    });
+
+    it('never claims a lower-bound count of matches on a page that lost rows', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 1,
+        page_count: 6,
+        page_size: 10,
+        outside_constraints: 4,
+        products: ONE_ROW,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page_size: 10,
+      });
+
+      const text = contractText(result);
+      expect(text).not.toContain('At least');
+      expect(text).toContain('**10000+ whole-number matches**');
+      expect(text).toContain(
+        '*Open Food Facts stops counting its whole-number answer at 10000 and does not report how many products meet these constraints. Add query or tag filters for an exact count of that answer.*',
+      );
+    });
+
+    it('names the whole-number answer on a page that lost none, clipped count included', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 1,
+        page_count: 1,
+        page_size: 1,
+        products: ONE_ROW,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page_size: 1,
+      });
+
+      expect(result.structuredContent).not.toHaveProperty('outside_constraints');
+      const text = contractText(result);
+      expect(text).toContain('**10000+ whole-number matches**');
+      expect(text).toContain(
+        '*Open Food Facts stops counting its whole-number answer at 10000 and does not report how many products meet these constraints. Add query or tag filters for an exact count of that answer.*',
+      );
+      expect(text).not.toContain('At least');
+      expect(text).not.toContain('total products');
+    });
+
+    it('renders the omitted and outside-constraints lines side by side', async () => {
+      mockSearch({
+        count: 40,
+        page: 1,
+        page_count: 1,
+        page_size: 5,
+        dropped: 2,
+        outside_constraints: 2,
+        products: ONE_ROW,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page_size: 5,
+      });
+
+      expect(result.structuredContent).toMatchObject({ omitted: 2, outside_constraints: 2 });
+      const text = contractText(result);
+      expect(text).toContain('2 matches on this page were left off');
+      expect(text).toContain(left(2));
+    });
+
+    it('sends a page that loses every row to the next one, with narrowing advice', async () => {
+      mockSearch({
+        count: 40,
+        page: 2,
+        page_count: 0,
+        page_size: 5,
+        outside_constraints: 5,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 2,
+        page_size: 5,
+      });
+
+      const next =
+        'Request page 3 for the next rows, or add query or tag filters to narrow what the index returns.';
+      expect(result.structuredContent).toMatchObject({
+        products: [],
+        page_count: 0,
+        last_page: 8,
+        outside_constraints: 5,
+        truncated: true,
+        shown: 0,
+        cap: 5,
+        notice: `Page 2 lists no products: ${left(5)} ${next}`,
+      });
+      const body = firstText(
+        offSearchProductsTool.format!(
+          result.structuredContent as Parameters<
+            NonNullable<typeof offSearchProductsTool.format>
+          >[0],
+        ),
+      );
+      expect(body).toContain(
+        '**Page 2 of 8 lists no products** (40 whole-number matches, 5 per page)',
+      );
+      expect(body).toContain(left(5));
+      expect(body).toContain(next);
+      expect(contractText(result)).not.toMatch(/No products found|past the end/);
+    });
+
+    it('names no next page on the last page of a counted answer', async () => {
+      mockSearch({
+        count: 13,
+        page: 3,
+        page_count: 0,
+        page_size: 5,
+        outside_constraints: 3,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 3,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ last_page: 3, outside_constraints: 3 });
+      for (const key of ['truncated', 'shown', 'cap'] as const) {
+        expect(structured).not.toHaveProperty(key);
+      }
+      expect(structured.notice).toBe(
+        `Page 3 lists no products: ${left(3)} No further page of matches can be requested.`,
+      );
+      const text = contractText(result);
+      expect(text).not.toContain('Request page 4');
+      expect(text).not.toContain('add query or tag filters');
+      expect(text).not.toMatch(/No products found|past the end/);
+    });
+
+    it('stops at the window on a clipped count, naming filters and no next page', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 500,
+        page_count: 0,
+        page_size: 20,
+        outside_constraints: 20,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 500,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ truncated: true, outside_constraints: 20 });
+      expect(structured).not.toHaveProperty('last_page');
+      const stop =
+        'No further page of matches can be requested: text search serves only the first 10000 results, so add query or tag filters to bring other rows into them.';
+      expect(structured.notice).toBe(`Page 500 lists no products: ${left(20)} ${stop}`);
+      // The body, apart from the notice trailer, rebuilds this from the output alone.
+      const body = result.content?.[0];
+      expect(body?.type === 'text' ? body.text : '').toContain(stop);
+      const text = contractText(result);
+      expect(text).not.toContain('Request page 501');
+      expect(text).not.toContain('At least');
+      expect(text).not.toMatch(/No products found|past the end/);
+    });
+
+    it('stops at the window where the page size leaves results past it', async () => {
+      // 10,000 results at 30 a page fill 334 pages, but only 333 fit the window, so the page a
+      // bare division calls next is one the pre-flight check rejects.
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 333,
+        page_count: 0,
+        page_size: 30,
+        outside_constraints: 30,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 333,
+        page_size: 30,
+      });
+
+      const text = contractText(result);
+      expect(text).not.toContain('Request page 334');
+      expect(text).toContain('text search serves only the first 10000 results');
+    });
+
+    it('names a next page the window still allows, on both surfaces', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 199,
+        page_count: 0,
+        page_size: 50,
+        outside_constraints: 50,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 199,
+        page_size: 50,
+      });
+
+      const next =
+        'Request page 200 for the next rows, or add query or tag filters to narrow what the index returns.';
+      expect(String((result.structuredContent as Record<string, unknown>).notice)).toContain(next);
+      const body = result.content?.[0];
+      expect(body?.type === 'text' ? body.text : '').toContain(next);
+    });
+
+    it('reports both counts on a page left empty by unservable and failing rows alike', async () => {
+      mockSearch({
+        count: 40,
+        page: 1,
+        page_count: 0,
+        page_size: 5,
+        dropped: 2,
+        outside_constraints: 3,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page_size: 5,
+      });
+
+      expect(result.structuredContent).toMatchObject({ omitted: 2, outside_constraints: 3 });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(String(structured.notice)).toMatch(
+        /^Page 1 lists no products: 2 matches on this page were left off: .* 3 rows on this page were left off: .* Request page 2 for the next rows, or add query or tag filters/,
+      );
+      const text = contractText(result);
+      expect(text).toContain('**Page 1 of 8 lists no products**');
+      expect(text).not.toMatch(/No products found|past the end/);
+    });
+
+    it('leaves a page past the end of the answer reading as one', async () => {
+      // Characterization: a page beyond the band returns no hits, so nothing left it.
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 5,
+        page_size: 50,
+      });
+
+      expect(result.structuredContent).not.toHaveProperty('outside_constraints');
+      expect(contractText(result)).toContain('past the end');
+    });
+
+    it('does not claim matching products exist past the end of a whole-number answer', async () => {
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 5,
+        page_size: 50,
+      });
+
+      const { notice } = result.structuredContent as { notice?: string };
+      expect(notice).toBe(
+        'Page 5 is past the end of this result set — 163 whole-number matches exist, but no page this deep holds any. Request page 4 or lower to reach them.',
+      );
+      const text = contractText(result);
+      expect(text).toContain(`> ${notice}`);
+      expect(text).not.toContain('matching products exist');
+      // No row names the constrained nutrient here, so format() keeps its label.
+      expect(text).toContain('**Page 5 is past the end of this result set** (163 total products)');
+    });
+
+    it('keeps the matching-products claim past the end of a search on a float nutrient', async () => {
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: [{ nutrient: 'salt', operator: 'lte', value: 0.1 }],
+        page: 5,
+        page_size: 50,
+      });
+
+      expect((result.structuredContent as { notice?: string }).notice).toBe(
+        'Page 5 is past the end of this result set — 163 matching products exist, but no page this deep holds any. Request page 4 or lower to reach them.',
+      );
+    });
+
+    it('states the row check and its limit in the nutrient_filters description', () => {
+      const description = inputDescription('nutrient_filters');
+
+      expect(description).toContain(
+        'The text index compares energy-kcal, fat, saturated-fat, carbohydrates, sugars as whole numbers',
+      );
+      expect(description).toContain('outside_constraints');
+      expect(description).toContain('add query or tag filters');
+    });
+
+    it('lists the field in the output schema with what total keeps counting', () => {
+      const { outside_constraints, total, last_page, total_is_lower_bound } = offSearchProductsTool
+        .output.shape as unknown as Record<string, { description?: string }>;
+
+      expect(outside_constraints?.description).toContain('Separate from omitted');
+      for (const field of [total, last_page, total_is_lower_bound]) {
+        expect(field?.description).toContain('whole-number answer');
+      }
     });
   });
 

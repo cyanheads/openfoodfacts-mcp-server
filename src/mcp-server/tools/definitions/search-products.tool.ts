@@ -23,6 +23,7 @@ import {
   type NutrientFilter,
   type NutrientOperator,
   type SearchParams,
+  WHOLE_NUMBER_NUTRIENTS,
 } from '@/services/openfoodfacts/types.js';
 import {
   type CanonicalTag,
@@ -32,8 +33,8 @@ import {
 import { mdInline } from '@/utils/markdown.js';
 
 /**
- * Most results one search call returns. A larger `page_size`, up to the 10,000 results no backend
- * serves past, is served at this size and disclosed, and `page` then counts pages of this size.
+ * Most results one search call returns. A larger `page_size` is served at this size and disclosed,
+ * and `page` then counts pages of this size.
  */
 const SEARCH_PAGE_SIZE_CAP = 50;
 
@@ -128,6 +129,39 @@ function omittedSentence(count: number): string {
     : `${count} matches on this page were left off: Open Food Facts stores them under codes it cannot serve, so off_get_product could not look them up either.`;
 }
 
+/**
+ * The disclosure for rows that failed a nutrient constraint, shared by the notice and the text
+ * surface. They are not matches, so they never read as `omittedSentence` rows do.
+ */
+function outsideConstraintsSentence(count: number): string {
+  return count === 1
+    ? '1 row on this page was left off: its indexed value falls outside nutrient_filters. The text index compares some nutrients as whole numbers, so it returns such rows, and total still counts them.'
+    : `${count} rows on this page were left off: their indexed values fall outside nutrient_filters. The text index compares some nutrients as whole numbers, so it returns such rows, and total still counts them.`;
+}
+
+/**
+ * What to do after a page every row left, shared by the notice and the text surface. `reachable` is
+ * the deepest page the search can request, so a page named here is one the window serves.
+ * `moreBeyond` is whether rows lie past this page. Narrowing advice goes only with rows outside the
+ * constraints: an unservable code is no reason to change the search, and on the last page of the
+ * answer there is nothing further for narrowing to bring forward.
+ */
+function emptyPageNextStep(
+  page: number,
+  reachable: number,
+  moreBeyond: boolean,
+  outsideConstraints: boolean,
+): string {
+  if (page < reachable) {
+    return outsideConstraints
+      ? `Request page ${page + 1} for the next rows, or add query or tag filters to narrow what the index returns.`
+      : `Request page ${page + 1} for further matches.`;
+  }
+  return outsideConstraints && moreBeyond
+    ? `No further page of matches can be requested: text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so add query or tag filters to bring other rows into them.`
+    : 'No further page of matches can be requested.';
+}
+
 /** Why an unconfirmed tag value was sent as it was, in the empty-result notice's words. */
 const UNCONFIRMED_TAG_REASONS = {
   no_vocabulary: 'brand slugs have no vocabulary to check them against',
@@ -190,6 +224,11 @@ const INDEXED_NUTRIMENTS_SHAPE = Object.fromEntries(
     ];
   }),
 ) as Record<IndexedNutrientKey, z.ZodOptional<z.ZodNumber>>;
+
+/** The `indexed_nutriments` keys of the nutrients the text index compares as whole numbers. */
+const WHOLE_NUMBER_KEYS: ReadonlySet<string> = new Set(
+  [...WHOLE_NUMBER_NUTRIENTS].map(indexedNutrientKey),
+);
 
 /** The constraints as the caller wrote them, for echoing: `sugars < 8, proteins >= 5`. */
 function constraintEcho(filters: readonly NutrientFilter[]): string {
@@ -333,7 +372,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .max(18)
       .optional()
       .describe(
-        'Numeric constraints on nutrient values per 100 g, or per 100 ml for liquids, combined as AND with each other and with every other filter. Pair two entries on the same nutrient to express a range (e.g. sugars gte 2 and sugars lte 8). Served only by the text backend, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the 10,000-result page window, and additives_tag cannot be combined with it. Per-serving and prepared-product values are not searchable.',
+        `Numeric constraints on nutrient values per 100 g, or per 100 ml for liquids, combined as AND with each other and with every other filter. Pair two entries on the same nutrient to express a range (e.g. sugars gte 2 and sugars lte 8). Served only by the text backend, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the 10,000-result page window, and additives_tag cannot be combined with it. The text index compares ${[...WHOLE_NUMBER_NUTRIENTS].join(', ')} as whole numbers, so every returned row is checked against these constraints: a row outside them leaves the page and counts in outside_constraints, and a nutrient the index holds no value for does not count against a row. A page can come back short or empty while later pages hold matches, and a range inside one whole number (sugars gt 3.9 and lt 4) can pass few rows of the 10,000 reachable, so add query or tag filters to narrow it. Per-serving and prepared-product values are not searchable.`,
       ),
     sort_by: z
       .enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'])
@@ -351,12 +390,17 @@ export const offSearchProductsTool = tool('off_search_products', {
       ),
     page_size: z
       .number()
-      .int()
+      .multipleOf(1, 'Send page_size as a whole number, not a fractional one.')
+      // multipleOf tolerates float noise (20.000000000000004), which would reach the request. It
+      // stays for what it advertises; this closes the gap, only where it passed, so 1.5 reports once.
+      .refine(Number.isInteger, {
+        error: 'Send page_size as a whole number, not a fractional one.',
+        when: ({ issues }) => issues.length === 0,
+      })
       .min(1)
-      .max(TEXT_SEARCH_RESULT_WINDOW)
       .default(20)
       .describe(
-        `Results per page (default 20). One call returns at most ${SEARCH_PAGE_SIZE_CAP}: a larger value, up to ${TEXT_SEARCH_RESULT_WINDOW} (no backend serves past result ${TEXT_SEARCH_RESULT_WINDOW}), is served at ${SEARCH_PAGE_SIZE_CAP}, reported in page_size and page_size_capped, and page then counts pages of ${SEARCH_PAGE_SIZE_CAP}. Keep low for initial exploration; increase for comparison workflows.`,
+        `Results per page (default 20). One call returns at most ${SEARCH_PAGE_SIZE_CAP}: a larger value is served at ${SEARCH_PAGE_SIZE_CAP}, reported in page_size and page_size_capped, and page then counts pages of ${SEARCH_PAGE_SIZE_CAP}. Keep low for initial exploration; increase for comparison workflows.`,
       ),
   }),
 
@@ -364,12 +408,12 @@ export const offSearchProductsTool = tool('off_search_products', {
     total: z
       .number()
       .describe(
-        'Matching products in the database for this search. Exact unless total_is_lower_bound is true, in which case at least this many match and the real figure is unknown.',
+        'Matching products in the database for this search. Exact unless total_is_lower_bound is true, in which case at least this many match and the real figure is unknown. On a search constraining a nutrient the text index compares as a whole number (see nutrient_filters) this is its whole-number answer, which can include rows those constraints rule out.',
       ),
     total_is_lower_bound: z
       .boolean()
       .describe(
-        'True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count.',
+        'True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count. On a search constraining a whole-number nutrient the floor is on the whole-number answer, not on the products that meet the constraints.',
       ),
     page: z.number().describe('Current page number (1-based).'),
     page_size: z
@@ -380,19 +424,25 @@ export const offSearchProductsTool = tool('off_search_products', {
     page_count: z
       .number()
       .describe(
-        'Products returned on this page — page_size except on the last page, or when a match stored under a code Open Food Facts cannot serve was left off. Not the total number of pages.',
+        'Products returned on this page — page_size except on the last page, or when a match stored under a code Open Food Facts cannot serve or a row outside nutrient_filters was left off. Not the total number of pages.',
       ),
     last_page: z
       .number()
       .optional()
       .describe(
-        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone and by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers. Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all.`,
+        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone and by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers. Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all. On a search constraining a whole-number nutrient it counts pages of the whole-number answer, so a page up to it can list few products or none.`,
       ),
     omitted: z
       .number()
       .optional()
       .describe(
         'Matches on this page left off because Open Food Facts stores them under a code it cannot serve (not 4–40 digits once leading zeros are stripped), so off_get_product could not look them up either. Absent when none was. total still counts them.',
+      ),
+    outside_constraints: z
+      .number()
+      .optional()
+      .describe(
+        'Rows the text index returned on this page that fail nutrient_filters on their indexed values, compared at the 32-bit precision the index uses, and so left off. The index returns them because it compares some nutrients as whole numbers. Separate from omitted, whose rows are matches; a row both unservable and outside counts only in omitted. total, total_is_lower_bound, and last_page still count these rows, and each page keeps its place in the result set. Absent when none was.',
       ),
     products: z
       .array(
@@ -437,7 +487,7 @@ export const offSearchProductsTool = tool('off_search_products', {
               .object(INDEXED_NUTRIMENTS_SHAPE)
               .optional()
               .describe(
-                'Present on every row of a search carrying nutrient_filters, and only there: the values the text index holds for the constrained nutrients, per 100 g, or per 100 ml for liquids — the values the filters were checked against. Keyed as off_get_product keys them (sugars_100g, energy_kcal_100g). A nutrient the index holds no value for is left out, never zero-filled, so the object can be empty. off_get_product returns the current record, whose values can differ.',
+                'Present on every row of a search carrying nutrient_filters, and only there: the values the text index holds for the constrained nutrients, per 100 g, or per 100 ml for liquids — the values the filters were checked against. Keyed as off_get_product keys them (sugars_100g, energy_kcal_100g). A nutrient the index holds no value for is left out, never zero-filled, so the object can be empty, and it does not count against the row. off_get_product returns the current record, whose values can differ.',
               ),
           })
           .describe('A single matching product summary row.'),
@@ -450,13 +500,13 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, names the current page and how far the backend will actually paginate when more results exist, or, on a page that returned no rows because it lies past the last match or every row was left off, says which page to request instead.',
+        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, names the current page and how far the backend will actually paginate when more results exist, or, on a page that returned no rows because it lies past the last match or every row was left off, says which page to request instead. When rows outside nutrient_filters emptied the page and more rows can be reached or lie past the window, it also suggests adding query or tag filters.',
       ),
     text_index_snapshot: z
       .string()
       .optional()
       .describe(
-        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. Absent on tag-only searches, which read the live database.',
+        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. When a constraint falls on a whole-number nutrient (see nutrient_filters) it also says that total, total_is_lower_bound, and last_page describe the whole-number answer and that rows outside the constraints count in outside_constraints. Absent on tag-only searches, which read the live database.',
       ),
     exclusion_coverage: z
       .string()
@@ -538,7 +588,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, answers 2xx with a malformed envelope, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, answers 2xx with a malformed envelope, closes the connection before finishing its answer, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -547,7 +597,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: 'Open Food Facts did not answer within the request deadline, or answered 408, 425, or 504',
+      when: 'Open Food Facts did not answer within the request or retry deadline, flagged its text search as timed out, or answered 408, 425, or 504',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -642,7 +692,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       );
     }
 
-    // The text backend refuses page * page_size beyond its result window with an HTTP 400 that no
+    // The text backend refuses page * page_size beyond its result window with an HTTP 422 that no
     // retry can clear. Reject it here so the caller gets the reachable page bound instead of a
     // backoff sequence.
     if (servedByTextBackend && input.page * pageSize > TEXT_SEARCH_RESULT_WINDOW) {
@@ -768,13 +818,21 @@ export const offSearchProductsTool = tool('off_search_products', {
         Boolean(input.nutrition_grade) ||
         Boolean(input.nova_group),
     );
+    // Once each, since a range pair names its nutrient twice.
+    const wholeNumber = [...new Set(nutrientFilters.map(({ nutrient }) => nutrient))].filter(
+      (nutrient) => WHOLE_NUMBER_NUTRIENTS.has(nutrient),
+    );
     if (servedByTextBackend) {
       const checkedAgainst =
         nutrientFilters.length > 0
           ? ` The nutrient constraints (${constraintEcho(nutrientFilters)}) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.`
           : '';
+      const wholeNumberAnswer =
+        wholeNumber.length > 0
+          ? ` The index compares ${wholeNumber.join(', ')} as whole numbers, so total, total_is_lower_bound, and last_page describe its whole-number answer, and rows of that answer outside these constraints are left off each page and counted in outside_constraints.`
+          : '';
       ctx.enrich({
-        text_index_snapshot: `${TEXT_INDEX_SNAPSHOT_NOTE} ${liveRoute.note}${checkedAgainst}`,
+        text_index_snapshot: `${TEXT_INDEX_SNAPSHOT_NOTE} ${liveRoute.note}${checkedAgainst}${wholeNumberAnswer}`,
       });
     }
     const exclusionCoverage = exclusionCoverageNote(exclusions);
@@ -784,6 +842,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       total: response.count,
       total_is_lower_bound: !response.count_is_exact,
       returned: response.products.length,
+      outside_constraints: response.outside_constraints,
       page: response.page,
     });
 
@@ -795,8 +854,8 @@ export const offSearchProductsTool = tool('off_search_products', {
     const lastPage = response.count_is_exact && response.count > 0 ? reachablePages : undefined;
     // Matches exist past this page when the backend stopped counting, or when the pages up to and
     // including this one, at the size served, end before the total. Keyed on the page's offset,
-    // never on the rows it delivered: a row left off for an unservable code shortens the page
-    // without leaving anything beyond it.
+    // never on the rows it delivered: a row left off for an unservable code or a failed constraint
+    // shortens the page without leaving anything beyond it.
     const moreBeyond = !response.count_is_exact || response.page * pageSize < response.count;
 
     if (pageSize < input.page_size) {
@@ -813,15 +872,18 @@ export const offSearchProductsTool = tool('off_search_products', {
       });
     }
 
-    if (response.products.length === 0 && response.dropped > 0) {
-      // Every match on this page was left off for a code no product lookup can serve. The page
-      // is not past the end, and the filters are matching products, so neither notice applies.
-      // Truncation follows the same offset rule as a page that kept its rows.
-      const notice =
-        `Page ${response.page} lists no products: ${omittedSentence(response.dropped)} ` +
-        (response.page < reachablePages
-          ? `Request page ${response.page + 1} for further matches.`
-          : 'No further page of matches can be requested.');
+    const outside = response.outside_constraints;
+    if (response.products.length === 0 && (response.dropped > 0 || outside !== undefined)) {
+      // Every row on this page was left off, for a code no product lookup can serve or for failing
+      // a nutrient constraint. The page is not past the end, and the search is matching rows, so
+      // neither notice applies. Truncation follows the same offset rule as a page that kept its
+      // rows.
+      const notice = [
+        `Page ${response.page} lists no products:`,
+        ...(response.dropped > 0 ? [omittedSentence(response.dropped)] : []),
+        ...(outside === undefined ? [] : [outsideConstraintsSentence(outside)]),
+        emptyPageNextStep(response.page, reachablePages, moreBeyond, outside !== undefined),
+      ].join(' ');
       if (moreBeyond) {
         ctx.enrich.truncated({ shown: response.page_count, cap: pageSize, guidance: notice });
       } else {
@@ -836,9 +898,10 @@ export const offSearchProductsTool = tool('off_search_products', {
           ? `The backend stopped counting at ${response.count} matches, so there is no exact last page — request an earlier page.`
           : `Request page ${lastPage} or lower to reach them.`;
 
+      // A whole-number answer counts rows the constraints can rule out, so it is no product count.
+      const matches = wholeNumber.length > 0 ? 'whole-number matches' : 'matching products';
       ctx.enrich.notice(
-        `Page ${response.page} is past the end of this result set — ${response.count} matching ` +
-          `products exist, but no page this deep holds any. ${bound}`,
+        `Page ${response.page} is past the end of this result set — ${response.count} ${matches} exist, but no page this deep holds any. ${bound}`,
       );
     } else if (response.products.length === 0) {
       // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend.
@@ -965,6 +1028,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       page_count: response.page_count,
       ...(lastPage !== undefined && { last_page: lastPage }),
       ...(response.dropped > 0 && { omitted: response.dropped }),
+      ...(outside !== undefined && { outside_constraints: outside }),
       products,
     };
   },
@@ -979,16 +1043,28 @@ export const offSearchProductsTool = tool('off_search_products', {
       ];
     }
 
-    const totalLabel = `${result.total}${result.total_is_lower_bound ? '+' : ''}`;
+    const outside = result.outside_constraints;
+    // format() has no input. A page that lost rows, or whose rows carry a whole-number nutrient
+    // (only a constrained nutrient reaches a row), shows the total is the index's whole-number
+    // answer, not a product count. A page with neither keeps the plain wording, past-end pages too.
+    const wholeNumberAnswer =
+      outside !== undefined ||
+      result.products.some((p) =>
+        Object.keys(p.indexed_nutriments ?? {}).some((key) => WHOLE_NUMBER_KEYS.has(key)),
+      );
+    const totalLabel = `${result.total}${result.total_is_lower_bound ? '+' : ''} ${wholeNumberAnswer ? 'whole-number matches' : 'total products'}`;
     /** The clipped-total caveat, rendered wherever a total is shown so neither branch flattens it. */
-    const lowerBoundCaveat = `*At least ${result.total} products match — Open Food Facts stops counting there and does not report the true total. Add filters for an exact count.*`;
+    const lowerBoundCaveat = wholeNumberAnswer
+      ? `*Open Food Facts stops counting its whole-number answer at ${result.total} and does not report how many products meet these constraints. Add query or tag filters for an exact count of that answer.*`
+      : `*At least ${result.total} products match — Open Food Facts stops counting there and does not report the true total. Add filters for an exact count.*`;
 
-    if (result.products.length === 0 && result.omitted !== undefined) {
-      const onlyOmitted = [
-        `**Page ${result.page} lists no products** (${totalLabel} total products)`,
-        `*${omittedSentence(result.omitted)}*`,
+    if (result.products.length === 0 && (result.omitted !== undefined || outside !== undefined)) {
+      const leftOff = [
+        `**Page ${result.page}${result.last_page === undefined ? '' : ` of ${result.last_page}`} lists no products** (${totalLabel}, ${result.page_size} per page)`,
       ];
-      if (result.total_is_lower_bound) onlyOmitted.push(lowerBoundCaveat);
+      if (result.omitted !== undefined) leftOff.push(`*${omittedSentence(result.omitted)}*`);
+      if (outside !== undefined) leftOff.push(`*${outsideConstraintsSentence(outside)}*`);
+      if (result.total_is_lower_bound) leftOff.push(lowerBoundCaveat);
       // The handler's reachable bound, rebuilt from the output: last_page when the count is exact,
       // and otherwise the text backend's result window — only that backend stops counting.
       const reachable =
@@ -997,17 +1073,20 @@ export const offSearchProductsTool = tool('off_search_products', {
           Math.ceil(result.total / result.page_size),
           Math.floor(TEXT_SEARCH_RESULT_WINDOW / result.page_size),
         );
-      if (result.page < reachable) {
-        onlyOmitted.push('', `Request page ${result.page + 1} for further matches.`);
-      }
-      return [{ type: 'text' as const, text: onlyOmitted.join('\n') }];
+      const moreBeyond =
+        result.total_is_lower_bound || result.page * result.page_size < result.total;
+      leftOff.push(
+        '',
+        emptyPageNextStep(result.page, reachable, moreBeyond, outside !== undefined),
+      );
+      return [{ type: 'text' as const, text: leftOff.join('\n') }];
     }
 
     if (result.products.length === 0) {
       // A positive total with an empty page is an exhausted page. Preserve the total, say which
       // page holds results, and say nothing about broadening filters that are matching products.
       const exhausted = [
-        `**Page ${result.page} is past the end of this result set** (${totalLabel} total products)`,
+        `**Page ${result.page} is past the end of this result set** (${totalLabel})`,
       ];
       if (result.total_is_lower_bound) exhausted.push(lowerBoundCaveat);
       exhausted.push(
@@ -1020,12 +1099,13 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     const lines: string[] = [
-      `**${totalLabel} total products** (page ${result.page}${result.last_page === undefined ? '' : ` of ${result.last_page}`}, ${result.page_size} per page, showing ${result.page_count})`,
+      `**${totalLabel}** (page ${result.page}${result.last_page === undefined ? '' : ` of ${result.last_page}`}, ${result.page_size} per page, showing ${result.page_count})`,
     ];
     if (result.total_is_lower_bound) {
       lines.push(lowerBoundCaveat);
     }
     if (result.omitted !== undefined) lines.push(`*${omittedSentence(result.omitted)}*`);
+    if (outside !== undefined) lines.push(`*${outsideConstraintsSentence(outside)}*`);
     lines.push('');
 
     for (const p of result.products) {

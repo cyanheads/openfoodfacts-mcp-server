@@ -20,13 +20,16 @@ import { mdCodeFence, mdInline } from '@/utils/markdown.js';
  * Fields a requested field needs to be readable, fetched alongside it. Open Food Facts returns
  * exactly the `fields=` list it is given, so a subset that names a value without its denominator
  * gets figures nothing can interpret — per-serving nutrition with no serving size, a serving unit
- * with no quantity to describe. Expanding the request is what keeps the response's own claim about
- * why something is missing true: an absent value is absent upstream, never merely unasked-for.
+ * with no quantity to describe, a quantity with no unit. Expanding the request is what keeps the
+ * response's own claim about why something is missing true: an absent value is absent upstream,
+ * never merely unasked-for. `serving_size` has no entry because the line it renders claims nothing
+ * about a parsed quantity it was not asked for. `expandFields` is not transitive, so each entry
+ * lists its whole set.
  */
 const FIELD_DEPENDENCIES: Record<string, readonly string[]> = {
   nutriments: ['serving_size', 'serving_quantity', 'serving_quantity_unit'],
   serving_quantity_unit: ['serving_quantity', 'serving_size'],
-  serving_quantity: ['serving_size'],
+  serving_quantity: ['serving_size', 'serving_quantity_unit'],
 };
 
 /**
@@ -97,6 +100,9 @@ const NAMED_RAW_KEYS = new Set(NUTRIMENT_MAP.map(([rawKey]) => rawKey));
  */
 const NON_NUTRIMENT_BASE_KEYS = new Set(['nova-group']);
 
+/** Ends a nutrient's base name, and its open-map key, when a figure is for the prepared product. */
+const PREPARED_SUFFIX = '_prepared';
+
 /**
  * The unit Open Food Facts normalizes a nutrient's `_100g` and `_serving` figures to, mirroring its
  * own normalizer. The `{base}_unit` sibling is never read: no `_prepared` or estimate key has one,
@@ -107,7 +113,7 @@ const NON_NUTRIMENT_BASE_KEYS = new Set(['nova-group']);
  * kJ as entered, so the stored figure is kilojoules.
  */
 function normalizedUnit(base: string): string | undefined {
-  const nutrient = base.endsWith('_prepared') ? base.slice(0, -'_prepared'.length) : base;
+  const nutrient = base.endsWith(PREPARED_SUFFIX) ? base.slice(0, -PREPARED_SUFFIX.length) : base;
   switch (nutrient) {
     case 'energy':
     case 'energy-kj':
@@ -189,16 +195,66 @@ function completenessLabel(score: number): string {
 }
 
 /**
- * Render one open-map nutrient as a markdown bullet, carrying its unit. Takes the Zod
- * inferred shape (`unit?: string | undefined`) rather than `NutrimentEntry`, since `format()` is
- * typed from the output schema and the project runs `exactOptionalPropertyTypes`.
+ * One open-map entry as `format()` receives it. Takes the Zod inferred shape
+ * (`unit?: string | undefined`) rather than `NutrimentEntry`, since `format()` is typed from the
+ * output schema and the project runs `exactOptionalPropertyTypes`.
  */
-function additionalLines(
-  entries: Record<string, { value: number; unit?: string | undefined }>,
-): string[] {
-  return Object.entries(entries).map(
+type RenderedEntry = [key: string, nutrient: { value: number; unit?: string | undefined }];
+
+/** Split an open map by preparation state, each side in map order. */
+function byPreparation(map: Record<string, RenderedEntry[1]> = {}): {
+  asSold: RenderedEntry[];
+  prepared: RenderedEntry[];
+} {
+  const entries = Object.entries(map);
+  return {
+    asSold: entries.filter(([key]) => !key.endsWith(PREPARED_SUFFIX)),
+    prepared: entries.filter(([key]) => key.endsWith(PREPARED_SUFFIX)),
+  };
+}
+
+/**
+ * Whether a read's nutrition holds prepared figures and nothing as sold. Every named field is an
+ * as-sold figure, so any one of them settles it. A read says this about itself, never about the
+ * record, which can store both states while Open Food Facts serves one.
+ */
+function onlyPreparedFigures({
+  additional_100g,
+  additional_serving,
+  ...named
+}: {
+  additional_100g?: Record<string, unknown> | undefined;
+  additional_serving?: Record<string, unknown> | undefined;
+}): boolean {
+  const open = [...Object.keys(additional_100g ?? {}), ...Object.keys(additional_serving ?? {})];
+  return (
+    Object.keys(named).length === 0 &&
+    open.length > 0 &&
+    open.every((key) => key.endsWith(PREPARED_SUFFIX))
+  );
+}
+
+/** Render open-map nutrients as markdown bullets, each carrying its unit. */
+function additionalLines(entries: RenderedEntry[]): string[] {
+  return entries.map(
     ([key, { value, unit }]) => `  - ${mdInline(key)}: ${value}${unit ? ` ${mdInline(unit)}` : ''}`,
   );
+}
+
+/**
+ * A per-serving section's heading, plus a disclosure when no serving size is recorded. The serving
+ * size is the denominator for everything in the section, so it is restated here rather than left
+ * to the header line — bare per-serving numbers are unusable without it, and its absence is stated
+ * outright instead of being silently omitted.
+ */
+function servingSectionHead(title: string, servingSize: string | undefined): string[] {
+  const heading = `\n### ${title}${servingSize ? ` (per ${mdInline(servingSize)})` : ''}`;
+  return servingSize === undefined
+    ? [
+        heading,
+        '*Serving size not recorded by Open Food Facts — the figures below have no stated denominator.*',
+      ]
+    : [heading];
 }
 
 /** Join a canonical tag list for display, escaping each value for the line it lands on. */
@@ -340,7 +396,7 @@ function servingSizeLine(
 export const offGetProductTool = tool('off_get_product', {
   title: 'Get Food Product by Barcode',
   description:
-    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Nutrition is the exception: Open Food Facts returns one preparation state per read, so a read of prepared figures (_prepared keys under nutriments) omits as-sold figures the record can still hold. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -383,7 +439,7 @@ export const offGetProductTool = tool('off_get_product', {
       )
       .optional()
       .describe(
-        'Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed. A field that cannot be read on its own arrives with what it depends on: nutriments brings serving_size, serving_quantity, and serving_quantity_unit so per-serving figures carry their denominator, and serving_quantity_unit brings the quantity it describes. requested_fields echoes the full set that was fetched.',
+        'Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed. A field that cannot be read on its own arrives with what it depends on: nutriments brings serving_size, serving_quantity, and serving_quantity_unit so per-serving figures carry their denominator, and serving_quantity and serving_quantity_unit each bring the other plus serving_size, since a quantity reads only with its unit. requested_fields echoes the full set that was fetched.',
       ),
   }),
 
@@ -536,7 +592,7 @@ export const offGetProductTool = tool('off_get_product', {
               )
               .optional()
               .describe(
-                'Every other nutrient Open Food Facts holds per 100 g, or per 100 ml for liquids, keyed by normalized name (calcium, iron, vitamin_c, trans_fat, added_sugars, cholesterol, energy in kJ, …). Excludes the named fields above, so a nutrient appears in exactly one place. Micronutrients are in grams, so calcium 0.071 g is 71 mg.',
+                'Every other nutrient this read returned per 100 g, or per 100 ml for liquids, keyed by normalized name (calcium, iron, vitamin_c, trans_fat, added_sugars, cholesterol, energy in kJ, …). Excludes the named fields above, so a nutrient appears in exactly one place. A key ending in _prepared (energy_kcal_prepared, carbohydrates_prepared, …) is a figure for the prepared product, not the product as sold. Micronutrients are in grams, so calcium 0.071 g is 71 mg.',
               ),
             additional_serving: z
               .record(
@@ -550,12 +606,12 @@ export const offGetProductTool = tool('off_get_product', {
               )
               .optional()
               .describe(
-                'The same nutrients per serving. Also carries the per-serving figures for macros that have a named _100g field but no named per-serving one (saturated_fat, carbohydrates, fiber, proteins, salt, sodium). Percent, % vol, and unitless figures are concentrations, so they equal the per-100 figure. Check serving_size for the denominator the other figures are measured against.',
+                "The same nutrients per serving. Also carries the per-serving figures for macros that have a named _100g field but no named per-serving one (saturated_fat, carbohydrates, fiber, proteins, salt, sodium). Percent, % vol, and unitless figures are concentrations, so they equal the per-100 figure. Check serving_size for the denominator the other figures are measured against. A key ending in _prepared is a prepared-product figure that Open Food Facts scales from the per-100 figure by serving_quantity, which is often a powder's dry portion rather than the prepared serving, so it can describe a fraction of what is consumed.",
               ),
           })
           .optional()
           .describe(
-            'Nutrition figures normalized to underscore keys. All values may be absent when nutrition data not yet entered.',
+            'Nutrition figures normalized to underscore keys. The named fields hold as-sold figures, and keys ending in _prepared under additional_100g and additional_serving hold prepared-product figures. Open Food Facts returns one preparation state per read, so a read of prepared figures leaves every named field absent even when the record holds as-sold figures. All values may be absent when nutrition data not yet entered.',
           ),
         serving_size: z
           .string()
@@ -640,7 +696,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, answers 2xx with a malformed envelope, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, answers 2xx with a malformed envelope, closes the connection before finishing its answer, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -649,7 +705,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: 'Open Food Facts did not answer within the request deadline, or answered 408, 425, or 504',
+      when: 'Open Food Facts did not answer within the request or retry deadline, or answered 408, 425, or 504',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -714,6 +770,7 @@ export const offGetProductTool = tool('off_get_product', {
     const requested = result.requested_fields;
     const notRequested = (field: string): boolean =>
       requested !== undefined && !requested.includes(field);
+    const onlyPrepared = onlyPreparedFigures(p.nutriments ?? {});
 
     // A name that was never fetched is not an unknown name. Saying so here is the same
     // distinction the section lines below draw, applied to the one line that leads the response.
@@ -743,6 +800,11 @@ export const offGetProductTool = tool('off_get_product', {
     // Nutrition
     if (p.nutriments) {
       const n = p.nutriments;
+      // Rendering only: prepared figures stay in the open maps on structuredContent, and every
+      // other key keeps its section and its order.
+      const open100 = byPreparation(n.additional_100g);
+      const openServing = byPreparation(n.additional_serving);
+
       // Open Food Facts stores liquids per 100 ml under the same _100g keys and no field reliably
       // says which basis a record is on, so the heading names both rather than asserting one.
       const per100: string[] = [];
@@ -757,9 +819,9 @@ export const offGetProductTool = tool('off_get_product', {
       if (n.proteins_100g !== undefined) per100.push(`**Protein:** ${n.proteins_100g}g`);
       if (n.salt_100g !== undefined) per100.push(`**Salt:** ${n.salt_100g}g`);
       if (n.sodium_100g !== undefined) per100.push(`**Sodium:** ${n.sodium_100g}g`);
-      if (n.additional_100g) {
+      if (open100.asSold.length > 0) {
         per100.push('**Other nutrients per 100 g / 100 ml:**');
-        per100.push(...additionalLines(n.additional_100g));
+        per100.push(...additionalLines(open100.asSold));
       }
       if (per100.length > 0) lines.push('\n### Nutrition per 100 g / 100 ml', ...per100);
 
@@ -767,27 +829,38 @@ export const offGetProductTool = tool('off_get_product', {
         n.energy_kcal_serving !== undefined ||
         n.fat_serving !== undefined ||
         n.sugars_serving !== undefined ||
-        n.additional_serving
+        openServing.asSold.length > 0
       ) {
-        // The serving size is the denominator for everything in this section, so it is restated
-        // here rather than left to the header line — bare per-serving numbers are unusable without
-        // it, and its absence is stated outright instead of being silently omitted.
-        lines.push(
-          `\n### Nutrition per serving${p.serving_size ? ` (per ${mdInline(p.serving_size)})` : ''}`,
-        );
-        if (p.serving_size === undefined) {
-          lines.push(
-            '*Serving size not recorded by Open Food Facts — the figures below have no stated denominator.*',
-          );
-        }
+        lines.push(...servingSectionHead('Nutrition per serving', p.serving_size));
         if (n.energy_kcal_serving !== undefined)
           lines.push(`**Energy:** ${n.energy_kcal_serving} kcal`);
         if (n.fat_serving !== undefined) lines.push(`**Fat:** ${n.fat_serving}g`);
         if (n.sugars_serving !== undefined) lines.push(`**Sugars:** ${n.sugars_serving}g`);
-        if (n.additional_serving) {
+        if (openServing.asSold.length > 0) {
           lines.push('**Other nutrients per serving:**');
-          lines.push(...additionalLines(n.additional_serving));
+          lines.push(...additionalLines(openServing.asSold));
         }
+      }
+
+      if (onlyPrepared) {
+        lines.push(
+          '\n**As-sold nutrition:** This read returned only prepared figures. Open Food Facts returns one preparation state per read, so the record can still hold as-sold figures.',
+        );
+      }
+
+      if (open100.prepared.length > 0) {
+        lines.push(
+          '\n### Nutrition per 100 g / 100 ml, as prepared',
+          ...additionalLines(open100.prepared),
+        );
+      }
+
+      if (openServing.prepared.length > 0) {
+        lines.push(
+          ...servingSectionHead('Nutrition per serving, as prepared', p.serving_size),
+          "*Open Food Facts scales these from the per-100 figures by serving_quantity, which is often a powder's dry portion rather than the prepared serving.*",
+          ...additionalLines(openServing.prepared),
+        );
       }
     } else if (notRequested('nutriments')) {
       lines.push('\n**Nutrition:** Not requested');
@@ -875,8 +948,10 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push(`\n**Data completeness:** ${completenessLabel(p.completeness)}`);
     }
 
+    // The as-sold fields of a prepared-only read are missing because of the read, which the
+    // statement above says, so the footer's claim narrows to the rest.
     lines.push(
-      '\n*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. Missing fields = not yet entered.*',
+      `\n*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. ${onlyPrepared ? 'Other missing' : 'Missing'} fields = not yet entered.*`,
     );
 
     return [{ type: 'text' as const, text: lines.join('\n') }];
