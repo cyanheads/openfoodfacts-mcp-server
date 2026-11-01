@@ -3,7 +3,9 @@
  * export beside the store (resuming with `Range` + `If-Range`), ingests it from a line cursor,
  * sweeps the rows the load did not stamp, builds any sort index the store lacks, and only then sets
  * the checkpoint. `deltaPass` applies the daily deltas ending past the checkpoint, oldest first.
- * Both run one upstream request at a time and stop on any non-2xx.
+ * Both run one upstream request at a time and stop on any non-2xx. A feed line that is not valid
+ * JSON or runs past 16 MiB is skipped, counted, and logged by line number, never by content:
+ * fetching the feed again would bring the same line back.
  * @module services/mirror/mirror-ingester
  */
 
@@ -22,12 +24,19 @@ import type {
   SyncPage,
 } from '@cyanheads/mcp-ts-core/mirror';
 import { USER_AGENT } from '@/services/openfoodfacts/user-agent.js';
-import { type DeltaFile, parseDeltaIndex, planDeltas, readLines } from './mirror-feeds.js';
+import {
+  type DeltaFile,
+  type OversizeLine,
+  parseDeltaIndex,
+  planDeltas,
+  readLines,
+} from './mirror-feeds.js';
 import {
   decodeCheckpoint,
   encodeCheckpoint,
   ensureSortIndexes,
   fileSize,
+  type MirrorLoad,
   writeMirrorLoad,
 } from './mirror-store.js';
 import type { MirrorRecord } from './record-builder.js';
@@ -94,6 +103,11 @@ const ExportCursorSchema = z.object({
   maxModifiedT: z.number().int().nonnegative(),
   /** Sweep position: rows at or below this rowid are swept. */
   rowid: z.number().int().nonnegative(),
+  /**
+   * Lines among the `line` consumed that were skipped as malformed or past 16 MiB. Absent from a
+   * cursor written before lines were skipped, when a malformed line still failed the load.
+   */
+  skipped: z.number().int().nonnegative().default(0),
 });
 
 /** A full load's resume position, persisted as the framework sync cursor. */
@@ -124,17 +138,17 @@ export interface ExportLoadOptions extends IngestOptions {
    * when the export changes after the ingest began.
    */
   generation: number;
-  /** Called with the generation the load completed under, once `mirror_load` records it. */
-  onLoaded(generation: number): void;
+  /** Called with the load once `mirror_load` records it. */
+  onLoaded(load: MirrorLoad): void;
   /** The checkpoint before this load, kept in place until the load completes. */
   previousCheckpoint: string | undefined;
 }
 
 /**
  * Full load. Every page carries the cursor, so an interrupt anywhere resumes with no line skipped
- * or applied twice: the download from its byte offset, the ingest from its line count, the sweep
- * from its rowid. The checkpoint changes once, on the last page, after the sweep and the sort
- * index builds.
+ * or applied twice: the download from its byte offset, the ingest from its line count (and the
+ * count of lines it skipped through it), the sweep from its rowid. The checkpoint changes once, on
+ * the last page, after the sweep and the sort index builds.
  */
 export async function* exportLoad(
   ctx: SyncContext,
@@ -148,6 +162,7 @@ export async function* exportLoad(
     line: 0,
     maxModifiedT: 0,
     rowid: 0,
+    skipped: 0,
   };
   /**
    * The runner clears the checkpoint when a load starts over a completed store; restoring it keeps
@@ -181,7 +196,15 @@ export async function* exportLoad(
                   generation,
                 });
               }
-              cursor = { ...cursor, etag, generation, totalBytes, line: 0, maxModifiedT: 0 };
+              cursor = {
+                ...cursor,
+                etag,
+                generation,
+                totalBytes,
+                line: 0,
+                maxModifiedT: 0,
+                skipped: 0,
+              };
             } else {
               cursor = { ...cursor, totalBytes };
             }
@@ -223,6 +246,11 @@ export async function* exportLoad(
       const lines = gunzipLines(createReadStream(downloadPath));
       const skip = cursor.line;
       let line = 0;
+      let { skipped } = cursor;
+      const onSkip = (reason: SkippedLineReason, bytes?: number) => {
+        skipped += 1;
+        logSkippedLine(log, 'export', line, reason, bytes);
+      };
       let pending: MirrorRecord[] = [];
       let pages = 0;
       try {
@@ -232,10 +260,15 @@ export async function* exportLoad(
             if (line % 10_000 === 0) ctx.signal.throwIfAborted();
             continue;
           }
-          const record = buildLine(builder, bytes, line);
+          const record = buildLine(builder, bytes, onSkip);
           if (record !== null) pending.push(record);
           if (pending.length < PAGE_SIZE) continue;
-          cursor = { ...cursor, line, maxModifiedT: maxModified(cursor.maxModifiedT, pending) };
+          cursor = {
+            ...cursor,
+            line,
+            maxModifiedT: maxModified(cursor.maxModifiedT, pending),
+            skipped,
+          };
           const records = toRows(pending, cursor.generation, options);
           pending = [];
           yield { records, cursor: JSON.stringify(cursor) };
@@ -266,13 +299,17 @@ export async function* exportLoad(
         line,
         maxModifiedT: maxModified(cursor.maxModifiedT, pending),
         rowid: 0,
+        skipped,
       };
       yield {
         records: toRows(pending, cursor.generation, options),
         cursor: JSON.stringify(cursor),
       };
       await rm(downloadPath, { force: true });
-      log.info?.('Ingested the export; sweeping rows it no longer lists.', { lines: line });
+      log.info?.('Ingested the export; sweeping rows it no longer lists.', {
+        lines: line,
+        skippedLines: skipped,
+      });
       continue;
     }
 
@@ -308,26 +345,29 @@ export async function* exportLoad(
       asOfSeconds: cursor.maxModifiedT,
     }),
   };
-  writeMirrorLoad(handle, {
+  const load: MirrorLoad = {
     generation: cursor.generation,
     loadedAt: new Date().toISOString(),
     recordVersion: builder.MIRROR_RECORD_VERSION,
-  });
-  options.onLoaded(cursor.generation);
+    ...(cursor.etag !== undefined && { etag: cursor.etag }),
+    skippedLines: cursor.skipped,
+  };
+  writeMirrorLoad(handle, load);
+  options.onLoaded(load);
 }
 
 /** Options for one delta pass. */
 export interface DeltaPassOptions extends IngestOptions {
   /** The delta index, parsed. */
   index: readonly DeltaFile[];
-  /** Called with each delta's name once its last page is applied. */
-  onApplied(name: string): void;
+  /** Called with each delta's name, and the lines of it skipped, once its last page is applied. */
+  onApplied(name: string, skippedLines: number): void;
 }
 
 /**
- * Applies each delta ending past the checkpoint, oldest first. A delta's pages carry no checkpoint
- * until its last, so an interrupted delta is applied again whole (upserts are idempotent) and a
- * completed one is never applied twice.
+ * Applies each delta ending past the checkpoint, oldest first, stopping before a gap the listed
+ * deltas cannot bridge. A delta's pages carry no checkpoint until its last, so an interrupted
+ * delta is applied again whole (upserts are idempotent) and a completed one is never applied twice.
  */
 export async function* deltaPass(
   ctx: SyncContext,
@@ -337,12 +377,8 @@ export async function* deltaPass(
     throw new Error('deltaPass needs the checkpoint of a completed full load.');
   }
   const { generation, asOfSeconds } = decodeCheckpoint(ctx.checkpoint);
-  const plan = planDeltas(options.index, asOfSeconds);
-  if (plan.kind === 'gap') {
-    throw new Error('deltaPass was given an index with a gap after the checkpoint.');
-  }
   let pages = 0;
-  for (const delta of plan.deltas) {
+  for (const delta of planDeltas(options.index, asOfSeconds).deltas) {
     await delay(options.upstream.requestGapMs, undefined, { signal: ctx.signal });
     const download = await requestOk(
       new URL(delta.name, options.upstream.deltaBaseUrl).href,
@@ -350,12 +386,17 @@ export async function* deltaPass(
       ctx.signal,
     );
     let lines = 0;
+    let skipped = 0;
+    const onSkip = (reason: SkippedLineReason, bytes?: number) => {
+      skipped += 1;
+      logSkippedLine(options.log, delta.name, lines, reason, bytes);
+    };
     let pending: MirrorRecord[] = [];
     const stream = gunzipLines(Readable.from(bodyChunks(download)));
     try {
       for await (const bytes of stream.lines) {
         lines += 1;
-        const record = buildLine(options.builder, bytes, lines);
+        const record = buildLine(options.builder, bytes, onSkip);
         if (record !== null) pending.push(record);
         if (pending.length < PAGE_SIZE) continue;
         const records = toRows(pending, generation, options);
@@ -372,8 +413,24 @@ export async function* deltaPass(
       records: toRows(pending, generation, options),
       checkpoint: encodeCheckpoint({ generation, asOfSeconds: delta.endSeconds }),
     };
-    options.onApplied(delta.name);
-    options.log.info?.('Applied a delta.', { delta: delta.name, lines });
+    options.onApplied(delta.name, skipped);
+    options.log.info?.('Applied a delta.', { delta: delta.name, lines, skippedLines: skipped });
+  }
+}
+
+/**
+ * The export's current ETag, read with a HEAD request, or `undefined` when the response carries
+ * none. Non-2xx throws `upstream_status`.
+ */
+export async function fetchExportEtag(
+  upstream: MirrorUpstream,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const head = await requestOk(upstream.exportUrl, upstream.userAgent, signal, 'HEAD');
+  try {
+    return head.response.headers.get('etag') ?? undefined;
+  } finally {
+    await head.release();
   }
 }
 
@@ -446,19 +503,49 @@ function toRows(records: MirrorRecord[], generation: number, options: IngestOpti
   }));
 }
 
-function buildLine(builder: MirrorBuilder, bytes: Buffer, line: number): MirrorRecord | null {
+/** Why a feed line was skipped rather than ingested. */
+type SkippedLineReason = 'upstream_line_malformed' | 'upstream_line_too_long';
+
+/**
+ * The record a feed line builds, or `null` for a blank or unservable line. A line that is not
+ * valid JSON, or that ran past 16 MiB, is handed to `onSkip` instead: it is a per-record failure
+ * in otherwise valid upstream content, which fetching the feed again would bring back unchanged.
+ */
+function buildLine(
+  builder: MirrorBuilder,
+  bytes: Buffer | OversizeLine,
+  onSkip: (reason: SkippedLineReason, bytes?: number) => void,
+): MirrorRecord | null {
+  if (!Buffer.isBuffer(bytes)) {
+    onSkip('upstream_line_too_long', bytes.oversizeBytes);
+    return null;
+  }
   if (bytes.length === 0 || (bytes.length === 1 && bytes[0] === 0x0d)) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(bytes.toString('utf8'));
-  } catch (err) {
-    throw serviceUnavailable(
-      `Line ${line} of an Open Food Facts feed is not valid JSON; the sync stopped with its checkpoint unchanged.`,
-      { reason: 'upstream_line_malformed', line },
-      { cause: err },
-    );
+  } catch {
+    // The parser's message quotes the line, so it never reaches the log.
+    onSkip('upstream_line_malformed');
+    return null;
   }
   return builder.buildMirrorRecord(parsed);
+}
+
+/** Logs one skipped line by feed, line number, reason, and length, never its content. */
+function logSkippedLine(
+  log: MirrorLogger,
+  feed: string,
+  line: number,
+  reason: SkippedLineReason,
+  bytes?: number,
+): void {
+  log.warning?.(
+    reason === 'upstream_line_malformed'
+      ? 'Skipped a feed line that is not valid JSON.'
+      : 'Skipped a feed line longer than 16 MiB.',
+    { feed, line, reason, ...(bytes !== undefined && { bytes }) },
+  );
 }
 
 function maxModified(current: number, records: readonly MirrorRecord[]): number {
@@ -496,6 +583,7 @@ async function startRequest(
   url: string,
   headers: Record<string, string>,
   signal: AbortSignal,
+  method: 'GET' | 'HEAD' = 'GET',
 ): Promise<Download> {
   const stall = new AbortController();
   const arm = () =>
@@ -513,7 +601,11 @@ async function startRequest(
   const release = () => clearTimeout(timer);
   let response: Response;
   try {
-    response = await fetch(url, { headers, signal: AbortSignal.any([signal, stall.signal]) });
+    response = await fetch(url, {
+      headers,
+      method,
+      signal: AbortSignal.any([signal, stall.signal]),
+    });
   } catch (err) {
     release();
     throw stall.signal.aborted && !signal.aborted ? stall.signal.reason : err;
@@ -532,9 +624,14 @@ async function startRequest(
   };
 }
 
-/** Starts a GET that must answer 2xx. */
-async function requestOk(url: string, userAgent: string, signal: AbortSignal): Promise<Download> {
-  const download = await startRequest(url, { 'User-Agent': userAgent }, signal);
+/** Starts a GET (or HEAD) that must answer 2xx. */
+async function requestOk(
+  url: string,
+  userAgent: string,
+  signal: AbortSignal,
+  method: 'GET' | 'HEAD' = 'GET',
+): Promise<Download> {
+  const download = await startRequest(url, { 'User-Agent': userAgent }, signal, method);
   if (!download.response.ok) {
     await download.release();
     throw upstreamStatus(url, download.response.status);
@@ -613,7 +710,10 @@ function upstreamStatus(url: string, status: number): McpError {
  * Gunzips `source` into lines. `pipe()` forwards no errors, so a failing source destroys the
  * gunzip with its error rather than leaving the line iterator waiting forever.
  */
-function gunzipLines(source: Readable): { destroy(): void; lines: AsyncGenerator<Buffer> } {
+function gunzipLines(source: Readable): {
+  destroy(): void;
+  lines: AsyncGenerator<Buffer | OversizeLine>;
+} {
   const gunzip = createGunzip();
   source.on('error', (err) => gunzip.destroy(err));
   source.pipe(gunzip);

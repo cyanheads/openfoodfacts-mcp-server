@@ -5,7 +5,7 @@
  * @module tests/services/mirror/mirror-feeds.test
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   type DeltaFile,
   parseDeltaIndex,
@@ -20,7 +20,28 @@ async function* chunked(text: string | Buffer, size: number): AsyncGenerator<Uin
 
 async function collect(text: string, size: number): Promise<string[]> {
   const lines: string[] = [];
-  for await (const line of readLines(chunked(text, size))) lines.push(line.toString('utf8'));
+  for await (const line of readLines(chunked(text, size))) {
+    lines.push(Buffer.isBuffer(line) ? line.toString('utf8') : `<${line.oversizeBytes} bytes>`);
+  }
+  return lines;
+}
+
+const MiB = 1024 * 1024;
+
+/** `parts` as one stream: a number is that many MiB of `a`, sent 1 MiB at a time. */
+async function* stream(...parts: (number | string)[]): AsyncGenerator<Uint8Array> {
+  const mebibyte = Buffer.alloc(MiB, 0x61);
+  for (const part of parts) {
+    if (typeof part === 'string') yield Buffer.from(part, 'utf8');
+    else for (let i = 0; i < part; i += 1) yield mebibyte;
+  }
+}
+
+/** Each line as its length in bytes, or `{ oversizeBytes }` for a line dropped past the ceiling. */
+async function lineLengths(chunks: AsyncIterable<Uint8Array>): Promise<unknown[]> {
+  const lines: unknown[] = [];
+  for await (const line of readLines(chunks))
+    lines.push(Buffer.isBuffer(line) ? line.length : line);
   return lines;
 }
 
@@ -41,14 +62,30 @@ describe('readLines', () => {
     expect(await collect('{"a":1}\r\n', 3)).toEqual(['{"a":1}\r']);
   });
 
-  it('refuses a line past 16 MiB as a foreign stream', async () => {
-    const huge = Buffer.alloc(16 * 1024 * 1024 + 1, 0x61);
-    const run = async () => {
-      for await (const _ of readLines(chunked(huge, 1 << 20))) {
-        /* drain */
-      }
-    };
-    await expect(run()).rejects.toMatchObject({ data: { reason: 'upstream_line_too_long' } });
+  it('yields a line of exactly 16 MiB whole, and one byte more as only its length', async () => {
+    expect(await lineLengths(stream(16, '\n', 16, 'a\n', 'b'))).toEqual([
+      16 * MiB,
+      { oversizeBytes: 16 * MiB + 1 },
+      1,
+    ]);
+  });
+
+  it('drops a line past 16 MiB as it streams, never joining its bytes, and keeps the lines around it', async () => {
+    const concat = vi.spyOn(Buffer, 'concat');
+    try {
+      expect(await lineLengths(stream('{"a":', '1}\n', 64, '\n{"b":2}\n', 17))).toEqual([
+        7,
+        { oversizeBytes: 64 * MiB },
+        7,
+        { oversizeBytes: 17 * MiB },
+      ]);
+      const joined = concat.mock.calls.map(([, length]) => length ?? 0);
+      // The first line spans two chunks, so the spy sees how held bytes are joined.
+      expect(joined).toContain(7);
+      expect(Math.max(...joined)).toBeLessThanOrEqual(16 * MiB);
+    } finally {
+      concat.mockRestore();
+    }
   });
 });
 
@@ -115,14 +152,21 @@ describe('planDeltas', () => {
   });
 
   it('reports a gap when the checkpoint predates the oldest listed delta', () => {
-    expect(planDeltas(index, 99)).toEqual({ kind: 'gap', resumesAtSeconds: 99 });
+    expect(planDeltas(index, 99)).toEqual({ kind: 'gap', deltas: [], resumesAtSeconds: 99 });
     expect(planDeltas(index, 100)).toEqual({ kind: 'apply', deltas: index });
   });
 
-  it('reports a gap when a missing day leaves changes in no listed file', () => {
+  it('reports a gap when a missing day leaves changes in no listed file, with the deltas before it', () => {
     expect(planDeltas([index[0] as DeltaFile, index[2] as DeltaFile], 150)).toEqual({
       kind: 'gap',
+      deltas: [index[0]],
       resumesAtSeconds: 200,
+    });
+    const later = [day(100, 200), day(200, 300), day(400, 500), day(500, 600)];
+    expect(planDeltas(later, 150)).toEqual({
+      kind: 'gap',
+      deltas: [later[0], later[1]],
+      resumesAtSeconds: 300,
     });
   });
 });
@@ -192,4 +236,15 @@ describe('feed parser timing', () => {
       });
     });
   }
+
+  it('readLines stays linear: one long line that passes 16 MiB at the largest size', async () => {
+    // 5 bytes a repeat: 25.6 MB at 320k units, over the ceiling; 12.8 MB at 160k, under it.
+    await expectLinear(
+      (units) => `${'§1 x'.repeat(16 * units)}\ny`,
+      async (input) => {
+        const lines = await lineLengths(chunked(input, 1024));
+        expect(lines.at(-1)).toBe(1);
+      },
+    );
+  });
 });

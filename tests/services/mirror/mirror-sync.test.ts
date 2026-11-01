@@ -1,10 +1,12 @@
 /**
  * @fileoverview Tests for a mirror sync run against a fake Open Food Facts static host on
  * 127.0.0.1: full init, download resume (`Range` + `If-Range`) and its restart on a changed ETag,
- * an interrupted ingest resuming with no line skipped or applied twice, delta order and
- * idempotence, the non-2xx stop, a delta re-applied after a failure part way through it, and the
- * full reloads (age, record version, gap) with their sweep and the checkpoint they move back, and
- * a run whose lease another run reclaimed writing nothing over that run's completed state.
+ * an interrupted ingest resuming with no line skipped or applied twice, malformed and oversize
+ * lines skipped and counted once across a resume, delta order and idempotence, the non-2xx stop, a
+ * delta re-applied after a failure part way through it, the full reloads (age, record version,
+ * gap) with their sweep and the checkpoint they move back, the age and gap reloads an unchanged
+ * export ETag skips, a refresh at a path naming no file refused before it opens anything, and a
+ * run whose lease another run reclaimed writing nothing over that run's completed state.
  * @module tests/services/mirror/mirror-sync.test
  */
 
@@ -90,6 +92,7 @@ function fakeBuilder(version = 1, onBuild?: (code: string) => void): MirrorBuild
 
 interface Request {
   headers: IncomingHttpHeaders;
+  method: string;
   path: string;
 }
 
@@ -100,7 +103,7 @@ class FakeHost {
   requests: Request[] = [];
   exportBody = Buffer.alloc(0);
   etag = '"e1"';
-  /** Send this many body bytes, call `onHold`, and never finish the response. Applies once. */
+  /** Send this many body bytes, call `onHold`, and never finish the response. Applies to one GET. */
   holdAfterBytes: number | undefined;
   onHold: () => void = () => {};
   /** The response `holdAfterBytes` left unfinished, for a test to cut. */
@@ -119,7 +122,7 @@ class FakeHost {
   async start(): Promise<void> {
     this.server = createServer((req, res) => {
       const path = req.url ?? '';
-      this.requests.push({ path, headers: req.headers });
+      this.requests.push({ path, method: req.method ?? '', headers: req.headers });
       this.onRequest(path);
       const status = this.statuses.get(path);
       if (status !== undefined) {
@@ -143,7 +146,8 @@ class FakeHost {
           }),
         });
         const hold = this.holdAfterBytes;
-        if (hold === undefined) {
+        // A HEAD has no body to hold.
+        if (hold === undefined || req.method !== 'GET') {
           res.end(body);
           return;
         }
@@ -192,9 +196,46 @@ class FakeHost {
   paths(): string[] {
     return this.requests.map((r) => r.path);
   }
+
+  /** Each request as `<method> <path>`. */
+  calls(): string[] {
+    return this.requests.map((r) => `${r.method} ${r.path}`);
+  }
 }
 
+/** The requests a refresh sends to read the delta index and check the export's ETag. */
+const INDEX_AND_ETAG_CHECK = [
+  'GET /data/delta/index.txt',
+  'HEAD /data/openfoodfacts-products.jsonl.gz',
+  'HEAD /s3/openfoodfacts-products.jsonl.gz',
+];
+
 const silent: MirrorLogger = {};
+
+interface LogLine {
+  level: string;
+  message: string;
+  meta?: Readonly<Record<string, unknown>>;
+}
+
+/** A logger that keeps every line it is given. */
+function capture(): { lines: LogLine[]; log: MirrorLogger; warnings(): LogLine[] } {
+  const lines: LogLine[] = [];
+  const at = (level: string) => (message: string, meta?: Readonly<Record<string, unknown>>) => {
+    lines.push({ level, message, ...(meta && { meta }) });
+  };
+  return {
+    lines,
+    log: {
+      debug: at('debug'),
+      info: at('info'),
+      notice: at('notice'),
+      warning: at('warning'),
+      error: at('error'),
+    },
+    warnings: () => lines.filter((line) => line.level === 'warning'),
+  };
+}
 
 let dir: string;
 let path: string;
@@ -220,8 +261,9 @@ function sync(
   mode: 'init' | 'refresh',
   builder: MirrorBuilder = fakeBuilder(),
   signal = new AbortController().signal,
+  log: MirrorLogger = silent,
 ) {
-  return runMirrorSync({ builder, log: silent, mode, path, signal, upstream: host.upstream });
+  return runMirrorSync({ builder, log, mode, path, signal, upstream: host.upstream });
 }
 
 /** Adds incompressible bytes to each line, so the gzipped export spans many network chunks. */
@@ -355,6 +397,7 @@ describe('mirror:init', () => {
     expect(await mirrorAsOf(probe)).toBe(new Date((exportMax + 500) * 1000).toISOString());
     expect(await isMirrorReady(probe)).toBe(true);
     expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 1, recordVersion: 1 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ etag: '"e1"', skippedLines: 0 });
     expect(existsSync(`${path}.export.jsonl.gz`)).toBe(false);
     expect(host.paths()).toEqual([
       '/data/openfoodfacts-products.jsonl.gz',
@@ -498,6 +541,90 @@ describe('mirror:init', () => {
     expect(stored).toHaveLength(1_000);
     expect(stored.every((code) => code.startsWith('NEW'))).toBe(true);
     expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2 });
+  });
+
+  it('skips a malformed line and one past 16 MiB in an otherwise good export, counting and logging each by number alone', async () => {
+    const [first, second, third] = products(3).map((line) => JSON.stringify(line));
+    const oversize = JSON.stringify({ code: 'HUGE', name: 'x'.repeat(16 * 1024 * 1024) });
+    host.exportBody = gzipSync(
+      [first, '{"code":"BAD","name":', oversize, second, '', third].join('\n'),
+    );
+    const { lines, log, warnings } = capture();
+
+    const report = await sync('init', fakeBuilder(), undefined, log);
+
+    expect(report.fullLoad).toMatchObject({ reason: 'requested', generation: 1, skippedLines: 2 });
+    expect(await codes()).toEqual(['P00000', 'P00001', 'P00002']);
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 1, skippedLines: 2 });
+    expect(warnings()).toEqual([
+      {
+        level: 'warning',
+        message: 'Skipped a feed line that is not valid JSON.',
+        meta: { feed: 'export', line: 2, reason: 'upstream_line_malformed' },
+      },
+      {
+        level: 'warning',
+        message: 'Skipped a feed line longer than 16 MiB.',
+        meta: {
+          feed: 'export',
+          line: 3,
+          reason: 'upstream_line_too_long',
+          bytes: Buffer.byteLength(oversize),
+        },
+      },
+    ]);
+    const logged = JSON.stringify(lines);
+    expect(logged).not.toContain('BAD');
+    expect(logged).not.toContain('xxxxxxxx');
+    expect(existsSync(`${path}.export.jsonl.gz`)).toBe(false);
+    expect(await isMirrorReady(probe)).toBe(true);
+  });
+
+  it('resumes an ingest interrupted past skipped lines, counting each once and skipping no good line', async () => {
+    const lines = products(4_500).map((line) => JSON.stringify(line));
+    // Line 1,001 lands in the first page, applied before the interrupt.
+    lines.splice(1_000, 0, '{"code":');
+    // Line 2,301 lands in the page the interrupt discards, so the resume reads it again.
+    lines.splice(2_300, 0, 'not json');
+    host.exportBody = gzipSync(lines.join('\n'));
+    const skippedAt = (line: number) => ({
+      level: 'warning',
+      message: 'Skipped a feed line that is not valid JSON.',
+      meta: { feed: 'export', line, reason: 'upstream_line_malformed' },
+    });
+    const firstRun = capture();
+    const controller = new AbortController();
+    const interrupting = fakeBuilder(1, (code) => {
+      if (code === 'P02500') controller.abort(new Error('interrupted'));
+    });
+
+    await expect(sync('init', interrupting, controller.signal, firstRun.log)).rejects.toThrow(
+      'interrupted',
+    );
+
+    expect(parseExportCursor((await probe.readState()).cursor)).toMatchObject({
+      phase: 'ingest',
+      line: 2_001,
+      skipped: 1,
+    });
+    expect(await codes()).toHaveLength(2_000);
+    expect(firstRun.warnings()).toEqual([skippedAt(1_001), skippedAt(2_301)]);
+
+    const secondRun = capture();
+    const built: string[] = [];
+    const report = await sync(
+      'init',
+      fakeBuilder(1, (code) => built.push(code)),
+      undefined,
+      secondRun.log,
+    );
+
+    expect(built[0]).toBe('P02000');
+    expect(built).toHaveLength(2_500);
+    expect(await codes()).toHaveLength(4_500);
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', skippedLines: 2 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ skippedLines: 2 });
+    expect(secondRun.warnings()).toEqual([skippedAt(2_301)]);
   });
 
   it('builds the sort indexes once the ingest is in, before the checkpoint is set and the load completes', async () => {
@@ -757,6 +884,8 @@ describe('mirror refresh', () => {
     await rm(path, { force: true });
     await probe.close();
     probe = openMirrorStore(join(dir, 'other.sqlite'));
+    // The store exists, as an init that stopped before its first page leaves it.
+    await probe.raw();
     await expect(
       runMirrorSync({
         builder: fakeBuilder(),
@@ -766,7 +895,33 @@ describe('mirror refresh', () => {
         signal: new AbortController().signal,
         upstream: host.upstream,
       }),
-    ).rejects.toMatchObject({ data: { reason: 'mirror_not_initialized' } });
+    ).rejects.toMatchObject({
+      message:
+        'The mirror store has never completed a full load, so there is nothing to refresh. Run `bun run mirror:init` first.',
+      data: { reason: 'mirror_not_initialized' },
+    });
+    expect(host.requests).toEqual([]);
+  });
+
+  it('is refused at a path naming no file before it opens anything, creating no store or directory', async () => {
+    const absent = join(dir, 'absent');
+
+    await expect(
+      runMirrorSync({
+        builder: fakeBuilder(),
+        log: silent,
+        mode: 'refresh',
+        path: join(absent, 'store.sqlite'),
+        signal: new AbortController().signal,
+        upstream: host.upstream,
+      }),
+    ).rejects.toMatchObject({
+      message:
+        'The mirror store has never completed a full load, so there is nothing to refresh. Run `bun run mirror:init` first.',
+      data: { reason: 'mirror_not_initialized' },
+    });
+
+    expect(existsSync(absent)).toBe(false);
     expect(host.requests).toEqual([]);
   });
 
@@ -850,21 +1005,51 @@ describe('mirror refresh', () => {
   it('re-applies whole a delta whose body failed part way, its checkpoint left before it', async () => {
     const lines = products(2_500, exportMax + 1, 'D');
     const name = host.addDelta(exportMax - 50, exportMax + 3_000, lines);
-    // Line 2,101 is cut mid-object, after the delta's first 2,000-record page has applied.
-    const cut = lines.slice(0, 2_100).map((line) => JSON.stringify(line));
-    host.deltas.set(name, gzipSync(`${cut.join('\n')}\n{"code":`));
+    // The gzip stream stops short, after the delta's first 2,000-record page has applied.
+    const whole = jsonl(lines);
+    host.deltas.set(name, whole.subarray(0, Math.floor(whole.length * 0.9)));
 
-    await expect(sync('refresh')).rejects.toMatchObject({
-      data: { reason: 'upstream_line_malformed', line: 2_101 },
-    });
+    await expect(sync('refresh')).rejects.toMatchObject({ code: 'Z_BUF_ERROR' });
+    expect(await codes()).toHaveLength(2_100);
     expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax });
 
-    host.deltas.set(name, jsonl(lines));
+    host.deltas.set(name, whole);
     const report = await sync('refresh');
 
     expect(report.deltasApplied).toEqual([name]);
     expect(await codes()).toHaveLength(2_600);
     expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax + 3_000 });
+  });
+
+  it('skips a malformed delta line, counting it, and moves the checkpoint past the delta', async () => {
+    const name = host.addDelta(exportMax - 50, exportMax + 100, []);
+    host.deltas.set(
+      name,
+      gzipSync(
+        [
+          JSON.stringify({ code: 'P00007', name: 'v1' }),
+          '{"code":"BAD",',
+          JSON.stringify({ code: 'NEW01', name: 'new' }),
+        ].join('\n'),
+      ),
+    );
+    const { lines, log, warnings } = capture();
+
+    const report = await sync('refresh', fakeBuilder(), undefined, log);
+
+    expect(report.deltasApplied).toEqual([name]);
+    expect(report.skippedDeltaLines).toBe(1);
+    expect(await doc('P00007')).toMatchObject({ product_name: 'v1' });
+    expect(await doc('NEW01')).toMatchObject({ product_name: 'new' });
+    expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax + 100 });
+    expect(warnings()).toEqual([
+      {
+        level: 'warning',
+        message: 'Skipped a feed line that is not valid JSON.',
+        meta: { feed: name, line: 2, reason: 'upstream_line_malformed' },
+      },
+    ]);
+    expect(JSON.stringify(lines)).not.toContain('BAD');
   });
 
   it('reloads after 30 days, removing products the new export lacks and their postings', async () => {
@@ -916,12 +1101,82 @@ describe('mirror refresh', () => {
     expect(readMirrorLoad(handle)).toMatchObject({ generation: 1 });
 
     vi.setSystemTime(loadedAt + 30 * day);
+    host.etag = '"e2"';
     expect((await sync('refresh')).fullLoad).toMatchObject({ reason: 'age', generation: 2 });
     expect(readMirrorLoad(handle)).toEqual({
       generation: 2,
       loadedAt: '2026-10-31T00:00:00.000Z',
       recordVersion: 1,
+      etag: '"e2"',
+      skippedLines: 0,
     });
+  });
+
+  it('skips the 30-day reload while the export is unchanged, still applying the deltas, and runs it once the export changes', async () => {
+    const day = 24 * 3600 * 1000;
+    const loadedAt = '2026-10-01T00:00:00.000Z';
+    const handle = await probe.raw();
+    handle.prepare('UPDATE mirror_load SET loaded_at = ?').run(loadedAt);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.parse(loadedAt) + 30 * day);
+    const delta = host.addDelta(exportMax - 50, exportMax + 100, [{ code: 'P00007', name: 'v1' }]);
+    const { log, warnings } = capture();
+
+    const skipped = await sync('refresh', fakeBuilder(), undefined, log);
+
+    expect(skipped.fullLoad).toBeUndefined();
+    expect(skipped.reloadSkipped).toBe('age');
+    expect(skipped.deltasApplied).toEqual([delta]);
+    expect(host.calls()).toEqual([...INDEX_AND_ETAG_CHECK, `GET /data/delta/${delta}`]);
+    expect(await doc('P00007')).toMatchObject({ product_name: 'v1' });
+    expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax + 100 });
+    expect(readMirrorLoad(handle)).toMatchObject({ generation: 1, loadedAt, etag: '"e1"' });
+    expect(warnings()).toEqual([
+      {
+        level: 'warning',
+        message:
+          'The last full load is 30 days old, but the export is unchanged since that load, so reloading it would change nothing; the reload is skipped and the mirror keeps serving.',
+        meta: { reason: 'age', etag: '"e1"', loadedAt },
+      },
+    ]);
+
+    host.etag = '"e2"';
+    host.requests = [];
+    const reloaded = await sync('refresh');
+
+    expect(reloaded.fullLoad).toMatchObject({ reason: 'age', generation: 2 });
+    expect(reloaded.reloadSkipped).toBeUndefined();
+    expect(host.calls().slice(0, 5)).toEqual([
+      ...INDEX_AND_ETAG_CHECK,
+      'GET /data/openfoodfacts-products.jsonl.gz',
+      'GET /s3/openfoodfacts-products.jsonl.gz',
+    ]);
+    expect(readMirrorLoad(handle)).toMatchObject({ generation: 2, etag: '"e2"' });
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: exportMax + 100 });
+  });
+
+  it('stops a reload whose download answers non-2xx after the ETag check found the export changed', async () => {
+    const handle = await probe.raw();
+    handle.prepare('UPDATE mirror_load SET loaded_at = ?').run('2000-01-01T00:00:00.000Z');
+    host.etag = '"e2"';
+    host.answerExport = (res, _from, req) => {
+      if (req.method !== 'GET') return false;
+      res.writeHead(503).end('refused');
+      return true;
+    };
+
+    await expect(sync('refresh')).rejects.toMatchObject({
+      data: { reason: 'upstream_status', status: 503 },
+    });
+
+    expect(host.calls()).toEqual([
+      ...INDEX_AND_ETAG_CHECK,
+      'GET /data/openfoodfacts-products.jsonl.gz',
+      'GET /s3/openfoodfacts-products.jsonl.gz',
+    ]);
+    expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax });
+    expect(await codes()).toHaveLength(100);
+    expect(await isMirrorReady(probe)).toBe(true);
   });
 
   it('resumes an interrupted sweep from its rowid cursor, skipping no stale row and reading no export line again', async () => {
@@ -1079,6 +1334,18 @@ describe('mirror refresh', () => {
     expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: exportMax + 1_000 });
   });
 
+  it('reloads for a newer record builder whatever the export, even when the load is also 30 days old', async () => {
+    const handle = await probe.raw();
+    handle.prepare('UPDATE mirror_load SET loaded_at = ?').run('2000-01-01T00:00:00.000Z');
+
+    const report = await sync('refresh', fakeBuilder(2));
+
+    expect(report.fullLoad).toMatchObject({ reason: 'record_version', generation: 2 });
+    expect(report.reloadSkipped).toBeUndefined();
+    expect(host.requests.filter((r) => r.method === 'HEAD')).toEqual([]);
+    expect(readMirrorLoad(handle)).toMatchObject({ recordVersion: 2, etag: '"e1"' });
+  });
+
   it('reloads when the record builder is newer than the last full load', async () => {
     const report = await sync('refresh', fakeBuilder(2));
 
@@ -1094,8 +1361,9 @@ describe('mirror refresh', () => {
     expect(readMirrorLoad(handle)).toMatchObject({ recordVersion: 2 });
   });
 
-  it('reloads when the checkpoint predates the oldest listed delta', async () => {
+  it('reloads when the checkpoint predates the oldest listed delta and the export changed since the last load', async () => {
     host.addDelta(exportMax + 100, exportMax + 200, [{ code: 'P00007', name: 'later' }]);
+    host.etag = '"e2"';
 
     const report = await sync('refresh');
 
@@ -1104,6 +1372,98 @@ describe('mirror refresh', () => {
     // The reloaded export still predates the delta, so it stays unapplied until a later reload.
     expect(report.deltasApplied).toEqual([]);
     expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: exportMax });
+  });
+
+  it('reloads an export older than the oldest delta once, then only checks its ETag while it stays unchanged', async () => {
+    host.addDelta(exportMax + 100, exportMax + 200, [{ code: 'P00007', name: 'later' }]);
+    // Regenerated once since the init, and still older than every listed delta.
+    host.etag = '"e2"';
+    const first = await sync('refresh');
+    expect(first.fullLoad).toMatchObject({ reason: 'gap', generation: 2 });
+    const handle = await probe.raw();
+    const asOf = await mirrorAsOf(probe);
+    const { log, warnings } = capture();
+    host.requests = [];
+
+    const second = await sync('refresh', fakeBuilder(), undefined, log);
+
+    expect(host.calls()).toEqual(INDEX_AND_ETAG_CHECK);
+    expect(second.fullLoad).toBeUndefined();
+    expect(second.reloadSkipped).toBe('gap');
+    expect(second.deltasApplied).toEqual([]);
+    for (const request of host.requests) expect(request.headers['user-agent']).toBe(USER_AGENT);
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: exportMax });
+    expect(await mirrorAsOf(probe)).toBe(asOf);
+    expect(readMirrorLoad(handle)).toMatchObject({ generation: 2, etag: '"e2"' });
+    expect(await isMirrorReady(probe)).toBe(true);
+    expect(warnings()).toEqual([
+      {
+        level: 'warning',
+        message:
+          'The listed deltas no longer reach back to the mirror’s checkpoint, but the export is unchanged since the last full load, so reloading it would leave the gap in place; the reload is skipped and the mirror keeps serving.',
+        meta: {
+          reason: 'gap',
+          etag: '"e2"',
+          loadedAt: readMirrorLoad(handle)?.loadedAt,
+          asOf: new Date(exportMax * 1000).toISOString(),
+        },
+      },
+    ]);
+  });
+
+  it('applies the deltas before a gap the unchanged export cannot bridge, and none past it', async () => {
+    const before = host.addDelta(exportMax - 50, exportMax + 100, [{ code: 'P00007', name: 'v1' }]);
+    // The day between exportMax + 100 and exportMax + 200 is in no listed file.
+    host.addDelta(exportMax + 200, exportMax + 300, [{ code: 'P00007', name: 'v3' }]);
+    const firstRun = capture();
+
+    const first = await sync('refresh', fakeBuilder(), undefined, firstRun.log);
+
+    expect(first.fullLoad).toBeUndefined();
+    expect(first.reloadSkipped).toBe('gap');
+    expect(first.deltasApplied).toEqual([before]);
+    expect(host.calls()).toEqual([...INDEX_AND_ETAG_CHECK, `GET /data/delta/${before}`]);
+    expect(await doc('P00007')).toMatchObject({ product_name: 'v1' });
+    expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax + 100 });
+    expect(firstRun.warnings().map((line) => line.meta?.reason)).toEqual(['gap']);
+
+    const secondRun = capture();
+    host.requests = [];
+    const again = await sync('refresh', fakeBuilder(), undefined, secondRun.log);
+
+    expect(again.reloadSkipped).toBe('gap');
+    expect(again.deltasApplied).toEqual([]);
+    expect(host.calls()).toEqual(INDEX_AND_ETAG_CHECK);
+    expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: exportMax + 100 });
+    expect(secondRun.warnings().map((line) => line.meta?.reason)).toEqual(['gap']);
+  });
+
+  it('reloads on a gap as before when the last load recorded no ETag, sending no ETag check', async () => {
+    // A store whose load row predates the ETag column: migration 2 adds it empty.
+    const handle = await probe.raw();
+    handle.exec('ALTER TABLE mirror_load DROP COLUMN etag');
+    handle.exec('ALTER TABLE mirror_load DROP COLUMN skipped_lines');
+    handle.prepare('UPDATE schema_version SET version = 1').run();
+    await probe.close();
+    probe = openMirrorStore(path);
+    expect(readMirrorLoad(await probe.raw())).toEqual({
+      generation: 1,
+      loadedAt: expect.any(String),
+      recordVersion: 1,
+      skippedLines: 0,
+    });
+    host.addDelta(exportMax + 100, exportMax + 200, [{ code: 'P00007', name: 'later' }]);
+
+    const report = await sync('refresh');
+
+    expect(report.fullLoad).toMatchObject({ reason: 'gap', generation: 2 });
+    expect(host.requests.filter((r) => r.method === 'HEAD')).toEqual([]);
+    expect(host.calls().slice(0, 3)).toEqual([
+      'GET /data/delta/index.txt',
+      'GET /data/openfoodfacts-products.jsonl.gz',
+      'GET /s3/openfoodfacts-products.jsonl.gz',
+    ]);
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 2, etag: '"e1"' });
   });
 
   describe('a run and its sync lease', () => {

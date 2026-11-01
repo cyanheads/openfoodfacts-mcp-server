@@ -18,6 +18,7 @@ await runMirrorScript(async ({ log, path, signal }) => {
     generation: report.fullLoad?.generation,
     products: report.deltaResult.total,
     deltasApplied: report.deltasApplied,
+    skippedLines: (report.fullLoad?.skippedLines ?? 0) + report.skippedDeltaLines,
   });
   return 0;
 });

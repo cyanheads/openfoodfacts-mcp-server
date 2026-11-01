@@ -2,9 +2,12 @@
 /**
  * @fileoverview mirror:status and mirror:verify (`--verify`) — print the store's health: sync
  * status, readiness, product count, last sync, the as-of time mirror answers cite, the last full
- * load, the sync lock, and bytes on disk. Exits non-zero unless the store is ready (a sync has
- * completed and it holds products); `--verify` also runs SQLite's integrity check, which reads the
- * whole file, and exits non-zero when it fails. Never creates a store that does not exist.
+ * load with the export lines it skipped, the sync lock, and bytes on disk. Exits non-zero unless
+ * the store is ready (a sync has completed and it holds products); `--verify` also runs SQLite's
+ * integrity check, which reads the whole file, and exits non-zero when it fails. A store whose
+ * write lock a sync holds past the open's 5 s wait gets a busy report instead, naming the sync from
+ * its lease row, and a non-zero exit. Never creates a store that does not exist; its open runs any
+ * pending migration.
  * @module scripts/mirror-status
  */
 
@@ -32,7 +35,7 @@ await runMirrorScript(async ({ path }) => {
       [
         'last full load',
         report.load
-          ? `${report.load.loadedAt} (generation ${report.load.generation}, record version ${report.load.recordVersion})`
+          ? `${report.load.loadedAt} (generation ${report.load.generation}, record version ${report.load.recordVersion}, ${report.load.skippedLines} export line${report.load.skippedLines === 1 ? '' : 's'} skipped)`
           : 'never',
       ],
       [

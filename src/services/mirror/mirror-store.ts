@@ -9,15 +9,16 @@
  * | `products` | `code TEXT PRIMARY KEY` (normalized barcode); `popularity_key`, `unique_scans_n`, `created_t`, `last_modified_t` INTEGER (the `sort_by` keys, null when the record lacks one); `generation` INTEGER (full load that last stamped the row); `record_version` INTEGER (`MIRROR_RECORD_VERSION` the row was built with); `tag_ids` TEXT (sorted JSON array of `tags.id`); `doc` TEXT (the builder's projected v2 JSON) | the framework's per-page upsert and tombstone delete |
  * | `tags` | `id INTEGER PRIMARY KEY`, `key TEXT UNIQUE` (a `mirrorTagKey(facet, storedTag)`) | the ingester, before each page |
  * | `product_tags` | `PRIMARY KEY (tag_id, code) WITHOUT ROWID` — one posting per product per tag | triggers on `products` insert, `tag_ids` change, and delete |
- * | `mirror_load` | one row: `generation`, `loaded_at` (ISO), `record_version` of the last completed full load | the ingester, after a full load's sweep |
+ * | `mirror_load` | one row: `generation`, `loaded_at` (ISO), `record_version`, `etag` (the strong ETag of the export it read; null in a row written before migration 2 added it), and `skipped_lines` (export lines it skipped as malformed or past 16 MiB) of the last completed full load | the ingester, after a full load's sweep |
  * | `mirror_sync_lock` | one row while a sync runs: holder token, `pid`, `host`, `acquired_at`, `heartbeat_at` (epoch ms) | `mirror-lock.ts` |
  * | `mirror_sync_state`, `schema_version` | the framework's sync state and schema stamp | the framework |
  * | `products_<column>_sort`, one per `SORT_COLUMNS` entry | index `(<column> DESC, code)`: every product in a tag search's order for that sort key | `ensureSortIndexes` in the sync process, then SQLite with `products` |
  * | `products_code_sort_keys` (`SORT_KEYS_INDEX`) | index `(code, popularity_key, unique_scans_n, created_t, last_modified_t)`: a code's sort keys without its product row | the same |
  *
  * Every auxiliary table and trigger is created by migration 1, which runs on an empty file before
- * any data, and no migration builds an index: one built over a populated table when a process
- * opens the store blocks the serving process for minutes. The indexes above come from the sync
+ * any data, and migration 2 adds `mirror_load`'s `etag` and `skipped_lines` columns. No migration
+ * builds an index: one built over a populated table when a process opens the store blocks the
+ * serving process for minutes. The indexes above come from the sync
  * process instead, which a reader keeps reading through under WAL: a full load builds them after
  * its sweep and before it completes, one sorted pass each, and any run on a loaded store first
  * builds one it lacks. Maintained through the ingest instead, they slow it and come out larger.
@@ -39,7 +40,7 @@ import { getServerConfig } from '@/config/server-config.js';
 import { type MirrorLockHolder, readMirrorLock } from './mirror-lock.js';
 
 /** Schema version the store's migrations reach. */
-const STORE_SCHEMA_VERSION = 1;
+const STORE_SCHEMA_VERSION = 2;
 
 /** The auxiliary tables and the triggers that keep `product_tags` in step with `products.tag_ids`. */
 const AUXILIARY_DDL = [
@@ -123,14 +124,16 @@ export async function ensureSortIndexes(handle: SqliteHandle): Promise<string[]>
  * call that gives up reads live, and the next call opens again. Reads through an open store never
  * wait on a writer under WAL. The sync processes and scripts keep the framework's 5 s: one started
  * while a sync runs must wait out its page transaction to reach the lease row and be refused by
- * name (`mirror_lock_held`), not by a lock error.
+ * name (`mirror_lock_held`), not by a lock error. A script that meets a longer hold names the sync
+ * holding it instead (`scripts/_mirror-context.ts`).
  */
 export const SERVING_BUSY_TIMEOUT_MS = 250;
 
 /**
  * Builds the store at `path`, created with its parent directory on first use if absent. Nothing
- * opens until the first call on it. `busyTimeoutMs` bounds how long the open and each statement
- * wait on another connection's lock; the framework's 5 s when omitted.
+ * opens until the first call on it, and each call made before an open succeeds tries again, so a
+ * caller that must not create the store checks the path first. `busyTimeoutMs` bounds how long the
+ * open and each statement wait on another connection's lock; the framework's 5 s when omitted.
  */
 export function openMirrorStore(path: string, busyTimeoutMs?: number): MirrorStore {
   return sqliteMirrorStore({
@@ -157,6 +160,16 @@ export function openMirrorStore(path: string, busyTimeoutMs?: number): MirrorSto
           for (const statement of AUXILIARY_DDL) handle.exec(statement);
         },
       },
+      {
+        version: 2,
+        up(handle) {
+          handle.exec('ALTER TABLE mirror_load ADD COLUMN etag TEXT');
+          // Before migration 2 any malformed line failed the load, so a recorded load skipped none.
+          handle.exec(
+            'ALTER TABLE mirror_load ADD COLUMN skipped_lines INTEGER NOT NULL DEFAULT 0',
+          );
+        },
+      },
     ],
   });
 }
@@ -165,16 +178,18 @@ let servingStore: MirrorStore | undefined;
 
 /**
  * The serving process's store, built once from `OFF_MIRROR_PATH`, its open bounded by
- * {@link SERVING_BUSY_TIMEOUT_MS}. `undefined` when the variable is unset, and while the file it
- * names does not exist (a store not yet built, a mistyped path, an unmounted volume), checked again
- * on each call until it does: the serving process never creates a store, and on one a sync built,
- * its open's schema statements change nothing. Every write runs in `mirror:*` scripts or the
+ * {@link SERVING_BUSY_TIMEOUT_MS}. `undefined` when the variable is unset, and on any call while
+ * the file it names does not exist (a store not yet built, a mistyped path, an unmounted volume).
+ * The file is checked on every call, not only before the store is built: an open that gave up on a
+ * sync's lock is retried by the next call, and that retry would create the file and its directories
+ * if they had gone in between. The serving process therefore never creates a store. Its open runs
+ * the framework's schema statements and any migration the store has not reached (on a store built
+ * before migration 2, its two `ALTER`s); every other write runs in `mirror:*` scripts or the
  * scheduled job's child process.
  */
 export function getMirrorStore(): MirrorStore | undefined {
   const { mirrorPath } = getServerConfig();
-  if (mirrorPath === undefined) return;
-  if (servingStore === undefined && !existsSync(mirrorPath)) return;
+  if (mirrorPath === undefined || !existsSync(mirrorPath)) return;
   servingStore ??= openMirrorStore(mirrorPath, SERVING_BUSY_TIMEOUT_MS);
   return servingStore;
 }
@@ -240,17 +255,30 @@ export function decodeCheckpoint(checkpoint: string): MirrorCheckpoint {
 
 /** The last completed full load, as `mirror_load` records it. */
 export interface MirrorLoad {
+  /**
+   * Strong ETag of the export the load read. Absent in a row recorded before the store kept it,
+   * which a refresh treats as an export it cannot compare.
+   */
+  etag?: string;
   generation: number;
   /** ISO time the load's sweep finished. */
   loadedAt: string;
   recordVersion: number;
+  /** Export lines the load skipped because they were not valid JSON or ran past 16 MiB. */
+  skippedLines: number;
 }
 
 /** Reads the last completed full load, or `undefined` before the first one completes. */
 export function readMirrorLoad(handle: SqliteHandle): MirrorLoad | undefined {
   const row = handle
-    .prepare<{ generation: number; loaded_at: string; record_version: number }>(
-      'SELECT generation, loaded_at, record_version FROM mirror_load WHERE id = 1',
+    .prepare<{
+      etag: string | null;
+      generation: number;
+      loaded_at: string;
+      record_version: number;
+      skipped_lines: number;
+    }>(
+      'SELECT generation, loaded_at, record_version, etag, skipped_lines FROM mirror_load WHERE id = 1',
     )
     .get();
   if (row == null) return;
@@ -258,6 +286,8 @@ export function readMirrorLoad(handle: SqliteHandle): MirrorLoad | undefined {
     generation: row.generation,
     loadedAt: row.loaded_at,
     recordVersion: row.record_version,
+    ...(row.etag !== null && { etag: row.etag }),
+    skippedLines: row.skipped_lines,
   };
 }
 
@@ -316,9 +346,11 @@ export async function readMirrorReport(store: MirrorStore, path: string): Promis
 export function writeMirrorLoad(handle: SqliteHandle, load: MirrorLoad): void {
   handle
     .prepare(
-      `INSERT INTO mirror_load(id, generation, loaded_at, record_version) VALUES (1, ?, ?, ?)
+      `INSERT INTO mirror_load(id, generation, loaded_at, record_version, etag, skipped_lines)
+       VALUES (1, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET generation = excluded.generation, loaded_at = excluded.loaded_at,
-         record_version = excluded.record_version`,
+         record_version = excluded.record_version, etag = excluded.etag,
+         skipped_lines = excluded.skipped_lines`,
     )
-    .run(load.generation, load.loadedAt, load.recordVersion);
+    .run(load.generation, load.loadedAt, load.recordVersion, load.etag ?? null, load.skippedLines);
 }

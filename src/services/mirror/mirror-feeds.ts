@@ -9,21 +9,28 @@
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 
 /**
- * Longest line accepted. The 2026-11 export's longest line is about 265 KB; a line past this is a
- * corrupt or foreign stream, and buffering it whole would break the ingest's flat memory.
+ * Longest line kept. The 2026-11 export's longest line is about 265 KB; a line past this is
+ * dropped as it streams rather than buffered whole, so the ingest's memory stays flat.
  */
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 
 const LF = 0x0a;
 
+/** A line longer than 16 MiB, dropped as it streamed: only its length is kept. */
+export interface OversizeLine {
+  readonly oversizeBytes: number;
+}
+
 /**
  * Splits a byte stream on LF, one line at a time. Bytes of an unfinished line are held as chunk
  * slices and joined once, when its LF arrives, so the work stays linear however a line is chunked.
- * A final line without LF is yielded too. Lines keep a trailing CR if the stream has one.
- *
- * @throws McpError `ServiceUnavailable` (`upstream_line_too_long`) for a line over 16 MiB.
+ * A line that grows past 16 MiB has its held slices released and its further bytes counted, never
+ * held, and is yielded as an {@link OversizeLine} when it ends. A final line without LF is yielded
+ * too. Lines keep a trailing CR if the stream has one.
  */
-export async function* readLines(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<Buffer> {
+export async function* readLines(
+  chunks: AsyncIterable<Uint8Array>,
+): AsyncGenerator<Buffer | OversizeLine> {
   let pending: Buffer[] = [];
   let pendingBytes = 0;
   for await (const chunk of chunks) {
@@ -32,31 +39,22 @@ export async function* readLines(chunks: AsyncIterable<Uint8Array>): AsyncGenera
       : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     let start = 0;
     for (let lf = bytes.indexOf(LF, start); lf !== -1; lf = bytes.indexOf(LF, start)) {
-      const tail = bytes.subarray(start, lf);
-      const length = pendingBytes + tail.length;
-      assertLineLength(length);
-      yield pending.length === 0 ? tail : Buffer.concat([...pending, tail], length);
+      const length = pendingBytes + lf - start;
+      if (length > MAX_LINE_BYTES) yield { oversizeBytes: length };
+      else if (pending.length === 0) yield bytes.subarray(start, lf);
+      else yield Buffer.concat([...pending, bytes.subarray(start, lf)], length);
       pending = [];
       pendingBytes = 0;
       start = lf + 1;
     }
     if (start < bytes.length) {
-      const rest = bytes.subarray(start);
-      pendingBytes += rest.length;
-      assertLineLength(pendingBytes);
-      pending.push(rest);
+      pendingBytes += bytes.length - start;
+      if (pendingBytes > MAX_LINE_BYTES) pending = [];
+      else pending.push(bytes.subarray(start));
     }
   }
-  if (pendingBytes > 0) yield Buffer.concat(pending, pendingBytes);
-}
-
-function assertLineLength(bytes: number): void {
-  if (bytes > MAX_LINE_BYTES) {
-    throw serviceUnavailable(
-      `An export line runs past ${MAX_LINE_BYTES} bytes, so the stream is not an Open Food Facts JSONL export; the sync stopped.`,
-      { reason: 'upstream_line_too_long' },
-    );
-  }
+  if (pendingBytes > MAX_LINE_BYTES) yield { oversizeBytes: pendingBytes };
+  else if (pendingBytes > 0) yield Buffer.concat(pending, pendingBytes);
 }
 
 /** One daily delta file the index lists. */
@@ -96,23 +94,28 @@ export function parseDeltaIndex(text: string): DeltaFile[] {
   return files.sort((a, b) => a.startSeconds - b.startSeconds || a.endSeconds - b.endSeconds);
 }
 
-/** The deltas a refresh applies, or a gap the listed deltas cannot bridge. */
+/**
+ * The deltas a refresh applies, oldest first: every one ending past the checkpoint, or, when the
+ * listed deltas cannot bridge to some change, those before that gap.
+ */
 export type DeltaPlan =
   | { deltas: DeltaFile[]; kind: 'apply' }
-  /** The first change after the checkpoint is older than every delta that could carry it. */
-  | { kind: 'gap'; resumesAtSeconds: number };
+  /** The change after `resumesAtSeconds` is older than every later delta that could carry it. */
+  | { deltas: DeltaFile[]; kind: 'gap'; resumesAtSeconds: number };
 
 /**
  * Picks the deltas ending past `asOfSeconds`, oldest first. Each must start at or before the point
  * the data already reaches; otherwise the changes in between are in no listed file, and only a
- * full reload recovers them. A checkpoint older than the oldest listed delta is that case at the
- * first file.
+ * full reload recovers them, so the plan stops before that file. A checkpoint older than the
+ * oldest listed delta is that case at the first file.
  */
 export function planDeltas(index: readonly DeltaFile[], asOfSeconds: number): DeltaPlan {
   const deltas = index.filter((file) => file.endSeconds > asOfSeconds);
   let reached = asOfSeconds;
-  for (const file of deltas) {
-    if (file.startSeconds > reached) return { kind: 'gap', resumesAtSeconds: reached };
+  for (const [i, file] of deltas.entries()) {
+    if (file.startSeconds > reached) {
+      return { kind: 'gap', deltas: deltas.slice(0, i), resumesAtSeconds: reached };
+    }
     reached = Math.max(reached, file.endSeconds);
   }
   return { kind: 'apply', deltas };

@@ -33,9 +33,11 @@ if (mirrorPath === undefined) {
     });
     log.info?.('Mirror refresh finished.', {
       fullLoad: report.fullLoad?.reason ?? null,
+      reloadSkipped: report.reloadSkipped ?? null,
       deltasApplied: report.deltasApplied,
       recordsApplied:
         (report.fullLoad?.result.recordsApplied ?? 0) + report.deltaResult.recordsApplied,
+      skippedLines: (report.fullLoad?.skippedLines ?? 0) + report.skippedDeltaLines,
     });
     process.exitCode = 0;
   } catch (err) {

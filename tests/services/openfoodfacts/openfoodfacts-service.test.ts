@@ -6466,6 +6466,31 @@ describe('OpenFoodFactsService', () => {
         });
       });
 
+      it('reads live, creating no store or directory, once the store disappears after its open gave up on a sync write lock', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        const sync = openMirrorStore(storePath());
+        const syncHandle = await sync.raw();
+        syncHandle.exec('BEGIN IMMEDIATE');
+        const requests = stubLive([mirrorFixture(OATS)]);
+        try {
+          await expect(svc.getProduct(OATS, createMockContext())).resolves.toMatchObject({
+            source: 'off_api',
+          });
+        } finally {
+          syncHandle.exec('ROLLBACK');
+          await sync.close();
+        }
+        // The store's directory goes away before any open succeeded, as an unmount leaves it.
+        await rm(dir, { recursive: true, force: true });
+        const ctx = createMockContext();
+
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+
+        expect(existsSync(dir)).toBe(false);
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`, `/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([]);
+      });
+
       it('reads live, creating no store or directory, while OFF_MIRROR_PATH names no file, and serves the store once one is built there', async () => {
         const unmounted = join(dir, 'unmounted');
         mirrorConfig.mirrorPath = join(unmounted, 'store.sqlite');
