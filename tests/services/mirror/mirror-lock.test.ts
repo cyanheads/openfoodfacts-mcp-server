@@ -2,7 +2,8 @@
  * @fileoverview Tests for the cross-process mirror sync lock: a second handle or process is refused
  * with the holder named, a holder whose heartbeat lapsed or whose process died is reclaimed, a
  * reclaimed holder learns it lost the lease from its heartbeat or, before its heartbeat has run,
- * from `assertHeld`, and release never deletes another holder's row.
+ * from `assertHeld`, release never deletes another holder's row, and a `mirror:*` script that meets
+ * a sync's held write lock reports the sync holding it rather than the lock error.
  * @module tests/services/mirror/mirror-lock.test
  */
 
@@ -209,5 +210,78 @@ describe('a mirror script that meets a held lock', () => {
     } finally {
       lock.release();
     }
+  });
+});
+
+describe("a mirror script that meets a sync's held write lock", () => {
+  /** Runs `scripts/<script>` on the test store, as `bun run mirror:*` does. */
+  async function runScript(
+    script: string,
+    ...args: string[]
+  ): Promise<{ code: number | null; stderr: string }> {
+    const bun = process.versions.bun ? process.execPath : 'bun';
+    const child = spawn(bun, ['run', `scripts/${script}`, ...args], {
+      env: { ...process.env, OFF_MIRROR_PATH: path },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    const [code] = (await once(child, 'close')) as [number | null];
+    return { code, stderr };
+  }
+
+  /**
+   * Holds the write lock on `handle`, as a sort index build does for minutes, until every run of
+   * `scripts` has exited: each waits out its 5 s busy timeout and gives up.
+   */
+  async function whileWriting(
+    handle: SqliteHandle,
+    scripts: [string, ...string[]][],
+  ): Promise<{ code: number | null; stderr: string }[]> {
+    handle.exec('BEGIN IMMEDIATE');
+    try {
+      return await Promise.all(scripts.map((script) => runScript(...script)));
+    } finally {
+      handle.exec('ROLLBACK');
+    }
+  }
+
+  it('names the sync holding it, read from its lease row, and exits non-zero', {
+    timeout: 60_000,
+  }, async () => {
+    const handle = await connect();
+    const lock = acquireMirrorLock(handle);
+    const holder = readMirrorLock(handle);
+    if (holder === undefined) throw new Error('The lease row was not written.');
+    let runs: { code: number | null; stderr: string }[];
+    try {
+      runs = await whileWriting(handle, [
+        ['mirror-status.ts'],
+        ['mirror-status.ts', '--verify'],
+        ['mirror-refresh.ts'],
+      ]);
+    } finally {
+      lock.release();
+    }
+
+    for (const { code, stderr } of runs) {
+      expect(code).toBe(1);
+      expect(stderr).toContain(
+        `error: The mirror store is busy: the sync run by pid ${process.pid} on host ${hostname()} since ${holder.acquiredAt} (last heartbeat ${holder.heartbeatAt}) holds its write lock. Try again once that write finishes.\n`,
+      );
+      expect(stderr).not.toContain('mirror store "store.sqlite"');
+    }
+  });
+
+  it('reports the lock alone when no live sync holds the lease', { timeout: 60_000 }, async () => {
+    const [run] = await whileWriting(await connect(), [['mirror-status.ts']]);
+
+    expect(run?.code).toBe(1);
+    expect(run?.stderr).toContain(
+      'error: The mirror store is busy: another connection holds its write lock. Try again once that write finishes.\n',
+    );
+    expect(run?.stderr).not.toContain('mirror store "store.sqlite"');
   });
 });
