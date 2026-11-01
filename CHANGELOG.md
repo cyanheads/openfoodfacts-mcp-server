@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-11-01
+
+Adds an optional local mirror of the Open Food Facts export that serves barcode reads and tag-only searches, reads a record's stored as-sold figures when a product read returns only prepared ones, and names why a taxonomy lookup failed, with the wait in whole seconds.
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-30
 
 Checks every nutrient-filtered row against the caller bounds, caps each read with a total retry deadline, treats a flagged search timeout and a dropped connection as declared failures, labels prepared figures on product reads, adds prepared and carbohydrate figures to comparisons, and returns up to 200 taxonomy tags.
