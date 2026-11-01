@@ -206,16 +206,20 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (OFF_BASE_URL, rate limits)
+    server-config.ts                    # Server-specific env vars (OFF_BASE_URL, rate limits, OFF_MIRROR_PATH)
   services/
+    mirror/                             # Optional local export mirror (OFF_MIRROR_PATH): store, record builder, ingester, queries, refresh schedule
     openfoodfacts/
-      openfoodfacts-service.ts          # Open Food Facts API client (HTTP, rate limiting, retry)
+      openfoodfacts-service.ts          # Open Food Facts API client (HTTP, rate limiting, retry); reads the mirror first when one is ready
+      user-agent.ts                     # Identifying User-Agent shared by the client and the mirror's downloads
+      nutrition-sets.ts                 # Stored as-sold nutrition sets: choosing one for a prepared-only read
       types.ts                          # Domain types
     taxonomy/
       taxonomy-service.ts               # Tag vocabulary — live resolution, offline sample, merge/fallback policy, tag-value canonicalization
   utils/
     markdown.ts                         # Contextual Markdown escaping for crowd-sourced values in content[]
   mcp-server/
+    tools/read-source.ts                # How tool text names an answer's source (off_api / off_mirror) and the mirror freshness note
     tools/definitions/
       get-product.tool.ts               # off_get_product
       search-products.tool.ts           # off_search_products
@@ -316,6 +320,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run mirror:init` / `mirror:refresh` / `mirror:status` / `mirror:verify` | Build, refresh, inspect, and integrity-check the local export mirror at `OFF_MIRROR_PATH` (checkout or Docker image) |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |

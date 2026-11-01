@@ -53,7 +53,8 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 - `barcode` is digits only, 4–40 digits after any leading zeros; optional `fields` trims the response and pulls in what a field depends on (`nutriments` brings the serving size, quantity, and unit, and `serving_quantity` and `serving_quantity_unit` each bring the other plus the serving size), with `requested_fields` echoing what was fetched
 - Returns ingredients (raw text plus a parsed tree up to three levels deep with `percent_estimate`), `allergens_tags`, `traces_tags`, `additives_tags`, `ingredients_analysis_tags` (vegan, vegetarian, palm-oil verdicts), `nutriscore_grade`, `nova_group`, `ecoscore_grade` (Green-Score), `nutriments` (per serving, and per 100 g, or per 100 ml for liquids), category/label/packaging/origin/country tags, `image_url`, and `completeness` (0–1)
 - `traces_tags: ["en:none"]` means the label states no traces, while an empty array means none entered yet; a barcode no contributor has recorded fails as `not_found`
-- Open Food Facts returns one preparation state of the nutrition per read. A read of prepared-product figures puts them under keys ending in `_prepared` in `additional_100g` and `additional_serving`, prints them in "as prepared" sections, and leaves the named as-sold nutrient fields absent; the text says the read returned only prepared figures, not that the record holds no as-sold ones
+- Open Food Facts returns one preparation state of the nutrition per read. A read of prepared-product figures puts them under keys ending in `_prepared` in `additional_100g` and `additional_serving`, and prints them in "as prepared" sections. When a read returns only prepared figures, one more product read fetches the single as-sold set the record stores (`/api/v3.5` `fields=nutrition.input_sets`) and fills the named as-sold fields per 100 g, or per 100 ml for liquids, with no as-sold per-serving figure; `nutriments.stored_as_sold` reports `read`, `none` (the record stores no usable set), or `unread` with a `reason`, an `error`, and, when the failure named a wait, `retryAfter` in whole seconds (the call itself still succeeds). Other reads send nothing extra
+- `source` (`off_api` or `off_mirror`) names where the product was read; a barcode a [local mirror](#local-export-mirror) holds is read from it with no upstream request, with `mirror_as_of` (the time of the newest Open Food Facts change the copy reflects) and a `mirror_snapshot` note, and the stored as-sold set comes from the same stored record
 
 ---
 
@@ -62,7 +63,8 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 - `query` (up to 24 words, all of which must match the name, generic name, categories, labels, or brand; punctuation separates words, so `milk-chocolate` requires both) plus the tag filters `categories_tag`, `brands_tag`, `labels_tag` (up to 10), `allergens_tag`, `traces_tag`, `ingredients_analysis_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, the `exclude_allergens` / `exclude_traces` lists (up to 14 each), and up to 18 `nutrient_filters` (per 100 g, or per 100 ml for liquids), all combined as AND; optional `sort_by`
 - `page_size` defaults to 20 and is served at up to 50 per call; a larger value, with no ceiling, is served at 50 and flagged in `page_size_capped`, and `page` counts pages of 50. Rows carry `barcode`, `product_name`, `brands`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, and `categories_tags`, plus `total`, `total_is_lower_bound`, `last_page`, `omitted`, and `truncated` (more matches beyond this page). Exclusions add `exclusion_coverage`, since products with no allergen data entered pass them; `nutrient_filters` add `indexed_nutriments` (the index values the filters checked, which can differ from `off_get_product`)
 - The text index compares `energy-kcal`, `fat`, `saturated-fat`, `carbohydrates`, and `sugars` as whole numbers (`sugars lte 3` returns a row at 3.53). A `nutrient_filters` search sends `gt` and `gte` on those five as `[floor(value) TO *]` so no match is lost, then checks every returned row against every constraint at the index's 32-bit precision. Rows that fail leave the page and count in `outside_constraints`, so a page can come back short or empty while later pages hold matches. `total`, `total_is_lower_bound`, and `last_page` describe the index's whole-number answer and still count those rows. A range inside one whole number (`sugars gt 3.9` and `lt 4`) can pass few of the 10,000 reachable rows; add `query` or tag filters to narrow it
-- `query` or `nutrient_filters` searches a text index that lags the live database (flagged in `text_index_snapshot`), reaches only the first 10,000 results, and rejects `additives_tag` as `additives_filter_needs_tag_search`; tag-only searches read the live database through page 10. A page past either limit fails as `page_out_of_range`
+- `query` or `nutrient_filters` searches a text index that lags the live database (flagged in `text_index_snapshot`), reaches only the first 10,000 results, and rejects `additives_tag` as `additives_filter_needs_tag_search`; tag-only searches read the live database through page 10, unless a [local mirror](#local-export-mirror) serves them: with every tag value confirmed, a mirror-served search has an exact `total` and reaches its first 10,000 results. A page past any of these limits fails as `page_out_of_range`
+- `source` (`off_api` or `off_mirror`) names where the answer was read; from the mirror it also carries `mirror_as_of` and a `mirror_snapshot` note, and the default order and `sort_by` `popularity_key` and `unique_scans_n` follow the values stored with each record, which can differ from a live search, which ranks by its current scan counts
 
 ---
 
@@ -70,8 +72,9 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 
 - 2–100 `barcodes`, one row each in input order; repeated barcodes are compared once, and those past the 10th distinct one are listed in `unprocessed` without being fetched
 - Rows carry `found`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, energy, fat, saturated fat, carbohydrates, sugars, salt, protein, and fiber (per 100 g, or per 100 ml for liquids), and `completeness`; missing values stay absent, never imputed
-- A read of prepared-product figures adds a `prepared` object on the row with the same columns, read from the `*_prepared_100g` keys and never substituted for an as-sold figure. A row with as-sold figures appears in the as-sold table, a row with `prepared` in the "as prepared" table, and a row with both appears in both
-- `not_found` lists barcodes with no contributor record and `failed` lists fetches that failed, each with a `reason`; a failed barcode gets no row and never blocks the rest
+- A read of prepared-product figures adds a `prepared` object on the row with the same columns, read from the `*_prepared_100g` keys and never substituted for an as-sold figure. A row whose read returned only prepared figures gets the same stored as-sold read as `off_get_product`, once every barcode's product read has settled, and reports it as `stored_as_sold` (`read`, `none`, or `unread`, which never moves the barcode into `failed`). A row with as-sold figures appears in the as-sold table, a row with `prepared` in the "as prepared" table, and a row with both appears in both
+- Each row carries `source` (`off_api` or `off_mirror`), and `mirror_as_of` for a row read from a [local mirror](#local-export-mirror), so one comparison can mix the two; a `mirror_snapshot` note appears when any row came from it
+- `not_found` lists barcodes with no contributor record and `failed` lists fetches that failed, each with a `reason` and, when the failure named a wait, `retryAfter` in whole seconds; a failed barcode gets no row and never blocks the rest
 
 ---
 
@@ -89,9 +92,11 @@ Open Food Facts-specific:
 
 - No API key; the identifying `User-Agent` Open Food Facts' terms require is built in
 - Per-endpoint request budgets (product 15/min, search 10/min, taxonomy 10/min); transient failures retry up to 4 attempts within a total deadline of 35 s for a product or search read and 20 s for a taxonomy lookup (one caller's search that canonicalizes a tag first can spend 55 s), after which the read fails as `upstream_timeout`, or `rate_limited` when its last finished attempt answered 429
+- The stored as-sold read for a prepared-only product spends the product budget, so a barcode can take two product reads, and has its own 20 s deadline: a call settles within 35 s + 20 s = 55 s, and an unread set never fails the call or the row
+- Optional [local export mirror](#local-export-mirror) (`OFF_MIRROR_PATH`): barcode reads and confirmed tag-only searches served from a SQLite copy of the export, kept current by daily deltas; a result names its `source` and, from the mirror, the time it reflects
 - Nutriments normalized from hyphenated keys (`energy-kcal_100g` → `energy_kcal_100g`), with `additional_100g` / `additional_serving` maps that label each nutrient with its unit
 - Tag filters take canonical IDs (`en:organic`, `en:no-gluten`); on text searches a case variant, synonym, or brand name is canonicalized first (`US` → `en:united-states`)
-- Every field is contributor-entered, so a missing one means not yet recorded, except that a read of prepared-product nutrition omits as-sold figures the record can still hold; Nutri-Score, NOVA, and Green-Score are Open Food Facts' own computed grades, returned as-is, and carry regional formula caveats
+- Every field is contributor-entered, so a missing one means not yet recorded, except that a product read returning only prepared-product nutrition is followed by a read of the as-sold figures the record stores, reported as `stored_as_sold`; Nutri-Score, NOVA, and Green-Score are Open Food Facts' own computed grades, returned as-is, and carry regional formula caveats
 
 Agent-friendly output:
 
@@ -137,6 +142,7 @@ No API key or account is needed: the server identifies itself to Open Food Facts
 | `OFF_RATE_LIMIT_PRODUCT` | Product read budget (requests/min). The default is Open Food Facts' published per-IP limit; lower it on a shared outbound IP. | `15` |
 | `OFF_RATE_LIMIT_SEARCH` | Search budget (requests/min). The default is Open Food Facts' published per-IP limit. | `10` |
 | `OFF_RATE_LIMIT_TAXONOMY` | Taxonomy lookup budget (requests/min), shared by `off_browse_taxonomy`, tag canonicalization on text searches, and exclusion checks. | `10` |
+| `OFF_MIRROR_PATH` | Path of the [local export mirror](#local-export-mirror)'s SQLite file. Unset disables the mirror. Works from a source checkout or the Docker image only. | unset |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
@@ -188,6 +194,26 @@ docker run --rm -p 3010:3010 ghcr.io/cyanheads/openfoodfacts-mcp-server:latest
 
 The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/openfoodfacts-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/openfoodfacts-mcp-server:latest"]`. To build locally, `docker build -t openfoodfacts-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
+#### Local export mirror
+
+Setting `OFF_MIRROR_PATH` keeps a local SQLite copy of the Open Food Facts export. `off_get_product` and `off_compare_products` read it first by barcode and read live for a barcode it lacks. A search by tag filters alone is served from it when every value is a confirmed tag or brand slug, with an exact `total` through its first 10,000 results; every other search is live. A store error falls through to a live read. The mirror scripts need a checkout or the Docker image, so the npm install and `.mcpb` bundle stay live-only.
+
+In the image, mount a volume at the store directory, `/usr/src/app/.mirror`, set `OFF_MIRROR_PATH` to a file in it, and build the store once with `docker exec`:
+
+```sh
+docker run -d --name openfoodfacts-mcp-server -p 3010:3010 \
+  -v off-mirror:/usr/src/app/.mirror \
+  -e OFF_MIRROR_PATH=/usr/src/app/.mirror/openfoodfacts.sqlite \
+  ghcr.io/cyanheads/openfoodfacts-mcp-server:latest
+
+docker exec openfoodfacts-mcp-server bun run mirror:init     # full load of the export, then the deltas since; re-run after an interrupt to resume
+docker exec openfoodfacts-mcp-server bun run mirror:status   # health, product count, and the as-of time answers cite
+docker exec openfoodfacts-mcp-server bun run mirror:verify   # status plus SQLite's integrity check
+docker exec openfoodfacts-mcp-server bun run mirror:refresh  # one delta pass by hand
+```
+
+A full `mirror:init` of the 4.9M-product export took about 1 h 48 min in testing, peaked at about 27 GB on the volume while the 13.4 GB download sat beside the store, left a 14.3 GB store, and used under 350 MB of memory. Reads stay live until `mirror:init` completes. Once `OFF_MIRROR_PATH` is set the server refreshes the mirror itself every three hours, at minute 30 of the server's local time: it applies each new daily delta, and reloads the whole export when the last full load is 30 days old, because deltas never report deleted products. `mirror:status` and `mirror:verify` exit non-zero unless a sync has completed and the store holds products. From a checkout, run the same `bun run mirror:*` scripts with `OFF_MIRROR_PATH` set in `.env`.
+
 ## Project structure
 
 | Directory | Purpose |
@@ -196,6 +222,8 @@ The image defaults to HTTP transport, stateless session mode, and logs to `/var/
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/services/openfoodfacts` | Open Food Facts API client — HTTP, rate limiting, retry, field normalization. |
+| `src/services/mirror` | Local export mirror — SQLite store, record builder, export and delta ingester, tag-search queries, and the refresh schedule. |
+| `scripts/mirror-*.ts` | `mirror:init`, `mirror:refresh`, `mirror:status`, and `mirror:verify`. |
 | `src/services/taxonomy` | Tag vocabulary — live resolution, offline sample, and tag-value canonicalization. |
 | `src/utils` | Markdown escaping for contributor-entered values in text output. |
 | `skills/` | Published Agent Skills for the agents that call the tools. |
