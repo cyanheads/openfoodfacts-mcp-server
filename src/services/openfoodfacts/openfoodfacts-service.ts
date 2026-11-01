@@ -1,12 +1,16 @@
 /**
- * @fileoverview Open Food Facts API v2 client with retry, rate limiting, and error normalization.
- * Requires the identifying User-Agent per OFF terms of service.
+ * @fileoverview Open Food Facts API client with retry, rate limiting, and error normalization: API v2
+ * reads, plus the API v3.5 read of a record's stored nutrition sets that supplies the as-sold
+ * figures a prepared-only v2 read leaves out. Barcode reads and searches by tag filters alone are
+ * served from the local export mirror when one is configured (`OFF_MIRROR_PATH`) and ready, and
+ * read live otherwise; every result names the source that answered it. Requires the identifying
+ * User-Agent per OFF terms of service.
  * @module services/openfoodfacts/openfoodfacts-service
  */
 
-import { readFileSync } from 'node:fs';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import type { MirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import {
   defaultIsTransient,
   fetchWithTimeout,
@@ -15,7 +19,21 @@ import {
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
+import {
+  getByCodes,
+  type MirrorDoc,
+  type MirrorTagFilter,
+  type MirrorTagSearch,
+  searchByTags,
+} from '@/services/mirror/mirror-queries.js';
+import { getMirrorStore, isMirrorReady, mirrorAsOf } from '@/services/mirror/mirror-store.js';
 import { ANALYZER_STOP_WORDS, STOP_WORD_LANGS } from './analyzer-stop-words.js';
+import {
+  type AsSoldSelection,
+  type NutritionInputSet,
+  readInputSets,
+  selectAsSoldSet,
+} from './nutrition-sets.js';
 import {
   BARCODE_PATTERN,
   type IndexedNutriments,
@@ -37,20 +55,7 @@ import {
   type SearchRow,
   WHOLE_NUMBER_NUTRIENTS,
 } from './types.js';
-
-/**
- * Package version, read from package.json at load so the identifying User-Agent always matches the
- * shipped release rather than a hand-maintained constant that silently drifts between versions.
- */
-const { version: PACKAGE_VERSION } = JSON.parse(
-  readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
-) as { version: string };
-
-/**
- * Identifying User-Agent required by OFF terms — identifies the client and provides a contact email.
- * Format per OFF docs: <client>/<version> (<contact>)
- */
-const USER_AGENT = `openfoodfacts-mcp-server/${PACKAGE_VERSION} (casey@caseyjhand.com)`;
+import { USER_AGENT } from './user-agent.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -59,13 +64,21 @@ const REQUEST_TIMEOUT_MS = 15_000;
  * bounds one attempt only, and left alone a hung upstream holds a read for over 60 s, the default
  * request timeout of MCP SDK clients, so the caller gives up before a typed failure reaches it.
  * A search runs its lookups in parallel and then one search read, so one caller's longest chain
- * is this plus `READ_RETRY_DEADLINE_MS`: 55 s. A search that joined a lookup whose first caller
- * cancelled restarts it and can run past that (#75).
+ * is this plus `READ_RETRY_DEADLINE_MS`: 55 s. The taxonomy service counts it from each caller's
+ * own call: a search that joined a lookup whose first caller cancelled restarts it with what is
+ * left of its 20 s, so the restart stays inside that chain too.
  */
-const TAXONOMY_RETRY_DEADLINE_MS = 20_000;
+export const TAXONOMY_RETRY_DEADLINE_MS = 20_000;
 
 /** Total budget of one product or search read. See `TAXONOMY_RETRY_DEADLINE_MS`. */
 const READ_RETRY_DEADLINE_MS = 35_000;
+
+/**
+ * Total budget of the stored as-sold read that follows a product read returning only prepared
+ * figures. It starts once that read has settled, so a call's longest chain is
+ * `READ_RETRY_DEADLINE_MS` plus this: 55 s, the bound a search with tag lookups already keeps.
+ */
+const AS_SOLD_RETRY_DEADLINE_MS = 20_000;
 
 /** Headers sent on every upstream request. The identifying User-Agent is required by OFF terms. */
 const REQUEST_HEADERS: Record<string, string> = {
@@ -77,7 +90,8 @@ const REQUEST_HEADERS: Record<string, string> = {
  * search.openfoodfacts.org (search-a-licious) refuses any request whose `page * page_size` exceeds
  * this many results, with an HTTP 422 naming the window. Exported so the search tool can reject
  * those requests before they are sent. Scoped to the text path; the tag-only backend has its own,
- * page-based bound (`TAG_SEARCH_MAX_PAGE`).
+ * page-based bound (`TAG_SEARCH_MAX_PAGE`), and the mirror its own window
+ * (`MIRROR_SEARCH_RESULT_WINDOW`).
  *
  * This bounds how deep a request may page — it is deliberately not reused to detect a clipped hit
  * count. That ceiling is a separate limit in the same backend that happens to sit at the same
@@ -87,12 +101,24 @@ const REQUEST_HEADERS: Record<string, string> = {
 export const TEXT_SEARCH_RESULT_WINDOW = 10_000;
 
 /**
+ * Most results a search served from the mirror reaches: a page whose `page * page_size` exceeds it
+ * is refused before the store runs the search. Mirror reads are synchronous SQLite calls on the
+ * serving process, so the work one page costs is time every other caller of that process waits,
+ * and this bounds it. It matches `TEXT_SEARCH_RESULT_WINDOW`, so a caller pages to the same depth
+ * whichever of the two answers, but it is this server's own bound, not an upstream one, and the
+ * two can move apart. Exported so the search tool can refuse such a page before calling.
+ */
+export const MIRROR_SEARCH_RESULT_WINDOW = 10_000;
+
+/**
  * Deepest page `/api/v2/search` serves a client that is not logged in. Product Opener answers any
  * page past it with HTTP 401 and a rendered `robots_not_served_here` page before running the query
  * (`search_and_display_products` in `lib/ProductOpener/Display.pm`), whatever the `page_size` and
  * however few products match — live, page 11 was refused at `page_size` 1 and on a filter matching
  * nothing, while page 10 at `page_size` 50 was served. Exported so the search tool can reject a
- * deeper page before it is sent and report the reachable depth.
+ * deeper page before it is sent and report the reachable depth. The mirror serves deeper pages, up
+ * to `MIRROR_SEARCH_RESULT_WINDOW`, so `searchProducts` refuses a deeper `tags_confirmed` page by
+ * this bound only once the mirror cannot serve it.
  */
 export const TAG_SEARCH_MAX_PAGE = 10;
 
@@ -230,13 +256,40 @@ function plainTextDetail(body: string): string | undefined {
  */
 const PUBLISHED_ERROR_FIELDS = ['status', 'retryAfter', 'retryAttempts', 'operation'] as const;
 
-/** The published subset of a fetch error's data. */
+/**
+ * The published subset of a fetch error's data. `retryAfter` is published in whole seconds, the
+ * unit this server's own budget refusals carry, so a caller reads one type on every failure: the
+ * framework captures the raw header, and one it cannot read is dropped rather than passed on.
+ */
 function publishedErrorData(data: Record<string, unknown> | undefined): Record<string, unknown> {
   const published: Record<string, unknown> = {};
   for (const field of PUBLISHED_ERROR_FIELDS) {
     if (data?.[field] !== undefined) published[field] = data[field];
   }
+  if (published.retryAfter !== undefined) {
+    const seconds = retryAfterSeconds(published.retryAfter);
+    if (seconds === undefined) delete published.retryAfter;
+    else published.retryAfter = seconds;
+  }
   return published;
+}
+
+/** An HTTP-date opens with its day name in each of RFC 9110's three formats. */
+const HTTP_DATE_DAY = /^(?:mon|tue|wed|thu|fri|sat|sun)/i;
+
+/**
+ * A `Retry-After` value as whole seconds from now: delta-seconds as given, an HTTP-date as the
+ * seconds left (rounded up, never below 0). Anything else is unreadable. The day-name check keeps a
+ * numeric value that is not delta-seconds (`1.5`) from being read as a calendar date.
+ */
+function retryAfterSeconds(raw: unknown): number | undefined {
+  if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 ? Math.ceil(raw) : undefined;
+  if (typeof raw !== 'string') return;
+  const value = raw.trim();
+  if (/^\d+$/.test(value)) return Number(value);
+  if (!HTTP_DATE_DAY.test(value)) return;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, Math.ceil((at - Date.now()) / 1000));
 }
 
 /**
@@ -347,6 +400,80 @@ function isProductEnvelope(
   return isRecord(body) && (body.status === 0 || (body.status === 1 && isRecord(body.product)));
 }
 
+/**
+ * A v3.5 product read's found answer: `status` `success` or `success_with_warnings`, `result.id`
+ * `product_found`, and a product object whose `nutrition`, when present, is an object. Whether
+ * `nutrition.input_sets` is a list is `readInputSets`'s to say.
+ */
+function isInputSetsEnvelope(
+  body: unknown,
+): body is { product: { nutrition?: Record<string, unknown> } } {
+  return (
+    isRecord(body) &&
+    (body.status === 'success' || body.status === 'success_with_warnings') &&
+    isRecord(body.result) &&
+    body.result.id === 'product_found' &&
+    isRecord(body.product) &&
+    (body.product.nutrition === undefined || isRecord(body.product.nutrition))
+  );
+}
+
+/**
+ * How the stored as-sold read settled: the chosen set, `none` when no stored set qualifies, or
+ * `unread` with the failure. An unread set is a supplement that could not be read, never a failed
+ * call, so the failure is handed back rather than thrown.
+ */
+export type StoredAsSoldRead = AsSoldSelection | { status: 'unread'; error: McpError };
+
+/**
+ * Where a read was answered: the live Open Food Facts API, or the local export mirror, whose data
+ * reflects every change up to `mirrorAsOf` (ISO 8601: the end of the last applied delta, or the
+ * newest change in the export the last full load read).
+ */
+export type ReadSource = { source: 'off_api' } | { source: 'off_mirror'; mirrorAsOf: string };
+
+/**
+ * A found product and where it was read. `product` holds only the v2 fields the read asked for,
+ * as the live API returns them. A mirror read also carries `storedSets`, the record's stored
+ * nutrition sets from the same stored revision as `product` (`undefined` when it stores none),
+ * which `readStoredAsSold` selects the as-sold figures from without a request.
+ */
+export type ProductRead =
+  | { source: 'off_api'; product: RawProduct }
+  | {
+      source: 'off_mirror';
+      mirrorAsOf: string;
+      product: RawProduct;
+      storedSets: readonly NutritionInputSet[] | undefined;
+    };
+
+/**
+ * A search as the search tool hands it over. `tags_confirmed` marks a search by tag filters alone
+ * whose every value is canonical and confirmed: each tag value is the `value` the taxonomy
+ * service's `canonicalizeTag` returned with `resolution: 'vocabulary'`, or a brand's slug
+ * (`no_vocabulary`, the form Product Opener stores a brand under `xx:`); exclusions are confirmed
+ * before they are sent at all; `nutrition_grade`, `nova_group`, and `ingredients_analysis_tag` are
+ * closed vocabularies the tool's input schema enforces. Only such a search is served from the
+ * mirror, which matches stored tags exactly. Without it a search by tag filters alone reads
+ * `/api/v2/search`, which canonicalizes what it is given.
+ */
+export type ProductSearch = SearchParams & { tags_confirmed?: boolean };
+
+/** A search's answer, and where it was read. */
+type SearchRead = SearchResult & ReadSource;
+
+/**
+ * How a search settled: served, or refused with nothing sent and no search run, naming the bound
+ * the page passed. `live_max_page`: a `tags_confirmed` search the mirror could not serve after all
+ * (not ready, or a store error) asks for a page past `TAG_SEARCH_MAX_PAGE`, which the live API
+ * refuses; the search tool lets such a page through its own check only when the mirror is ready
+ * and every value confirmed. `mirror_window`: the mirror is ready to serve the search, and its
+ * `page * page_size` exceeds `MIRROR_SEARCH_RESULT_WINDOW`.
+ */
+export type SearchOutcome =
+  | ({ status: 'served' } & SearchRead)
+  | { status: 'page_out_of_range'; bound: 'live_max_page' | 'mirror_window' };
+
 /** A tag search's answer: a `products` list and a numeric `count`, zero for no matches. */
 function isTagSearchEnvelope(
   body: unknown,
@@ -426,6 +553,12 @@ const PRODUCT_FIELDS =
   'nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,' +
   'packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags';
 
+/**
+ * The fields a mirror doc holds for a product read: every field `PRODUCT_FIELDS` requests, and no
+ * other. A field read naming anything else is read live.
+ */
+const MIRROR_PRODUCT_FIELDS: ReadonlySet<string> = new Set(PRODUCT_FIELDS.split(','));
+
 /** Fields to request on search results — summary rows for triage. Shared by both search paths. */
 const SEARCH_FIELDS = [
   'code',
@@ -436,6 +569,9 @@ const SEARCH_FIELDS = [
   'ecoscore_grade',
   'categories_tags',
 ];
+
+/** `SEARCH_FIELDS`, as the mirror projects a stored doc to a search row. */
+const SEARCH_FIELD_SET: ReadonlySet<string> = new Set(SEARCH_FIELDS);
 
 /**
  * Text search endpoint — search.openfoodfacts.org uses Elasticsearch and actually filters by the
@@ -693,6 +829,61 @@ function withBarcodes<T extends { code?: string }>(
 }
 
 /**
+ * A stored doc cut to `fields`, as a v2 read returns only the fields it asks for, in the doc's key
+ * order (Product Opener's canonical order, which the record builder keeps). The doc is the
+ * builder's projection of a live v2 read, so the fields are already in the shape the live path
+ * hands on; its `code` and `_input_sets` leave unless `fields` names them.
+ */
+function projectDoc(doc: MirrorDoc, fields: ReadonlySet<string>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(doc).filter(([field]) => fields.has(field)));
+}
+
+/**
+ * A search by tag filters alone as the mirror matches it. Every value is canonical
+ * (`ProductSearch.tags_confirmed`); the query module turns each into the key the store indexes.
+ */
+function mirrorTagSearch(params: SearchParams): MirrorTagSearch {
+  const include: MirrorTagFilter[] = [];
+  const add = (facet: MirrorTagFilter['facet'], value: string | undefined) => {
+    if (value) include.push({ facet, value });
+  };
+  add('categories', params.categories_tag);
+  add('brands', params.brands_tag);
+  for (const label of [params.labels_tag ?? []].flat()) add('labels', label);
+  add('allergens', params.allergens_tag);
+  add('traces', params.traces_tag);
+  add('ingredients_analysis', params.ingredients_analysis_tag);
+  add('additives', params.additives_tag);
+  add('nutrition_grades', params.nutrition_grade);
+  add('nova_groups', params.nova_group);
+  add('countries', params.countries_tag);
+  return {
+    include,
+    exclude: [
+      ...(params.exclude_allergens ?? []).map((value) => ({ facet: 'allergens' as const, value })),
+      ...(params.exclude_traces ?? []).map((value) => ({ facet: 'traces' as const, value })),
+    ],
+    page: params.page ?? 1,
+    pageSize: params.page_size ?? 20,
+    sortBy: params.sort_by,
+  };
+}
+
+/**
+ * A failed mirror read as the log records it: the error's name, code, and message, except a JSON
+ * parse error's message, which quotes the stored document it failed on.
+ */
+function mirrorFailure(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) return { error: typeof error };
+  const code = 'code' in error ? error.code : undefined;
+  return {
+    error: error.name,
+    ...((typeof code === 'string' || typeof code === 'number') && { code }),
+    ...(!(error instanceof SyntaxError) && { message: error.message }),
+  };
+}
+
+/**
  * The index's value for each constrained nutrient, keyed as `off_get_product` keys it. Only a JSON
  * number is a value: a key the hit lacks, or holds as anything else, is left out rather than
  * zero-filled — every value the live index returned was a number (2026-10-13).
@@ -738,10 +929,24 @@ function meetsConstraints(
 
 /**
  * This server's own budget refusal, raised before anything is sent. It is an ordinary
- * `rate_limited` failure on the wire — retryable, carrying `retryAfter` — and a distinct type only
- * so the retry boundary it is thrown inside can tell it apart from an upstream 429 and stop.
+ * `rate_limited` failure on the wire — retryable, carrying `retryAfter` — and a distinct type so
+ * the retry boundary it is thrown inside can tell it apart from an upstream 429 and stop, and so
+ * the taxonomy service can report a lookup it refused as a spent budget rather than a rate limit
+ * Open Food Facts imposed.
  */
-class BudgetExhaustedError extends McpError {}
+export class BudgetExhaustedError extends McpError {
+  /** Whole seconds until the budget frees a slot, as `data.retryAfter` publishes it. */
+  readonly retryAfter: number;
+
+  constructor(message: string, data: { endpoint: string; limit: number; retryAfter: number }) {
+    super(JsonRpcErrorCode.RateLimited, message, {
+      ...data,
+      reason: 'rate_limited',
+      retryable: true,
+    });
+    this.retryAfter = data.retryAfter;
+  }
+}
 
 /**
  * Retry predicate for every upstream call. It is the framework default except that this server's
@@ -851,11 +1056,10 @@ class RateLimiter {
         Math.ceil(((this.timestamps[0] ?? now) + this.windowMs - now) / 1000),
       );
       throw new BudgetExhaustedError(
-        JsonRpcErrorCode.RateLimited,
         `openfoodfacts-mcp-server declined this ${endpoint} request: its own client-side budget of ` +
           `${this.maxRequests} ${endpoint} requests/min is spent, so nothing was sent to Open Food ` +
           `Facts. A slot frees in about ${retryAfter}s.`,
-        { endpoint, limit: this.maxRequests, retryAfter, reason: 'rate_limited', retryable: true },
+        { endpoint, limit: this.maxRequests, retryAfter },
       );
     }
     this.timestamps.push(now);
@@ -879,12 +1083,26 @@ export class OpenFoodFactsService {
   }
 
   /**
-   * Fetch a product by barcode.
+   * Whether the local mirror is configured and ready to serve. The search tool asks before it
+   * canonicalizes a search by tag filters alone, since only the mirror serves pages past
+   * `TAG_SEARCH_MAX_PAGE` and only canonical values reach it; with `OFF_MIRROR_PATH` unset this
+   * answers false without building a store. A store error is logged and reads as not ready. The
+   * caller's cancellation is rethrown.
+   */
+  async mirrorReady(ctx: Context): Promise<boolean> {
+    return (await this.readMirror('readiness check', async () => true, ctx)) !== undefined;
+  }
+
+  /**
+   * Fetch a product by barcode: from the mirror when it is ready and holds the barcode, sending no
+   * request and spending no budget slot, otherwise live.
    * Returns `null` when status:0 (barcode not found in any contributor record).
    * The caller is responsible for surfacing the not-found condition via ctx.fail.
    */
-  async getProduct(barcode: string, ctx: Context): Promise<RawProduct | null> {
-    return await retryRead(
+  async getProduct(barcode: string, ctx: Context): Promise<ProductRead | null> {
+    const mirrored = await this.readProductFromMirror(barcode, MIRROR_PRODUCT_FIELDS, ctx);
+    if (mirrored) return mirrored;
+    const product = await retryRead(
       ({ signal }) => {
         this.productLimiter.check('product');
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${PRODUCT_FIELDS}`;
@@ -899,18 +1117,25 @@ export class OpenFoodFactsService {
       },
       ctx,
     );
+    return product && { source: 'off_api', product };
   }
 
   /**
    * Fetch a product by barcode with a specific field subset.
-   * Used when the caller only needs a subset of fields (e.g., off_compare_products).
+   * Used when the caller only needs a subset of fields (e.g., off_compare_products). Served from the
+   * mirror as `getProduct` is, when every field is one the mirror holds.
    */
   async getProductFields(
     barcode: string,
     fields: string,
     ctx: Context,
-  ): Promise<RawProduct | null> {
-    return await retryRead(
+  ): Promise<ProductRead | null> {
+    const requested = new Set(fields.split(','));
+    const mirrored = [...requested].every((field) => MIRROR_PRODUCT_FIELDS.has(field))
+      ? await this.readProductFromMirror(barcode, requested, ctx)
+      : undefined;
+    if (mirrored) return mirrored;
+    const product = await retryRead(
       ({ signal }) => {
         this.productLimiter.check('product');
         const url = `${this.baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=${fields}`;
@@ -924,6 +1149,135 @@ export class OpenFoodFactsService {
         data: { barcode },
       },
       ctx,
+    );
+    return product && { source: 'off_api', product };
+  }
+
+  /**
+   * One product from the mirror, cut to `fields`, with the record's stored nutrition sets, or
+   * `undefined` to read it live: no mirror, a barcode it lacks, or a store error. The barcode is
+   * looked up as Product Opener normalizes it, so `030000010402` finds `0030000010402`. A record
+   * whose stored nutrition sets are not a list is a store error too, so its product and its as-sold
+   * figures are both read live.
+   */
+  private async readProductFromMirror(
+    barcode: string,
+    fields: ReadonlySet<string>,
+    ctx: Context,
+  ): Promise<ProductRead | undefined> {
+    const served = await this.readMirror(
+      'product read',
+      async (store) => {
+        const doc = (await getByCodes(store, [barcode])).get(barcode);
+        if (doc === undefined) return;
+        const storedSets = readInputSets({ input_sets: doc._input_sets });
+        if (storedSets === 'malformed') {
+          throw new Error('The stored nutrition sets of this record are not a list.');
+        }
+        return { doc, storedSets };
+      },
+      ctx,
+    );
+    if (!served) return;
+    ctx.log.debug('Product served from the mirror', { barcode });
+    return {
+      source: 'off_mirror',
+      mirrorAsOf: served.mirrorAsOf,
+      // A builder projection of the live v2 read's fields: the shape fetchProduct hands on.
+      product: projectDoc(served.value.doc, fields) as RawProduct,
+      storedSets: served.value.storedSets,
+    };
+  }
+
+  /**
+   * Runs `read` against the mirror when one is configured and ready, and resolves `undefined` —
+   * read live — when none is configured, the store is not ready, `read` finds nothing, or the store
+   * throws. A throw is logged without the stored document. The as-of time is read before the data,
+   * so a refresh committing in between leaves the data no older than the time it cites. The
+   * caller's cancellation is rethrown whatever the read did, never served or read live.
+   */
+  private async readMirror<T>(
+    operation: string,
+    read: (store: MirrorStore) => Promise<T | undefined>,
+    ctx: Context,
+  ): Promise<{ value: T; mirrorAsOf: string } | undefined> {
+    const store = getMirrorStore();
+    if (store === undefined) return;
+    let served: { value: T; mirrorAsOf: string } | undefined;
+    try {
+      if (await isMirrorReady(store)) {
+        const asOf = await mirrorAsOf(store);
+        if (asOf === undefined) throw new Error('The mirror is ready but records no as-of time.');
+        const value = await read(store);
+        if (value !== undefined) served = { value, mirrorAsOf: asOf };
+      }
+    } catch (error) {
+      ctx.signal.throwIfAborted();
+      ctx.log.warning('Mirror read failed — reading Open Food Facts live instead', {
+        operation,
+        ...mirrorFailure(error),
+      });
+      return;
+    }
+    ctx.signal.throwIfAborted();
+    return served;
+  }
+
+  /**
+   * The as-sold figures a record stores, for a product read whose `nutriments` held only prepared
+   * ones, taken from the same source as `read`, the read `getProduct` or `getProductFields`
+   * returned for `barcode`. A mirror read's come from its `storedSets`, with no request and no
+   * budget slot; a live one's from the live API, never the mirror, whose record can be a different
+   * revision. Its `source` decides, so a product read live is never paired with the mirror's sets,
+   * nor a mirror read with the live ones.
+   *
+   * Live, it is `GET /api/v3.5/product/{barcode}?fields=nutrition.input_sets`, then
+   * `selectAsSoldSet`. API v2 and v3.4 both serve the aggregated set, where prepared wins, so only
+   * v3.5's input sets carry the as-sold figures. Each attempt spends a product-budget slot, as Open
+   * Food Facts counts the route in its product bucket, and every attempt and backoff share a 20 s
+   * deadline. A 404 after the v2 read found the barcode means the route, not the record, is missing,
+   * so it is `unread` (`upstream_error`) at once, never `none`. Every other failure is `unread` with
+   * its declared reason. The caller's cancellation is rethrown, and so is anything that is not a
+   * declared failure, since that is a bug rather than an upstream answer.
+   */
+  async readStoredAsSold(
+    barcode: string,
+    ctx: Context,
+    read: ProductRead,
+  ): Promise<StoredAsSoldRead> {
+    if (read.source === 'off_mirror') {
+      return read.storedSets === undefined ? { status: 'none' } : selectAsSoldSet(read.storedSets);
+    }
+    let selection: AsSoldSelection | null;
+    try {
+      selection = await retryRead(
+        ({ signal }) => {
+          this.productLimiter.check('product');
+          const url = `${this.baseUrl}/api/v3.5/product/${encodeURIComponent(barcode)}?fields=nutrition.input_sets`;
+          ctx.log.debug('Fetching stored nutrition sets', { barcode });
+          return this.fetchInputSets(url, barcode, ctx, signal);
+        },
+        {
+          operation: `OFF:readStoredAsSold:${barcode}`,
+          baseDelayMs: 500,
+          deadlineMs: AS_SOLD_RETRY_DEADLINE_MS,
+          data: { barcode },
+        },
+        ctx,
+      );
+    } catch (error) {
+      if (ctx.signal.aborted || !(error instanceof McpError)) throw error;
+      return { status: 'unread', error };
+    }
+    return (
+      selection ?? {
+        status: 'unread',
+        error: contractError(
+          'upstream_error',
+          'Open Food Facts answered HTTP 404 on its API v3.5 product route for a barcode its v2 read found, so the stored nutrition sets were not read.',
+          { barcode, status: 404 },
+        ),
+      }
     );
   }
 
@@ -977,6 +1331,43 @@ export class OpenFoodFactsService {
   }
 
   /**
+   * Fetch one record's stored nutrition sets and select its as-sold figures. HTTP 404 resolves to
+   * `null` without a retry, which nothing can change; a 2xx body that fails the envelope rule, or
+   * whose `nutrition.input_sets` is not a list, is a malformed envelope, raised inside the retry
+   * boundary like any other. No sets stored is `none`.
+   */
+  private async fetchInputSets(
+    url: string,
+    barcode: string,
+    ctx: Context,
+    signal: AbortSignal,
+  ): Promise<AsSoldSelection | null> {
+    let response: Response;
+    try {
+      response = await fetchWithTimeout(
+        url,
+        REQUEST_TIMEOUT_MS,
+        withExtra(ctx, { upstreamOperation: 'OFF:productInputSets' }),
+        { signal, headers: REQUEST_HEADERS, expectedStatuses: [404] },
+      );
+    } catch (error) {
+      if (error instanceof McpError && error.code === JsonRpcErrorCode.NotFound) return null;
+      throw toContractError(error, { barcode });
+    }
+
+    const body = await parseJsonBody<unknown>(response, { barcode });
+    const sets = isInputSetsEnvelope(body) ? readInputSets(body.product.nutrition) : 'malformed';
+    if (sets === 'malformed') {
+      throw malformedEnvelope(
+        'stored nutrition sets read',
+        'status success with a found product whose nutrition.input_sets is a list',
+        { barcode },
+      );
+    }
+    return sets === undefined ? { status: 'none' } : selectAsSoldSet(sets);
+  }
+
+  /**
    * Fetch a search endpoint, re-raising every failure as a declared contract failure. Runs inside
    * the caller's retry boundary so the mapped code drives retry classification. A `jsonBody` makes
    * the request a POST carrying it as JSON; without one it is a GET.
@@ -1022,16 +1413,82 @@ export class OpenFoodFactsService {
    *   documents the equivalent parameters and ignores them, live-verified returning an identical
    *   unfiltered count for two mutually exclusive thresholds, so honoring them there would report
    *   an unfiltered result set under a nutrient constraint.
+   * - Tag filters only, every value confirmed (`tags_confirmed`): the local mirror, when it is
+   *   ready — filters ANDed, exclusions as absence, an exact total, and pages through its first
+   *   `MIRROR_SEARCH_RESULT_WINDOW` results, a page past them the `page_out_of_range` outcome with
+   *   no search run. With no ready mirror, or on a store error (logged), it reads /api/v2/search as
+   *   below, except that a page past `TAG_SEARCH_MAX_PAGE` is that outcome, with nothing sent.
    * - Tag filters only: /api/v2/search (structured facet filtering).
    *
-   * The two backends differ in freshness as well as in envelope: the text index is a snapshot that
-   * lags the live database, while /api/v2/search reads it directly. The tool discloses which one
-   * answered rather than presenting the two as interchangeable.
+   * The backends differ in freshness as well as in envelope: the text index is a snapshot that
+   * lags the live database, /api/v2/search reads it directly, and the mirror reflects it as of its
+   * `mirrorAsOf`. Every answer carries its `source` so the tool discloses which one answered rather
+   * than presenting them as interchangeable.
    */
-  searchProducts(params: SearchParams, ctx: Context): Promise<SearchResult> {
-    return params.query || params.nutrient_filters?.length
-      ? this.searchProductsByText(params, ctx)
-      : this.searchProductsByTags(params, ctx);
+  async searchProducts(params: ProductSearch, ctx: Context): Promise<SearchOutcome> {
+    if (params.query || params.nutrient_filters?.length) {
+      return {
+        status: 'served',
+        source: 'off_api',
+        ...(await this.searchProductsByText(params, ctx)),
+      };
+    }
+    if (params.tags_confirmed) {
+      const mirrored = await this.searchProductsOnMirror(params, ctx);
+      if (mirrored) return mirrored;
+      if ((params.page ?? 1) > TAG_SEARCH_MAX_PAGE) {
+        return { status: 'page_out_of_range', bound: 'live_max_page' };
+      }
+    }
+    return {
+      status: 'served',
+      source: 'off_api',
+      ...(await this.searchProductsByTags(params, ctx)),
+    };
+  }
+
+  /**
+   * A search by tag filters alone from the mirror, or `undefined` to read it live. Rows are cut to
+   * `SEARCH_FIELDS` and pass the barcode check the live rows do, so a mirror page lists what the
+   * same page read live lists, at the mirror's revision. The store counts every match, so the total
+   * is exact on every page, a page past the last included. A page past
+   * `MIRROR_SEARCH_RESULT_WINDOW` is refused once the mirror is known to be ready, before the store
+   * runs any search; with no ready mirror it is `undefined`, so the live path's own bound applies.
+   */
+  private async searchProductsOnMirror(
+    params: SearchParams,
+    ctx: Context,
+  ): Promise<SearchOutcome | undefined> {
+    const search = mirrorTagSearch(params);
+    if (search.page * search.pageSize > MIRROR_SEARCH_RESULT_WINDOW) {
+      return (await this.mirrorReady(ctx))
+        ? { status: 'page_out_of_range', bound: 'mirror_window' }
+        : undefined;
+    }
+    const served = await this.readMirror('tag search', (store) => searchByTags(store, search), ctx);
+    if (!served) return;
+    // A builder projection of the live v2 fields, as a live search row is.
+    const rows = served.value.docs.map(
+      (doc) => projectDoc(doc, SEARCH_FIELD_SET) as RawSearchProduct,
+    );
+    const products = withBarcodes(rows, ctx);
+    ctx.log.debug('Tag search served from the mirror', {
+      count: served.value.total,
+      page: search.page,
+      returned: products.length,
+    });
+    return {
+      status: 'served',
+      count: served.value.total,
+      count_is_exact: true,
+      page: search.page,
+      page_count: products.length,
+      page_size: search.pageSize,
+      products,
+      dropped: rows.length - products.length,
+      source: 'off_mirror',
+      mirrorAsOf: served.mirrorAsOf,
+    };
   }
 
   /**
@@ -1235,11 +1692,15 @@ export class OpenFoodFactsService {
    * or cursor, and passing one is ignored rather than rejected, so a `size` above the term's whole
    * answer is the only way to read all of it. The endpoint is a suggester over display names, not
    * an enumerator — it reports no match total and answers an empty list for an empty term.
+   *
+   * `deadlineMs` bounds every attempt and backoff together; a caller that has already spent part
+   * of its lookup budget passes what is left of it.
    */
   async suggestTaxonomy(
     taxonomyName: string,
     term: string,
     ctx: Context,
+    deadlineMs = TAXONOMY_RETRY_DEADLINE_MS,
   ): Promise<{ id: string; name: string }[]> {
     const lookup = { taxonomy_name: taxonomyName, term };
     return await retryRead(
@@ -1272,7 +1733,7 @@ export class OpenFoodFactsService {
       {
         operation: `OFF:suggestTaxonomy:${taxonomyName}`,
         baseDelayMs: 500,
-        deadlineMs: TAXONOMY_RETRY_DEADLINE_MS,
+        deadlineMs,
         data: lookup,
       },
       ctx,

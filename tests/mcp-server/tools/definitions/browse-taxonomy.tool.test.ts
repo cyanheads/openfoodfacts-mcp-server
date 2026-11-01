@@ -501,12 +501,83 @@ describe('off_browse_taxonomy', () => {
       );
       stubAutocomplete([{ id: 'en:hummus', text: 'Hummus' }]);
 
-      await svc.search('categories', 'hummus', 10, ctx);
-      const second = await svc.search('categories', 'organic', 10, ctx);
+      // Frozen, so the budget's wait is its whole 60 s window.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      let second: Awaited<ReturnType<typeof svc.search>>;
+      try {
+        await svc.search('categories', 'hummus', 10, ctx);
+        second = await svc.search('categories', 'organic', 10, ctx);
+      } finally {
+        vi.useRealTimers();
+      }
 
       expect(global.fetch).toHaveBeenCalledOnce();
-      expect(second.notice).toContain('could not be reached');
-      expect(second.notice).toContain('budget');
+      // #77: the notice opens with the spent budget, never with an unreachable vocabulary.
+      expect(second.notice).toMatch(/^This server's own per-minute taxonomy budget is spent, /);
+      expect(second.notice).toContain(
+        'A lookup slot frees in about 60 s; retry then for an authoritative answer.',
+      );
+      expect(second.notice).not.toContain('could not be reached');
+    });
+
+    it('names the wait a 429 asks for, or about a minute when it names none, on both surfaces (#77)', async () => {
+      const cases = [
+        {
+          retryAfter: '60',
+          close:
+            'Open Food Facts asked for a wait of 60 s; retry then for an authoritative answer.',
+        },
+        { retryAfter: undefined, close: 'Retry in about a minute for an authoritative answer.' },
+      ];
+      for (const { retryAfter, close } of cases) {
+        global.fetch = vi.fn(async () => {
+          const response = mockResponse({ detail: 'slow down' }, 429);
+          if (retryAfter !== undefined) response.headers.set('retry-after', retryAfter);
+          return response;
+        });
+
+        vi.useFakeTimers();
+        let result: Awaited<ReturnType<typeof runToolContract>>;
+        try {
+          const pending = runToolContract(offBrowseTaxonomyTool, {
+            facet: 'categories',
+            search: 'cheese',
+          });
+          await vi.runAllTimersAsync();
+          result = await pending;
+        } finally {
+          vi.useRealTimers();
+        }
+
+        const notice = String((result.structuredContent as { notice?: string }).notice);
+        expect(notice, String(retryAfter)).toMatch(/^Open Food Facts is rate-limiting /);
+        expect(notice.endsWith(close), notice).toBe(true);
+        expect(contractText(result)).toContain(close.slice(0, 40));
+      }
+    });
+
+    it('names the upstream rate limit on both surfaces when a lookup is answered 429 (#77)', async () => {
+      global.fetch = vi.fn(async () => mockResponse({ detail: 'slow down' }, 429));
+
+      vi.useFakeTimers();
+      let result: Awaited<ReturnType<typeof runToolContract>>;
+      try {
+        const pending = runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: 'cheese',
+        });
+        await vi.runAllTimersAsync();
+        result = await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const notice = String((result.structuredContent as { notice?: string }).notice);
+      expect(notice).toMatch(
+        /^Open Food Facts is rate-limiting this server's taxonomy lookups \(HTTP 429\), so the live categories vocabulary went unchecked\. /,
+      );
+      expect(notice).not.toContain('could not be reached');
+      expect(contractText(result)).toContain('rate-limiting this server');
     });
 
     it('ends as cancelled, not as the offline fallback, when the caller aborts mid-lookup (#60)', async () => {

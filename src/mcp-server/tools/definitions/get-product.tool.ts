@@ -6,6 +6,17 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
+import {
+  type StoredAsSold,
+  settleStoredAsSold,
+  storedAsSoldSchema,
+} from '@/mcp-server/tools/definitions/compare-products.tool.js';
+import {
+  mirrorCopyNote,
+  mirrorSnapshotTrailer,
+  sourceLine,
+} from '@/mcp-server/tools/read-source.js';
+import { holdsOnlyPreparedFigures } from '@/services/openfoodfacts/nutrition-sets.js';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import {
   BARCODE_PATTERN,
@@ -65,6 +76,7 @@ type NamedNutriments = {
 type NormalizedNutriments = NamedNutriments & {
   additional_100g?: Record<string, NutrimentEntry>;
   additional_serving?: Record<string, NutrimentEntry>;
+  stored_as_sold?: StoredAsSold;
 };
 
 /** Maps raw hyphenated nutriment keys → named output schema keys. */
@@ -211,27 +223,6 @@ function byPreparation(map: Record<string, RenderedEntry[1]> = {}): {
     asSold: entries.filter(([key]) => !key.endsWith(PREPARED_SUFFIX)),
     prepared: entries.filter(([key]) => key.endsWith(PREPARED_SUFFIX)),
   };
-}
-
-/**
- * Whether a read's nutrition holds prepared figures and nothing as sold. Every named field is an
- * as-sold figure, so any one of them settles it. A read says this about itself, never about the
- * record, which can store both states while Open Food Facts serves one.
- */
-function onlyPreparedFigures({
-  additional_100g,
-  additional_serving,
-  ...named
-}: {
-  additional_100g?: Record<string, unknown> | undefined;
-  additional_serving?: Record<string, unknown> | undefined;
-}): boolean {
-  const open = [...Object.keys(additional_100g ?? {}), ...Object.keys(additional_serving ?? {})];
-  return (
-    Object.keys(named).length === 0 &&
-    open.length > 0 &&
-    open.every((key) => key.endsWith(PREPARED_SUFFIX))
-  );
 }
 
 /** Render open-map nutrients as markdown bullets, each carrying its unit. */
@@ -396,7 +387,7 @@ function servingSizeLine(
 export const offGetProductTool = tool('off_get_product', {
   title: 'Get Food Product by Barcode',
   description:
-    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Nutrition is the exception: Open Food Facts returns one preparation state per read, so a read of prepared figures (_prepared keys under nutriments) omits as-sold figures the record can still hold. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Nutrition is the exception: Open Food Facts returns one preparation state per read, so a read of prepared figures (_prepared keys under nutriments) omits as-sold figures the record can still hold; when that happens, one more product read fetches the as-sold set the record stores into the as-sold fields, and nutriments.stored_as_sold says whether it was read, the record stores none, or it could not be read. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -567,15 +558,21 @@ export const offGetProductTool = tool('off_get_product', {
             energy_kcal_serving: z
               .number()
               .optional()
-              .describe('Energy per serving in kcal. Absent when serving size not defined.'),
+              .describe(
+                'Energy per serving in kcal. Absent when serving size not defined, and beside figures read from a stored as-sold set, which come per 100 g, or per 100 ml for liquids, only.',
+              ),
             fat_serving: z
               .number()
               .optional()
-              .describe('Total fat per serving in grams. Absent when serving size not defined.'),
+              .describe(
+                'Total fat per serving in grams. Absent when serving size not defined, and beside figures read from a stored as-sold set, which come per 100 g, or per 100 ml for liquids, only.',
+              ),
             sugars_serving: z
               .number()
               .optional()
-              .describe('Sugars per serving in grams. Absent when serving size not defined.'),
+              .describe(
+                'Sugars per serving in grams. Absent when serving size not defined, and beside figures read from a stored as-sold set, which come per 100 g, or per 100 ml for liquids, only.',
+              ),
             additional_100g: z
               .record(
                 z.string().describe('Nutrient name, hyphens normalized to underscores.'),
@@ -608,10 +605,11 @@ export const offGetProductTool = tool('off_get_product', {
               .describe(
                 "The same nutrients per serving. Also carries the per-serving figures for macros that have a named _100g field but no named per-serving one (saturated_fat, carbohydrates, fiber, proteins, salt, sodium). Percent, % vol, and unitless figures are concentrations, so they equal the per-100 figure. Check serving_size for the denominator the other figures are measured against. A key ending in _prepared is a prepared-product figure that Open Food Facts scales from the per-100 figure by serving_quantity, which is often a powder's dry portion rather than the prepared serving, so it can describe a fraction of what is consumed.",
               ),
+            stored_as_sold: storedAsSoldSchema('this product'),
           })
           .optional()
           .describe(
-            'Nutrition figures normalized to underscore keys. The named fields hold as-sold figures, and keys ending in _prepared under additional_100g and additional_serving hold prepared-product figures. Open Food Facts returns one preparation state per read, so a read of prepared figures leaves every named field absent even when the record holds as-sold figures. All values may be absent when nutrition data not yet entered.',
+            "Nutrition figures normalized to underscore keys. The named fields hold as-sold figures, and keys ending in _prepared under additional_100g and additional_serving hold prepared-product figures. Open Food Facts returns one preparation state per read, and prepared wins, so when the product read returns only prepared figures the record's stored as-sold set is read as well and fills the as-sold fields per 100 g, or per 100 ml for liquids; stored_as_sold says how that went. All values may be absent when nutrition data not yet entered.",
           ),
         serving_size: z
           .string()
@@ -682,7 +680,31 @@ export const offGetProductTool = tool('off_get_product', {
       .describe(
         'The field subset that was fetched, when the caller passed `fields` — the requested fields plus the ones they depend on, so every field that can appear in `product` is named here. Absent means all standard fields were requested. Sections outside this subset are omitted because they were not requested — not because Open Food Facts lacks the data.',
       ),
+    source: z
+      .enum(['off_api', 'off_mirror'])
+      .describe(
+        'Where this product was read: "off_api", Open Food Facts itself, or "off_mirror", this server\'s local copy of the Open Food Facts export, which serves a barcode it holds on a deployment that keeps one. The stored as-sold read behind nutriments.stored_as_sold, when one runs, reads the same source.',
+      ),
+    mirror_as_of: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 time of the newest Open Food Facts change the local copy reflects. Present only when source is "off_mirror".',
+      ),
   }),
+
+  enrichment: {
+    mirror_snapshot: z
+      .string()
+      .optional()
+      .describe(
+        'Present only when source is "off_mirror". States that the product comes from the local copy as of mirror_as_of, so an edit made to it since then is not reflected.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    mirror_snapshot: { render: mirrorSnapshotTrailer },
+  },
 
   errors: [
     {
@@ -737,28 +759,58 @@ export const offGetProductTool = tool('off_get_product', {
     // request. The service has a default full-field set; using getProductFields() overrides it.
     // The subset is expanded first, so a requested field arrives with whatever it needs to be read.
     const fields = input.fields && input.fields.length > 0 ? expandFields(input.fields) : undefined;
-    const product = fields
+    const read = fields
       ? await svc.getProductFields(input.barcode, fields.join(','), ctx)
       : await svc.getProduct(input.barcode, ctx);
 
-    if (!product) {
+    if (!read) {
       throw ctx.fail('not_found', `Barcode ${input.barcode} not found in Open Food Facts`, {
         barcode: input.barcode,
       });
     }
+    const { product } = read;
 
     ctx.log.info('Product fetched', {
       barcode: input.barcode,
       product_name: product.product_name,
       completeness: product.completeness,
+      source: read.source,
     });
+
+    // A read of prepared figures alone leaves out the as-sold ones the record can store, so their
+    // stored set is read next. It never fails the call: an unread set comes back as such.
+    const settled = holdsOnlyPreparedFigures(product.nutriments)
+      ? settleStoredAsSold(
+          input.barcode,
+          product,
+          await svc.readStoredAsSold(input.barcode, ctx, read),
+        )
+      : undefined;
+
+    if (read.source === 'off_mirror') {
+      ctx.enrich({
+        mirror_snapshot: mirrorCopyNote(
+          'This product comes',
+          read.mirrorAsOf,
+          'an edit made to it since then is not reflected',
+        ),
+      });
+    }
 
     // Thread the requested subset through so format() can distinguish "not requested" from
     // "missing upstream data". The expanded list is what was asked of Open Food Facts, so it is
     // what the caller is told: every field that can appear in `product` is named in it. A full
     // request (no fields) leaves requested_fields absent.
-    const result = buildProductOutput(input.barcode, product, fields);
-    return result;
+    return {
+      ...buildProductOutput(
+        input.barcode,
+        settled?.product ?? product,
+        fields,
+        settled?.stored_as_sold,
+      ),
+      source: read.source,
+      ...(read.source === 'off_mirror' && { mirror_as_of: read.mirrorAsOf }),
+    };
   },
 
   format: (result) => {
@@ -770,7 +822,6 @@ export const offGetProductTool = tool('off_get_product', {
     const requested = result.requested_fields;
     const notRequested = (field: string): boolean =>
       requested !== undefined && !requested.includes(field);
-    const onlyPrepared = onlyPreparedFigures(p.nutriments ?? {});
 
     // A name that was never fetched is not an unknown name. Saying so here is the same
     // distinction the section lines below draw, applied to the one line that leads the response.
@@ -842,9 +893,19 @@ export const offGetProductTool = tool('off_get_product', {
         }
       }
 
-      if (onlyPrepared) {
+      const stored = n.stored_as_sold;
+      if (stored?.status === 'read') {
         lines.push(
-          '\n**As-sold nutrition:** This read returned only prepared figures. Open Food Facts returns one preparation state per read, so the record can still hold as-sold figures.',
+          '\n**As-sold nutrition (stored set: read):** The product read returned only prepared figures, so the as-sold figures above come from the as-sold set the record stores.',
+        );
+      } else if (stored?.status === 'none') {
+        lines.push(
+          '\n**As-sold nutrition (stored set: none):** The product read returned only prepared figures, and Open Food Facts stores no entered as-sold figures for this product that can be given per 100 g, or per 100 ml for liquids.',
+        );
+      } else if (stored?.status === 'unread') {
+        const wait = stored.retryAfter === undefined ? '' : `, retry after ${stored.retryAfter} s`;
+        lines.push(
+          `\n**As-sold nutrition (stored set: unread, ${stored.reason}${wait}):** The product read returned only prepared figures, and the as-sold figures the record can still hold were not read: ${mdInline(stored.error)}`,
         );
       }
 
@@ -948,10 +1009,13 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push(`\n**Data completeness:** ${completenessLabel(p.completeness)}`);
     }
 
-    // The as-sold fields of a prepared-only read are missing because of the read, which the
-    // statement above says, so the footer's claim narrows to the rest.
+    // The as-sold fields of a prepared-only read whose stored set went unread are missing because
+    // of the read, which the statement above says, so the footer's claim narrows to the rest. A
+    // read stored set, or a record that stores none, leaves "not yet entered" true of every gap.
+    const asSoldUnknown = p.nutriments?.stored_as_sold?.status === 'unread';
     lines.push(
-      `\n*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. ${onlyPrepared ? 'Other missing' : 'Missing'} fields = not yet entered.*`,
+      `\n${sourceLine(result.source, result.mirror_as_of)}`,
+      `*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. ${asSoldUnknown ? 'Other missing' : 'Missing'} fields = not yet entered.*`,
     );
 
     return [{ type: 'text' as const, text: lines.join('\n') }];
@@ -998,11 +1062,12 @@ function servingQuantity(raw: number | string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-/** Build the normalized output object from a raw product. */
+/** Build the normalized output object from a raw product, and how its stored as-sold read went. */
 function buildProductOutput(
   barcode: string,
   raw: RawProduct,
-  requestedFields?: string[],
+  requestedFields: string[] | undefined,
+  storedAsSold: StoredAsSold | undefined,
 ): {
   barcode: string;
   requested_fields?: string[];
@@ -1030,8 +1095,14 @@ function buildProductOutput(
   if (typeof raw.nova_group === 'number') product.nova_group = raw.nova_group;
   if (raw.ecoscore_grade) product.ecoscore_grade = raw.ecoscore_grade;
 
+  // stored_as_sold rides on nutriments: a stored read runs only for a read holding prepared
+  // figures, so the object exists whenever there is a status to carry.
   const nutriments = normalizeNutriments(raw.nutriments);
-  if (nutriments) product.nutriments = nutriments;
+  if (nutriments) {
+    product.nutriments = storedAsSold
+      ? { ...nutriments, stored_as_sold: storedAsSold }
+      : nutriments;
+  }
 
   if (raw.serving_size) product.serving_size = raw.serving_size;
   const quantity = servingQuantity(raw.serving_quantity);

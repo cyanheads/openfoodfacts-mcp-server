@@ -2,7 +2,8 @@
  * @fileoverview Tests for the tag-value canonicalizer the text search path runs every tag filter
  * through (GH issue #39): brand slugging, offline-sample and live-autocomplete resolution under the
  * exact-match rule, best-effort fallback (timed-out answers from GH issue #68, the retry deadline
- * from GH issue #72), the in-process cache, and caller cancellation (GH issue #60). Driven through
+ * from GH issue #72), the in-process cache, and caller cancellation (GH issue #60), including the
+ * deadline of a caller that restarts a cancelled shared lookup (GH issue #75). Driven through
  * the real OpenFoodFactsService with a stubbed global fetch, so the rate limiter, retry
  * classification, and option parsing on the lookup path all run.
  * @module tests/services/taxonomy/taxonomy-service.test
@@ -94,6 +95,22 @@ describe('TaxonomyService.canonicalizeTag', () => {
       });
       expect(global.fetch).not.toHaveBeenCalled();
     });
+
+    it.each([
+      ['xx:nutella', 'nutella'],
+      ['en:nutella', 'nutella'],
+      ["FR:Ben & Jerry's", 'ben-jerry-s'],
+    ])(
+      'drops the language prefix of %j and slugs the rest to %j, as Product Opener matches a brand filter',
+      async (input, slug) => {
+        await expect(taxonomy.canonicalizeTag('brands', input, ctx)).resolves.toEqual({
+          value: slug,
+          resolution: 'normalized',
+          reason: 'no_vocabulary',
+        });
+        expect(global.fetch).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('offline sample', () => {
@@ -320,21 +337,89 @@ describe('TaxonomyService.canonicalizeTag', () => {
         value: 'en:us',
         resolution: 'normalized',
         reason: 'lookup_failed',
+        cause: 'unavailable',
       });
     });
 
-    it('falls back without sending anything once the taxonomy budget is spent', async () => {
+    it('falls back without sending anything once the taxonomy budget is spent (#77)', async () => {
       const budgeted = makeTaxonomy(1);
       stubOptions([]);
-
-      await budgeted.canonicalizeTag('countries', 'Never Land', ctx);
-      await expect(budgeted.canonicalizeTag('countries', 'Atlantis', ctx)).resolves.toEqual({
-        value: 'en:atlantis',
-        resolution: 'normalized',
-        reason: 'lookup_failed',
-      });
+      vi.useFakeTimers();
+      try {
+        await budgeted.canonicalizeTag('countries', 'Never Land', ctx);
+        await expect(budgeted.canonicalizeTag('countries', 'Atlantis', ctx)).resolves.toEqual({
+          value: 'en:atlantis',
+          resolution: 'normalized',
+          reason: 'lookup_failed',
+          cause: 'budget_spent',
+          // The budget's own wait: the one slot frees a whole window after it was spent.
+          retryAfter: 60,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
       expect(global.fetch).toHaveBeenCalledOnce();
     });
+
+    it.each([
+      ['a 503', 'unavailable', () => mockResponse('unavailable', 503)],
+      [
+        'an unreachable upstream',
+        'unavailable',
+        () => Promise.reject(new TypeError('Unable to connect.')),
+      ],
+      ['an upstream 429', 'rate_limited', () => mockResponse({ detail: 'slow down' }, 429)],
+    ] as const)('reads %s as lookup_failed with cause %s (#77)', async (_label, cause, answer) => {
+      global.fetch = vi.fn(async () => answer());
+
+      const refused = await onFakeTimers(() =>
+        taxonomy.canonicalizeTag('allergens', 'en:kiwi', ctx),
+      );
+
+      // No Retry-After was sent, so no wait is invented.
+      expect(refused).toEqual({
+        value: 'en:kiwi',
+        resolution: 'normalized',
+        reason: 'lookup_failed',
+        cause,
+      });
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+    });
+
+    it.each([
+      ['delta-seconds', '60', 60],
+      // 44.75 s left at the pinned clock, rounded up.
+      ['an HTTP-date', 'Sun, 01 Nov 2026 12:00:45 GMT', 45],
+    ])(
+      'carries the wait of an upstream 429 whose Retry-After is %s, sent once (#77)',
+      async (_label, retryAfter, seconds) => {
+        global.fetch = vi.fn(async () => {
+          const response = mockResponse({ detail: 'slow down' }, 429);
+          response.headers.set('retry-after', retryAfter);
+          return response;
+        });
+        vi.useFakeTimers({ now: Date.parse('2026-11-01T12:00:00.250Z') });
+        let refused: unknown;
+        try {
+          const pending = taxonomy.canonicalizeTag('allergens', 'en:kiwi', ctx);
+          pending.catch(() => undefined);
+          await vi.runAllTimersAsync();
+          refused = await pending;
+        } finally {
+          vi.useRealTimers();
+        }
+
+        expect(refused).toEqual({
+          value: 'en:kiwi',
+          resolution: 'normalized',
+          reason: 'lookup_failed',
+          cause: 'rate_limited',
+          retryAfter: seconds,
+        });
+        // A wait past withRetry's 30 s ceiling fails the lookup at once instead of sleeping it out.
+        expect(global.fetch).toHaveBeenCalledOnce();
+      },
+    );
 
     it('does not cache a failed lookup, so the next search retries it', async () => {
       global.fetch = vi.fn(async () => mockResponse({ detail: 'refused' }, 400));
@@ -358,6 +443,7 @@ describe('TaxonomyService.canonicalizeTag', () => {
         value: 'en:kiwi',
         resolution: 'normalized',
         reason: 'lookup_failed',
+        cause: 'unavailable',
       });
       expect(global.fetch).toHaveBeenCalledTimes(4);
 
@@ -391,6 +477,7 @@ describe('TaxonomyService.canonicalizeTag', () => {
           value: 'en:kiwi',
           resolution: 'normalized',
           reason: 'lookup_failed',
+          cause: 'unavailable',
         });
       } finally {
         vi.useRealTimers();
@@ -476,6 +563,85 @@ describe('TaxonomyService.canonicalizeTag', () => {
       await taxonomy.canonicalizeTag('countries', 'place 0', ctx);
       expect(global.fetch).toHaveBeenCalledTimes(502);
     });
+  });
+});
+
+describe('TaxonomyService.search — fallback notice by cause (#77)', () => {
+  const globalFetch = global.fetch;
+  /** The offline-sample sentence every fallback notice carries for `cheese` in categories. */
+  const SAMPLE =
+    "These 2 result(s) come from this server's offline sample of 73 entries, so a term the sample does not cover reads as no match here even when the tag exists upstream.";
+
+  afterEach(() => {
+    global.fetch = globalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('opens with the spent budget and its wait, and sends nothing', async () => {
+    const taxonomy = makeTaxonomy(1);
+    stubOptions([{ id: 'en:hummus', text: 'Hummus' }]);
+    vi.useFakeTimers();
+    let notice: string | undefined;
+    let tags: string[] = [];
+    try {
+      await taxonomy.search('categories', 'hummus', 20, createMockContext());
+      const second = await taxonomy.search('categories', 'cheese', 20, createMockContext());
+      notice = second.notice;
+      tags = second.tags.map((tag) => tag.id);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(tags).toEqual(['en:cheeses', 'en:fresh-cheeses']);
+    expect(notice).toBe(
+      `This server's own per-minute taxonomy budget is spent, so nothing was sent to Open Food Facts and the live categories vocabulary went unchecked. ${SAMPLE} A lookup slot frees in about 60 s; retry then for an authoritative answer.`,
+    );
+    expect(global.fetch).toHaveBeenCalledOnce();
+  });
+
+  it('names the upstream rate limit, not an unreachable vocabulary, for a 429', async () => {
+    const taxonomy = makeTaxonomy();
+    global.fetch = vi.fn(async () => mockResponse({ detail: 'slow down' }, 429));
+
+    const result = await onFakeTimers(() =>
+      taxonomy.search('categories', 'cheese', 20, createMockContext()),
+    );
+
+    expect(result.notice).toBe(
+      `Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429), so the live categories vocabulary went unchecked. ${SAMPLE} Retry in about a minute for an authoritative answer.`,
+    );
+  });
+
+  it('names the wait a 429 asked for when it carries a Retry-After', async () => {
+    const taxonomy = makeTaxonomy();
+    global.fetch = vi.fn(async () => {
+      const response = mockResponse({ detail: 'slow down' }, 429);
+      response.headers.set('retry-after', '60');
+      return response;
+    });
+
+    const result = await onFakeTimers(() =>
+      taxonomy.search('categories', 'cheese', 20, createMockContext()),
+    );
+
+    expect(result.tags.map((tag) => tag.id)).toEqual(['en:cheeses', 'en:fresh-cheeses']);
+    expect(result.notice).toBe(
+      `Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429), so the live categories vocabulary went unchecked. ${SAMPLE} Open Food Facts asked for a wait of 60 s; retry then for an authoritative answer.`,
+    );
+    expect(global.fetch).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the unreachable-vocabulary wording, with its cause, for an outage', async () => {
+    const taxonomy = makeTaxonomy();
+    global.fetch = vi.fn(async () => mockResponse('unavailable', 503));
+
+    const result = await onFakeTimers(() =>
+      taxonomy.search('categories', 'cheese', 20, createMockContext()),
+    );
+
+    expect(result.notice).toBe(
+      `The live Open Food Facts categories vocabulary could not be reached or gave no usable answer (Open Food Facts is unavailable (HTTP 503): unavailable (failed after 4 attempts)). ${SAMPLE} Retry for an authoritative answer.`,
+    );
   });
 });
 
@@ -585,6 +751,134 @@ describe('TaxonomyService — caller cancellation (#60)', () => {
     );
     // The cancelled request, then one replacement shared by every caller still waiting.
     expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  describe('a joiner restarting a cancelled lookup (#75)', () => {
+    const UNCHECKED = {
+      value: 'en:kiwi',
+      resolution: 'normalized',
+      reason: 'lookup_failed',
+      cause: 'unavailable',
+    };
+
+    /** Every request stays in flight until its signal aborts, then rejects with the abort reason. */
+    function stubHung(): void {
+      global.fetch = vi.fn(
+        (_input: unknown, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      ) as typeof fetch;
+    }
+
+    /** Starts a lookup of `en:kiwi` now and reports how it settled, timed from its own call. */
+    function startLookup(
+      taxonomy: TaxonomyService,
+      signal?: AbortSignal,
+    ): Promise<{ afterMs: number; value?: unknown; error?: unknown }> {
+      const startedAt = Date.now();
+      return taxonomy
+        .canonicalizeTag('allergens', 'en:kiwi', createMockContext(signal ? { signal } : {}))
+        .then(
+          (value) => ({ afterMs: Date.now() - startedAt, value }),
+          (error: unknown) => ({ afterMs: Date.now() - startedAt, error }),
+        );
+    }
+
+    beforeEach(() => {
+      stubHung();
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it.each([19_999, 100])(
+      'settles a joiner within its own 20 s when the lookup it joined is cancelled at %i ms',
+      async (cancelAtMs) => {
+        const taxonomy = makeTaxonomy();
+        const controller = new AbortController();
+        const owner = startLookup(taxonomy, controller.signal);
+        await vi.advanceTimersByTimeAsync(1);
+        const joiner = startLookup(taxonomy);
+        await vi.advanceTimersByTimeAsync(cancelAtMs - 1);
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(120_000);
+
+        await expect(owner).resolves.toMatchObject({
+          error: { code: JsonRpcErrorCode.RequestCancelled },
+        });
+        await expect(joiner).resolves.toEqual({ afterMs: 20_000, value: UNCHECKED });
+      },
+    );
+
+    it('settles a later joiner within its own 20 s when the restarted lookup is cancelled too', async () => {
+      const taxonomy = makeTaxonomy();
+      const first = new AbortController();
+      const second = new AbortController();
+      const a = startLookup(taxonomy, first.signal);
+      await vi.advanceTimersByTimeAsync(1);
+      const b = startLookup(taxonomy, second.signal);
+      await vi.advanceTimersByTimeAsync(1);
+      const c = startLookup(taxonomy);
+      await vi.advanceTimersByTimeAsync(98);
+      // At 100 ms: b, the first joiner back, restarts the lookup and c joins the restart.
+      first.abort();
+      await vi.advanceTimersByTimeAsync(9_900);
+      // At 10,000 ms: c restarts it with what is left of its own 20 s.
+      second.abort();
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      for (const cancelled of [a, b]) {
+        await expect(cancelled).resolves.toMatchObject({
+          error: { code: JsonRpcErrorCode.RequestCancelled },
+        });
+      }
+      await expect(c).resolves.toEqual({ afterMs: 20_000, value: UNCHECKED });
+      // One lookup in flight at a time: the original, b's restart, and c's.
+      expect(global.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it('ends a joiner its own caller cancels at once, leaving the shared lookup to its starter', async () => {
+      const taxonomy = makeTaxonomy();
+      const controller = new AbortController();
+      const owner = startLookup(taxonomy);
+      await vi.advanceTimersByTimeAsync(1);
+      const joiner = startLookup(taxonomy, controller.signal);
+      await vi.advanceTimersByTimeAsync(99);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      // Its own cancellation, when it landed: never the shared lookup's lookup_failed 20 s later.
+      const settled = await joiner;
+      expect(settled.afterMs).toBe(99);
+      expect(settled.error).toBe(controller.signal.reason);
+      expect(settled).not.toHaveProperty('value');
+      // The starter's lookup runs on, two attempts in its 20 s, and nothing restarts it.
+      await expect(owner).resolves.toEqual({ afterMs: 20_000, value: UNCHECKED });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('ends a joiner with nothing left of its 20 s as lookup_failed, sending no request', async () => {
+      const taxonomy = makeTaxonomy();
+      const controller = new AbortController();
+      let requestsAtCancel = -1;
+      // Armed before the lookup's own deadline timer, so the cancellation lands first at 20 s.
+      setTimeout(() => {
+        requestsAtCancel = vi.mocked(global.fetch).mock.calls.length;
+        controller.abort();
+      }, 20_000);
+      const owner = startLookup(taxonomy, controller.signal);
+      const joiner = startLookup(taxonomy);
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      await expect(owner).resolves.toMatchObject({
+        error: { code: JsonRpcErrorCode.RequestCancelled },
+      });
+      await expect(joiner).resolves.toEqual({ afterMs: 20_000, value: UNCHECKED });
+      expect(global.fetch).toHaveBeenCalledTimes(requestsAtCancel);
+    });
   });
 
   it('ends search() as cancelled, never as the offline fallback', async () => {

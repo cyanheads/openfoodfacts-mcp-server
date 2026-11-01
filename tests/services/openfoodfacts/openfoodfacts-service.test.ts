@@ -4,15 +4,25 @@
  * declared error contract carried by every failure (GH issue #12), retry classification and
  * upstream-detail surfacing (GH issue #19), status-decided retryability (GH issue #37), malformed
  * success envelopes (GH issue #54), answers flagged timed_out (GH issue #68), the total retry
- * deadline (GH issue #72), the nutrient row check (GH issue #64), and User-Agent header
- * verification.
+ * deadline (GH issue #72), the nutrient row check (GH issue #64), reads and tag-only searches
+ * served from the local export mirror (GH issue #79), and User-Agent header verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** `OFF_MIRROR_PATH` as the mocked config reads it: unset unless a mirror test points it at a store. */
+const mirrorConfig = vi.hoisted(() => ({ mirrorPath: undefined as string | undefined }));
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn(() => ({
@@ -20,13 +30,29 @@ vi.mock('@/config/server-config.js', () => ({
     rateLimitProduct: 100,
     rateLimitSearch: 10,
     rateLimitTaxonomy: 100,
+    mirrorPath: mirrorConfig.mirrorPath,
   })),
 }));
+
+// A pass-through spy, so a case can tell whether the store ran a tag search at all.
+vi.mock('@/services/mirror/mirror-queries.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/mirror/mirror-queries.js')>();
+  return { ...actual, searchByTags: vi.fn(actual.searchByTags) };
+});
 
 import { offBrowseTaxonomyTool } from '@/mcp-server/tools/definitions/browse-taxonomy.tool.js';
 import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
+import { TagIds } from '@/services/mirror/mirror-ingester.js';
+import { searchByTags } from '@/services/mirror/mirror-queries.js';
+import {
+  closeMirrorStore,
+  encodeCheckpoint,
+  getMirrorStore,
+  openMirrorStore,
+} from '@/services/mirror/mirror-store.js';
+import { buildMirrorRecord, normalizeCodeZeroes } from '@/services/mirror/record-builder.js';
 import {
   ANALYZER_STOP_WORDS,
   STOP_WORD_LANGS,
@@ -34,10 +60,14 @@ import {
 import {
   initOpenFoodFactsService,
   OpenFoodFactsService,
+  type ProductRead,
+  type ProductSearch,
   requiredWords,
+  type SearchOutcome,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { NUTRIENT_FIELDS } from '@/services/openfoodfacts/types.js';
 import { getTaxonomyService, initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import { v2Capture, v35Capture } from '../../fixtures/as-sold-captures.js';
 import {
   UPSTREAM_MULTI_MATCH_FIELDS,
   UPSTREAM_TEXT_LANGS,
@@ -166,6 +196,15 @@ function settle(run: () => Promise<unknown>): Promise<McpErrorish> {
   return onFakeTimers(() => captureError(run()));
 }
 
+/** A search outcome the case expects served, narrowed to its answer. */
+function served(outcome: SearchOutcome): Extract<SearchOutcome, { status: 'served' }> {
+  if (outcome.status !== 'served') throw new Error(`The search was not served: ${outcome.status}`);
+  return outcome;
+}
+
+/** A live product read, as the as-sold read takes the read it follows. */
+const LIVE_READ: ProductRead = { source: 'off_api', product: {} };
+
 describe('OpenFoodFactsService', () => {
   let svc: OpenFoodFactsService;
   const globalFetch = global.fetch;
@@ -226,7 +265,7 @@ describe('OpenFoodFactsService', () => {
       const result = await svc.getProduct('3017620422003', ctx);
 
       expect(result).not.toBeNull();
-      expect(result?.product_name).toBe('Nutella');
+      expect(result?.product.product_name).toBe('Nutella');
     });
   });
 
@@ -413,7 +452,9 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx);
+      const result = served(
+        await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx),
+      );
 
       // brands array joined to string
       expect(result.products[0]?.brands).toBe('Ferrero, Nutella');
@@ -532,9 +573,8 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts(
-        { categories_tag: 'en:spreads', page: 1, page_size: 20 },
-        ctx,
+      const result = served(
+        await svc.searchProducts({ categories_tag: 'en:spreads', page: 1, page_size: 20 }, ctx),
       );
 
       const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
@@ -555,7 +595,9 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx);
+      const result = served(
+        await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx),
+      );
 
       expect(result.products[0]?.ecoscore_grade).toBe('c');
     });
@@ -579,7 +621,9 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts({ query: 'test', page: 1, page_size: 2 }, ctx);
+      const result = served(
+        await svc.searchProducts({ query: 'test', page: 1, page_size: 2 }, ctx),
+      );
 
       // page_count must be products-on-page (2), not total-pages (20)
       expect(result.page_count).toBe(2);
@@ -865,9 +909,11 @@ describe('OpenFoodFactsService', () => {
         params: Record<string, unknown> = {},
       ) {
         global.fetch = vi.fn().mockResolvedValue(textHits(hits));
-        return await svc.searchProducts(
-          { page: 1, page_size: 20, nutrient_filters, ...params } as never,
-          createMockContext(),
+        return served(
+          await svc.searchProducts(
+            { page: 1, page_size: 20, nutrient_filters, ...params } as never,
+            createMockContext(),
+          ),
         );
       }
 
@@ -1057,13 +1103,15 @@ describe('OpenFoodFactsService', () => {
           }),
         );
 
-        const result = await svc.searchProducts(
-          {
-            nutrient_filters: [{ nutrient: 'salt', operator: 'lte', value: 0.1 }],
-            page: 2,
-            page_size: 20,
-          },
-          createMockContext(),
+        const result = served(
+          await svc.searchProducts(
+            {
+              nutrient_filters: [{ nutrient: 'salt', operator: 'lte', value: 0.1 }],
+              page: 2,
+              page_size: 20,
+            },
+            createMockContext(),
+          ),
         );
 
         expect(result).toMatchObject({
@@ -1093,9 +1141,8 @@ describe('OpenFoodFactsService', () => {
         // Characterization: the rows a query-only search returned before the check existed.
         global.fetch = vi.fn().mockResolvedValue(textHits(hitsAt('sugars_100g', [3, 3.5])));
 
-        const result = await svc.searchProducts(
-          { query: 'skyr', page: 1, page_size: 20 },
-          createMockContext(),
+        const result = served(
+          await svc.searchProducts({ query: 'skyr', page: 1, page_size: 20 }, createMockContext()),
         );
 
         expect(result.products).toHaveLength(2);
@@ -1121,7 +1168,9 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts({ query: 'chocolate', page: 1, page_size: 2 }, ctx);
+      const result = served(
+        await svc.searchProducts({ query: 'chocolate', page: 1, page_size: 2 }, ctx),
+      );
 
       expect(result.count).toBe(10_000);
       expect(result.count_is_exact).toBe(false);
@@ -1140,7 +1189,9 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts({ query: 'kombucha', page: 1, page_size: 2 }, ctx);
+      const result = served(
+        await svc.searchProducts({ query: 'kombucha', page: 1, page_size: 2 }, ctx),
+      );
 
       expect(result.count_is_exact).toBe(true);
     });
@@ -1162,7 +1213,7 @@ describe('OpenFoodFactsService', () => {
         }),
       );
       expect(
-        (await svc.searchProducts({ query: 'a', page: 1, page_size: 2 }, ctx)).count_is_exact,
+        served(await svc.searchProducts({ query: 'a', page: 1, page_size: 2 }, ctx)).count_is_exact,
       ).toBe(true);
 
       global.fetch = vi.fn().mockResolvedValue(
@@ -1176,7 +1227,7 @@ describe('OpenFoodFactsService', () => {
         }),
       );
       expect(
-        (await svc.searchProducts({ query: 'b', page: 1, page_size: 2 }, ctx)).count_is_exact,
+        served(await svc.searchProducts({ query: 'b', page: 1, page_size: 2 }, ctx)).count_is_exact,
       ).toBe(false);
     });
 
@@ -1194,9 +1245,8 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts(
-        { categories_tag: 'en:beverages', page: 1, page_size: 20 },
-        ctx,
+      const result = served(
+        await svc.searchProducts({ categories_tag: 'en:beverages', page: 1, page_size: 20 }, ctx),
       );
 
       expect(result.count).toBe(230_860);
@@ -1345,7 +1395,7 @@ describe('OpenFoodFactsService', () => {
 
       const result = await svc.getProduct('3017620422003', ctx);
 
-      expect(result?.product_name).toBe('Nutella');
+      expect(result?.product.product_name).toBe('Nutella');
     });
 
     it('classifies a blown request deadline as upstream_timeout, not upstream_error', async () => {
@@ -1973,12 +2023,15 @@ describe('OpenFoodFactsService', () => {
         const ctx = createMockContext();
         answerAll(PRODUCT_FOUND);
         await expect(svc.getProduct('3017620422003', ctx)).resolves.toMatchObject({
-          product_name: 'Nutella',
-          nutriscore_grade: 'e',
+          source: 'off_api',
+          product: { product_name: 'Nutella', nutriscore_grade: 'e' },
         });
 
         answerAll(PRODUCT_FOUND_EMPTY);
-        await expect(svc.getProductFields('3017620422003', 'zz', ctx)).resolves.toEqual({});
+        await expect(svc.getProductFields('3017620422003', 'zz', ctx)).resolves.toEqual({
+          source: 'off_api',
+          product: {},
+        });
         expect(requestedPaths()).toEqual(['/api/v2/product/3017620422003.json']);
       });
 
@@ -1995,9 +2048,8 @@ describe('OpenFoodFactsService', () => {
       it('reads tag-search hits and a zero-hit page as counted answers', async () => {
         const ctx = createMockContext();
         answerAll(TAG_SEARCH_HITS);
-        const hits = await svc.searchProducts(
-          { categories_tag: 'en:hummus', page: 1, page_size: 2 },
-          ctx,
+        const hits = served(
+          await svc.searchProducts({ categories_tag: 'en:hummus', page: 1, page_size: 2 }, ctx),
         );
         expect(hits).toMatchObject({ count: 4581, count_is_exact: true, page_count: 2 });
         expect(hits.products.map((row) => row.code)).toEqual(['3292070005161', '3292070001576']);
@@ -2160,6 +2212,7 @@ describe('OpenFoodFactsService', () => {
           value: 'en:brokenac',
           resolution: 'normalized',
           reason: 'lookup_failed',
+          cause: 'unavailable',
         });
         const afterFirst = requestedPaths().length;
 
@@ -2936,7 +2989,7 @@ describe('OpenFoodFactsService', () => {
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(textHits(rows, 40));
 
-      const result = await svc.searchProducts({ query: 'x', page: 1, page_size: 5 }, ctx);
+      const result = served(await svc.searchProducts({ query: 'x', page: 1, page_size: 5 }, ctx));
 
       expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '7622210449283']);
       expect(result.page_count).toBe(2);
@@ -2964,9 +3017,8 @@ describe('OpenFoodFactsService', () => {
         }),
       );
 
-      const result = await svc.searchProducts(
-        { categories_tag: 'en:spreads', page: 1, page_size: 5 },
-        ctx,
+      const result = served(
+        await svc.searchProducts({ categories_tag: 'en:spreads', page: 1, page_size: 5 }, ctx),
       );
 
       expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '7622210449283']);
@@ -3012,9 +3064,8 @@ describe('OpenFoodFactsService', () => {
     it('drops them on the text path before page_count is set', async () => {
       global.fetch = vi.fn().mockResolvedValue(textHits(rows, 6));
 
-      const result = await svc.searchProducts(
-        { query: 'x', page: 1, page_size: 6 },
-        createMockContext(),
+      const result = served(
+        await svc.searchProducts({ query: 'x', page: 1, page_size: 6 }, createMockContext()),
       );
 
       expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '6035215']);
@@ -3026,9 +3077,8 @@ describe('OpenFoodFactsService', () => {
     it('reports no drop on a page whose codes are all servable', async () => {
       global.fetch = vi.fn().mockResolvedValue(textHits([{ code: '3017620422003' }], 1));
 
-      const result = await svc.searchProducts(
-        { query: 'x', page: 1, page_size: 1 },
-        createMockContext(),
+      const result = served(
+        await svc.searchProducts({ query: 'x', page: 1, page_size: 1 }, createMockContext()),
       );
 
       expect(result.dropped).toBe(0);
@@ -3041,9 +3091,11 @@ describe('OpenFoodFactsService', () => {
           mockResponse({ count: 6, page: 1, page_count: 6, page_size: 6, products: rows }),
         );
 
-      const result = await svc.searchProducts(
-        { categories_tag: 'en:honeys', page: 1, page_size: 6 },
-        createMockContext(),
+      const result = served(
+        await svc.searchProducts(
+          { categories_tag: 'en:honeys', page: 1, page_size: 6 },
+          createMockContext(),
+        ),
       );
 
       expect(result.products.map((p) => p.code)).toEqual(['3017620422003', '6035215']);
@@ -4296,6 +4348,67 @@ describe('OpenFoodFactsService', () => {
         vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname),
       ).toEqual(['/autocomplete']);
     });
+
+    it('ends a call that joined a shared lookup when its own caller cancels, not when the lookup ends (#75)', async () => {
+      // Lookups hang until their signal aborts; a search answers at once.
+      const paths: string[] = [];
+      global.fetch = vi.fn((input: unknown, init?: RequestInit) => {
+        const { pathname } = new URL(String(input));
+        paths.push(pathname);
+        if (pathname === '/search') return Promise.resolve(mockResponse(TEXT_SEARCH_EMPTY));
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal as AbortSignal;
+          if (signal.aborted) reject(signal.reason);
+          signal.addEventListener('abort', () => reject(signal.reason));
+        });
+      }) as typeof fetch;
+      const input = { query: 'soup', categories_tag: 'lentil soups' };
+      const cancelled = new DOMException(
+        'The joining call was cancelled by its caller.',
+        'AbortError',
+      );
+
+      vi.useFakeTimers();
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      try {
+        const start = Date.now();
+        const timed = <T>(run: Promise<T>) =>
+          run.then((result) => ({ afterMs: Date.now() - start, result }));
+        const owner = timed(
+          runToolContract(offSearchProductsTool, input, {
+            context: { errors: offSearchProductsTool.errors },
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(1);
+        const controller = new AbortController();
+        const joiner = timed(
+          runToolContract(offSearchProductsTool, input, {
+            context: { signal: controller.signal, errors: offSearchProductsTool.errors },
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(99);
+        // One lookup in flight, the first call's: the second joined it rather than sending its own.
+        expect(paths).toEqual(['/autocomplete']);
+        controller.abort(cancelled);
+        await vi.advanceTimersByTimeAsync(120_000);
+
+        const joined = await joiner;
+        expect(joined.afterMs).toBe(100);
+        expect(joined.result.isError).toBe(true);
+        const { error } = joined.result.structuredContent as { error: McpErrorish };
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        expect(error.message).toBe(cancelled.message);
+        expect(JSON.stringify(joined.result.content)).toContain(cancelled.message);
+
+        // The first call's lookup runs its 20 s on, two attempts, then its search: nothing restarts it.
+        const first = await owner;
+        expect(first.afterMs).toBe(20_000);
+        expect(first.result.isError).toBeFalsy();
+        expect(paths).toEqual(['/autocomplete', '/autocomplete', '/search']);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   // ── #72: every read is bounded by one total deadline ──────────────────────
@@ -4511,7 +4624,7 @@ describe('OpenFoodFactsService', () => {
           svc.getProduct(BARCODE, createMockContext()),
         );
 
-        expect(value).toMatchObject({ product_name: 'Nutella' });
+        expect(value).toMatchObject({ source: 'off_api', product: { product_name: 'Nutella' } });
         expect(settledAtMs).toBe(15_500);
         expect(global.fetch).toHaveBeenCalledTimes(2);
       });
@@ -4521,7 +4634,7 @@ describe('OpenFoodFactsService', () => {
 
         const { value } = await clocked(() => svc.getProduct(BARCODE, createMockContext()));
 
-        expect(value).toMatchObject({ product_name: 'Nutella' });
+        expect(value).toMatchObject({ source: 'off_api', product: { product_name: 'Nutella' } });
         expect(global.fetch).toHaveBeenCalledTimes(2);
       });
 
@@ -4614,12 +4727,58 @@ describe('OpenFoodFactsService', () => {
         },
       );
 
-      it('carries the Retry-After the upstream sent', async () => {
+      it('carries the Retry-After the upstream sent, in whole seconds (#76)', async () => {
         scriptFetch({ status: 429, retryAfter: '30' }, 'hang');
 
         const { error } = await clocked(textSearch);
 
-        expect(error?.data).toMatchObject({ retryAfter: '30' });
+        expect(error?.data).toMatchObject({ retryAfter: 30 });
+      });
+
+      it.each([
+        // 44.75 s left, rounded up; past withRetry's 30 s ceiling, so it fails fast.
+        ['ahead', '2026-11-01T12:00:00.250Z', 'Sun, 01 Nov 2026 12:00:45 GMT', 45, 1],
+        // 44.25 s left: rounded up too, where rounding to the nearest would say 44.
+        [
+          'ahead by a fraction under the half second',
+          '2026-11-01T12:00:00.750Z',
+          'Sun, 01 Nov 2026 12:00:45 GMT',
+          45,
+          1,
+        ],
+        // Nothing left, so the wait is 0 and every attempt is spent at once.
+        ['already past', '2026-11-01T12:00:00.250Z', 'Sun, 01 Nov 2026 11:59:00 GMT', 0, 4],
+      ])(
+        'converts an HTTP-date Retry-After %s into the seconds left (#76)',
+        async (_label, now, retryAfter, seconds, attempts) => {
+          vi.useFakeTimers({ now: Date.parse(now) });
+          let error: McpErrorish;
+          try {
+            scriptFetch({ status: 429, retryAfter });
+            const pending = captureError(svc.getProduct(BARCODE, createMockContext()));
+            await vi.runAllTimersAsync();
+            error = await pending;
+          } finally {
+            vi.useRealTimers();
+          }
+
+          expect(error.data).toMatchObject({ reason: 'rate_limited', retryAfter: seconds });
+          expect(global.fetch).toHaveBeenCalledTimes(attempts);
+        },
+      );
+
+      it.each([
+        ['no Retry-After', undefined],
+        ['an unreadable Retry-After', 'soon'],
+        ['a Retry-After that is neither form', '1.5'],
+      ])('publishes no retryAfter for a 429 with %s (#76)', async (_label, retryAfter) => {
+        // Every attempt answers alike, so the failure raised is one that carried the header.
+        scriptFetch(retryAfter === undefined ? { status: 429 } : { status: 429, retryAfter });
+
+        const { error } = await clocked(() => svc.getProduct(BARCODE, createMockContext()));
+
+        expect(error?.data?.reason).toBe('rate_limited');
+        expect(error?.data).not.toHaveProperty('retryAfter');
       });
 
       it('reports the outage when a later attempt answered something else', async () => {
@@ -4656,7 +4815,7 @@ describe('OpenFoodFactsService', () => {
         );
 
         expect(settledAtMs).toBe(15_500);
-        expect(error?.data).toMatchObject({ reason: 'rate_limited', retryAfter: '25' });
+        expect(error?.data).toMatchObject({ reason: 'rate_limited', retryAfter: 25 });
       });
 
       it('leaves the client-side budget refusal to fail at once, whatever came before it', async () => {
@@ -4707,6 +4866,18 @@ describe('OpenFoodFactsService', () => {
         expect(text).not.toContain('retry_deadline_exceeded');
       });
 
+      it.each([
+        ['off_get_product', () => runToolContract(offGetProductTool, { barcode: BARCODE })],
+        ['the search read', () => runToolContract(offSearchProductsTool, { query: 'pasta' })],
+      ])('carries a 429 wait on %s as a number of seconds (#76)', async (_label, call) => {
+        scriptFetch({ status: 429, retryAfter: '60' });
+
+        const { result } = await clockedTool(call);
+
+        const { error } = result.structuredContent as { error: McpErrorish };
+        expect(error.data).toMatchObject({ reason: 'rate_limited', retryAfter: 60 });
+      });
+
       it('lists a hung barcode in off_compare_products under its declared reason', async () => {
         scriptFetch('hang');
 
@@ -4740,6 +4911,38 @@ describe('OpenFoodFactsService', () => {
         const paths = requestedPaths();
         expect(paths.filter((path) => path === '/autocomplete')).toHaveLength(4);
         expect(paths.filter((path) => path === '/search')).toHaveLength(3);
+      });
+
+      it('settles a search that joined a lookup its starter cancelled within 55 s of its own start (#75)', async () => {
+        scriptFetch('hang');
+        vi.useFakeTimers();
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        const input = { query: 'tea', categories_tag: 'en:kombuchas' };
+        const controller = new AbortController();
+        try {
+          const starter = runToolContract(offSearchProductsTool, input, {
+            context: { signal: controller.signal },
+          });
+          await vi.advanceTimersByTimeAsync(1);
+          const startedAt = Date.now();
+          const joiner = runToolContract(offSearchProductsTool, input).then((result) => ({
+            afterMs: Date.now() - startedAt,
+            result,
+          }));
+          // The starter cancels 1 ms before its lookup's own 20 s deadline.
+          await vi.advanceTimersByTimeAsync(19_998);
+          controller.abort();
+          await vi.advanceTimersByTimeAsync(200_000);
+
+          const cancelled = (await starter).structuredContent as { error: McpErrorish };
+          expect(cancelled.error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+          const { afterMs, result } = await joiner;
+          expect(afterMs).toBe(55_000);
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.data?.reason).toBe('upstream_timeout');
+        } finally {
+          vi.useRealTimers();
+        }
       });
 
       it('refuses an unconfirmed exclusion at 20 s as retryable, sending no search', async () => {
@@ -4820,7 +5023,7 @@ describe('OpenFoodFactsService', () => {
 
           const { value } = await clocked(() => svc.getProduct(BARCODE, createMockContext()));
 
-          expect(value).toEqual(PRODUCT_FOUND.product);
+          expect(value).toEqual({ source: 'off_api', product: PRODUCT_FOUND.product });
           expect(global.fetch).toHaveBeenCalledTimes(2);
         });
       });
@@ -5057,6 +5260,1715 @@ describe('OpenFoodFactsService', () => {
         } finally {
           vi.useRealTimers();
         }
+      });
+    });
+  });
+
+  // ── #73: a prepared-only read's as-sold figures, from the stored input sets ─
+
+  describe('stored as-sold sets (#73)', () => {
+    const NESQUIK = '7613035530799';
+
+    /** The v3.5 request the follow-up must send for a barcode. */
+    const v35Url = (code: string) =>
+      `https://world.openfoodfacts.org/api/v3.5/product/${code}?fields=nutrition.input_sets`;
+
+    /** One answer: held until its signal aborts, or a body with a status, optionally late. */
+    type Answer = 'hang' | { status: number; body: unknown; afterMs?: number; html?: boolean };
+
+    /**
+     * Every request the fake saw: when (ms after the first request), which API version, and the
+     * full URL.
+     */
+    type Sent = { atMs: number; api: 'v2' | 'v3.5'; code: string; url: string };
+
+    /**
+     * Routes each request by API version and barcode, serving its answers in order and repeating
+     * the last. `onSend` runs as a request goes out, so a test can abort once one is in flight.
+     * Times count from the first request, on whichever clock is installed by then: a test routes
+     * before it fakes the timers, and a start read here would be real time, off by however long
+     * that took.
+     */
+    function routeFetch(
+      answers: Partial<Record<'v2' | 'v3.5', Record<string, Answer[]>>>,
+      onSend?: (sent: Sent) => void,
+    ): Sent[] {
+      const sent: Sent[] = [];
+      const served = new Map<string, number>();
+      let firstAt: number | undefined;
+      global.fetch = vi.fn((input: unknown, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const api = url.pathname.startsWith('/api/v3.5/') ? 'v3.5' : 'v2';
+        const code = (url.pathname.split('/').at(-1) ?? '').replace(/\.json$/, '');
+        firstAt ??= Date.now();
+        const request: Sent = { atMs: Date.now() - firstAt, api, code, url: url.toString() };
+        sent.push(request);
+        const queue = answers[api]?.[code];
+        if (!queue) throw new Error(`Unrouted ${api} request for ${code}`);
+        const key = `${api} ${code}`;
+        const n = served.get(key) ?? 0;
+        served.set(key, n + 1);
+        const answer = queue[Math.min(n, queue.length - 1)] as Answer;
+        return new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal as AbortSignal;
+          signal.addEventListener('abort', () => reject(signal.reason));
+          onSend?.(request);
+          if (answer === 'hang') return;
+          const respond = () =>
+            resolve(
+              new Response(
+                typeof answer.body === 'string' ? answer.body : JSON.stringify(answer.body),
+                {
+                  status: answer.status,
+                  headers: { 'content-type': answer.html ? 'text/html' : 'application/json' },
+                },
+              ),
+            );
+          if (answer.afterMs === undefined) respond();
+          else setTimeout(respond, answer.afterMs);
+        });
+      }) as typeof fetch;
+      return sent;
+    }
+
+    /** Settle `run` on fake timers with jitter off, reporting when it settled. */
+    async function clockedRun<T>(
+      run: () => Promise<T>,
+    ): Promise<{ settledAtMs: number; value?: T; error?: McpErrorish }> {
+      vi.useFakeTimers();
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      try {
+        const start = Date.now();
+        const settled = run().then(
+          (value) => ({ settledAtMs: Date.now() - start, value }),
+          (error: McpErrorish) => ({ settledAtMs: Date.now() - start, error }),
+        );
+        await vi.advanceTimersByTimeAsync(200_000);
+        return await settled;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    /** A found v3.5 envelope carrying the given product. */
+    const found = (product: unknown) => ({
+      status: 'success',
+      result: { id: 'product_found' },
+      product,
+    });
+
+    describe('the read', () => {
+      it('sends one v3.5 request for the input sets, with the identifying User-Agent', async () => {
+        const sent = routeFetch({
+          'v3.5': { [NESQUIK]: [{ status: 200, body: v35Capture(NESQUIK) }] },
+        });
+
+        const read = await svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ);
+
+        expect(read.status).toBe('read');
+        expect(read.status === 'read' && read.nutriments['energy-kcal_100g']).toBe(327);
+        expect(sent.map(({ url }) => url)).toEqual([v35Url(NESQUIK)]);
+        const [, init] = vi.mocked(global.fetch).mock.calls[0] ?? [];
+        expect(new Headers(init?.headers).get('User-Agent')).toMatch(
+          /^openfoodfacts-mcp-server\/\d+\.\d+\.\d+ /,
+        );
+      });
+
+      it('reads a success_with_warnings answer as found', async () => {
+        routeFetch({
+          'v3.5': {
+            [NESQUIK]: [
+              { status: 200, body: { ...v35Capture(NESQUIK), status: 'success_with_warnings' } },
+            ],
+          },
+        });
+
+        const read = await svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ);
+
+        expect(read.status).toBe('read');
+      });
+
+      it.each<[string, unknown]>([
+        ['no nutrition object', found({})],
+        ['no input_sets', found({ nutrition: {} })],
+        ['an empty input_sets list', found({ nutrition: { input_sets: [] } })],
+        [
+          'prepared and estimate sets only',
+          found({
+            nutrition: {
+              input_sets: v35Capture(NESQUIK).product.nutrition.input_sets.filter(
+                (set) => set.preparation !== 'as_sold' || set.source === 'estimate',
+              ),
+            },
+          }),
+        ],
+      ])('settles %s as none, in one request', async (_label, body) => {
+        routeFetch({ 'v3.5': { [NESQUIK]: [{ status: 200, body }] } });
+
+        const read = await svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ);
+
+        expect(read).toEqual({ status: 'none' });
+        expect(global.fetch).toHaveBeenCalledOnce();
+      });
+    });
+
+    describe('unread, never thrown', () => {
+      it('reads a 404 after a v2 hit as upstream_error at once, never as none', async () => {
+        routeFetch({
+          'v3.5': { [NESQUIK]: [{ status: 404, body: v35Capture('99999999999994') }] },
+        });
+
+        const { settledAtMs, value } = await clockedRun(() =>
+          svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ),
+        );
+
+        expect(settledAtMs).toBe(0);
+        expect(value?.status).toBe('unread');
+        const error = value?.status === 'unread' ? value.error : undefined;
+        expect(error?.data).toMatchObject({
+          reason: 'upstream_error',
+          status: 404,
+          barcode: NESQUIK,
+        });
+        expect(error?.message).toBe(
+          'Open Food Facts answered HTTP 404 on its API v3.5 product route for a barcode its v2 read found, so the stored nutrition sets were not read.',
+        );
+        expect(global.fetch).toHaveBeenCalledOnce();
+      });
+
+      it.each<[string, Answer]>([
+        [
+          'input_sets that is not a list',
+          { status: 200, body: found({ nutrition: { input_sets: {} } }) },
+        ],
+        [
+          'a nutrition field that is not an object',
+          { status: 200, body: found({ nutrition: 'n/a' }) },
+        ],
+        [
+          'no product object',
+          { status: 200, body: { status: 'success', result: { id: 'product_found' } } },
+        ],
+        [
+          'a failure envelope served with a 200',
+          { status: 200, body: { ...v35Capture('99999999999994'), product: {} } },
+        ],
+        [
+          'a result other than product_found',
+          { status: 200, body: { ...found({}), result: { id: 'x' } } },
+        ],
+        [
+          'a status other than success beside a found result',
+          { status: 200, body: { ...v35Capture(NESQUIK), status: 'failure' } },
+        ],
+        [
+          'an HTML page served with a 200',
+          { status: 200, body: '<!doctype html><p>busy</p>', html: true },
+        ],
+        ['a 503', { status: 503, body: { detail: 'down' } }],
+        [
+          'a bot-check page served with a 503',
+          { status: 503, body: '<!doctype html><p>Please verify you are a human</p>', html: true },
+        ],
+      ])('leaves %s unread as upstream_error after the retry ladder', async (_label, answer) => {
+        routeFetch({ 'v3.5': { [NESQUIK]: [answer] } });
+
+        const { settledAtMs, value } = await clockedRun(() =>
+          svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ),
+        );
+
+        expect(value?.status).toBe('unread');
+        expect(value?.status === 'unread' && value.error.data?.reason).toBe('upstream_error');
+        // Four attempts, backing off 0.5, 1, and 2 s with jitter off.
+        expect(global.fetch).toHaveBeenCalledTimes(4);
+        expect(settledAtMs).toBe(3_500);
+      });
+
+      it.each<[string, Answer]>([
+        ['a 403', { status: 403, body: { detail: 'forbidden' } }],
+        ['a 422', { status: 422, body: { detail: 'unprocessable' } }],
+        [
+          'a bot-check page served with a 403',
+          { status: 403, body: '<!doctype html><p>Please verify you are a human</p>', html: true },
+        ],
+      ])('leaves %s unread as upstream_rejected after one attempt', async (_label, answer) => {
+        routeFetch({ 'v3.5': { [NESQUIK]: [answer] } });
+
+        const { settledAtMs, value } = await clockedRun(() =>
+          svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ),
+        );
+
+        expect(value?.status).toBe('unread');
+        expect(value?.status === 'unread' && value.error.data).toMatchObject({
+          reason: 'upstream_rejected',
+          status: answer === 'hang' ? undefined : answer.status,
+        });
+        expect(global.fetch).toHaveBeenCalledOnce();
+        expect(settledAtMs).toBe(0);
+      });
+
+      /** The rendered page Product Opener serves with a refused request. */
+      const REFUSAL_PAGE = '<!doctype html><html><body>Forbidden</body></html>';
+
+      it.each<{
+        answer: Exclude<Answer, 'hang'>;
+        reason: 'upstream_rejected' | 'upstream_error' | 'upstream_timeout';
+        code: number;
+        requests: number;
+        settledAtMs: number;
+        message: string;
+      }>([
+        {
+          answer: { status: 401, body: { detail: 'login required' } },
+          reason: 'upstream_rejected',
+          code: JsonRpcErrorCode.InvalidParams,
+          requests: 1,
+          settledAtMs: 0,
+          message: 'Open Food Facts refused the request (HTTP 401): login required',
+        },
+        {
+          answer: { status: 403, body: { detail: 'forbidden' } },
+          reason: 'upstream_rejected',
+          code: JsonRpcErrorCode.InvalidParams,
+          requests: 1,
+          settledAtMs: 0,
+          message: 'Open Food Facts refused the request (HTTP 403): forbidden',
+        },
+        {
+          answer: { status: 403, body: REFUSAL_PAGE, html: true },
+          reason: 'upstream_rejected',
+          code: JsonRpcErrorCode.InvalidParams,
+          requests: 1,
+          settledAtMs: 0,
+          message:
+            'Open Food Facts refused the request (HTTP 403): it answered with a rendered error page rather than a JSON explanation of the refusal',
+        },
+        {
+          answer: { status: 422, body: { detail: 'unknown field' } },
+          reason: 'upstream_rejected',
+          code: JsonRpcErrorCode.InvalidParams,
+          requests: 1,
+          settledAtMs: 0,
+          message: 'Open Food Facts refused the request (HTTP 422): unknown field',
+        },
+        {
+          answer: { status: 501, body: { detail: 'not implemented' } },
+          reason: 'upstream_rejected',
+          code: JsonRpcErrorCode.InvalidParams,
+          requests: 1,
+          settledAtMs: 0,
+          message: 'Open Food Facts refused the request (HTTP 501): not implemented',
+        },
+        {
+          answer: { status: 500, body: { detail: 'server error' } },
+          reason: 'upstream_error',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          requests: 4,
+          settledAtMs: 3_500,
+          message:
+            'Open Food Facts is unavailable (HTTP 500): server error (failed after 4 attempts)',
+        },
+        {
+          answer: { status: 502, body: { detail: 'bad gateway' } },
+          reason: 'upstream_error',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          requests: 4,
+          settledAtMs: 3_500,
+          message:
+            'Open Food Facts is unavailable (HTTP 502): bad gateway (failed after 4 attempts)',
+        },
+        {
+          answer: { status: 504, body: { detail: 'gateway timeout' } },
+          reason: 'upstream_timeout',
+          code: JsonRpcErrorCode.Timeout,
+          requests: 4,
+          settledAtMs: 3_500,
+          message:
+            'Open Food Facts did not respond within the request deadline (HTTP 504): gateway timeout (failed after 4 attempts)',
+        },
+      ])(
+        'leaves an HTTP $answer.status unread as $reason after $requests request(s) (%#)',
+        async ({ answer, reason, code, requests, settledAtMs, message }) => {
+          const sent = routeFetch({ 'v3.5': { [NESQUIK]: [answer] } });
+
+          const run = await clockedRun(() =>
+            svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ),
+          );
+
+          expect(run.value?.status).toBe('unread');
+          const error = run.value?.status === 'unread' ? run.value.error : undefined;
+          expect(error?.code).toBe(code);
+          expect(error?.message).toBe(message);
+          expect(error?.data).toMatchObject({
+            reason,
+            retryable: reason !== 'upstream_rejected',
+            status: answer.status,
+            barcode: NESQUIK,
+          });
+          // A refusal is sent once; the rest back off 0.5, 1, and 2 s with jitter off.
+          expect(sent.map(({ url }) => url)).toEqual(Array(requests).fill(v35Url(NESQUIK)));
+          expect(run.settledAtMs).toBe(settledAtMs);
+        },
+      );
+
+      it('leaves a v3.5 route that never answers unread as upstream_timeout at the 20 s deadline', async () => {
+        routeFetch({ 'v3.5': { [NESQUIK]: ['hang'] } });
+
+        const { settledAtMs, value } = await clockedRun(() =>
+          svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ),
+        );
+
+        expect(settledAtMs).toBe(20_000);
+        expect(value?.status).toBe('unread');
+        const error = value?.status === 'unread' ? value.error : undefined;
+        expect(error?.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error?.data).toMatchObject({
+          reason: 'upstream_timeout',
+          operation: `OFF:readStoredAsSold:${NESQUIK}`,
+        });
+        expect(error?.message).toBe(
+          'Open Food Facts did not respond within the 20 s retry deadline.',
+        );
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('carries a 429 wait in whole seconds as rate_limited', async () => {
+        global.fetch = vi.fn(async () => {
+          const response = mockResponse({ detail: 'slow down' }, 429);
+          response.headers.set('retry-after', '30');
+          return response;
+        }) as typeof fetch;
+
+        const { value } = await clockedRun(() =>
+          svc.readStoredAsSold(NESQUIK, createMockContext(), LIVE_READ),
+        );
+
+        expect(value?.status === 'unread' && value.error.data).toMatchObject({
+          reason: 'rate_limited',
+          retryAfter: 30,
+        });
+      });
+
+      it('spends the product budget: a spent one refuses the read locally, sending nothing', async () => {
+        const budgeted = new OpenFoodFactsService({
+          baseUrl: 'https://world.openfoodfacts.org',
+          rateLimitProduct: 1,
+          rateLimitSearch: 100,
+          rateLimitTaxonomy: 100,
+        });
+        const sent = routeFetch({ v2: { [NESQUIK]: [{ status: 200, body: v2Capture(NESQUIK) }] } });
+        const ctx = createMockContext();
+
+        // Both reads on one frozen clock, so the wait is the slot's whole 60 s window.
+        const { settledAtMs, value: read } = await clockedRun(async () => {
+          await budgeted.getProduct(NESQUIK, ctx);
+          return budgeted.readStoredAsSold(NESQUIK, ctx, LIVE_READ);
+        });
+
+        expect(settledAtMs).toBe(0);
+        expect(read?.status).toBe('unread');
+        const error = read?.status === 'unread' ? read.error : undefined;
+        expect(error?.code).toBe(JsonRpcErrorCode.RateLimited);
+        expect(error?.data).toMatchObject({
+          reason: 'rate_limited',
+          retryable: true,
+          endpoint: 'product',
+          limit: 1,
+          retryAfter: 60,
+        });
+        expect(error?.message).toBe(
+          'openfoodfacts-mcp-server declined this product request: its own client-side budget of 1 product requests/min is spent, so nothing was sent to Open Food Facts. A slot frees in about 60s.',
+        );
+        expect(sent.map(({ api }) => api)).toEqual(['v2']);
+      });
+    });
+
+    describe('cancellation', () => {
+      it('rethrows a caller abort raised while the v3.5 request is in flight', async () => {
+        const controller = new AbortController();
+        routeFetch({ 'v3.5': { [NESQUIK]: ['hang'] } }, () => controller.abort());
+
+        const error = await captureError(
+          svc.readStoredAsSold(
+            NESQUIK,
+            createMockContext({ signal: controller.signal }),
+            LIVE_READ,
+          ),
+        );
+
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        expect(global.fetch).toHaveBeenCalledOnce();
+      });
+    });
+
+    describe('through off_get_product', () => {
+      beforeEach(() => {
+        initOpenFoodFactsService();
+      });
+
+      it('keeps the prepared figures and the product when the v3.5 route answers 403 or 404', async () => {
+        for (const [status, reason] of [
+          [403, 'upstream_rejected'],
+          [404, 'upstream_error'],
+        ] as const) {
+          routeFetch({
+            v2: { [NESQUIK]: [{ status: 200, body: v2Capture(NESQUIK) }] },
+            'v3.5': {
+              [NESQUIK]: [
+                { status, body: '<!doctype html><p>Please verify you are a human</p>', html: true },
+              ],
+            },
+          });
+
+          const result = await runToolContract(offGetProductTool, { barcode: NESQUIK });
+
+          expect(result.isError, `HTTP ${status}`).toBeFalsy();
+          const { nutriments } = (
+            result.structuredContent as {
+              product: {
+                nutriments: Record<string, unknown> & {
+                  additional_100g: Record<string, { value: number }>;
+                };
+              };
+            }
+          ).product;
+          expect(nutriments.stored_as_sold).toMatchObject({ status: 'unread', reason });
+          expect(nutriments).not.toHaveProperty('energy_kcal_100g');
+          expect(nutriments.additional_100g.energy_kcal_prepared?.value).toBe(68);
+          expect(JSON.stringify(result)).not.toContain('not_found');
+        }
+      });
+
+      it('serves the stored as-sold set of 7613035530799 beside its prepared figures', async () => {
+        const sent = routeFetch({
+          v2: { [NESQUIK]: [{ status: 200, body: v2Capture(NESQUIK) }] },
+          'v3.5': { [NESQUIK]: [{ status: 200, body: v35Capture(NESQUIK) }] },
+        });
+
+        const result = await runToolContract(offGetProductTool, { barcode: NESQUIK });
+
+        expect(result.isError).toBeFalsy();
+        const { nutriments } = (
+          result.structuredContent as {
+            product: {
+              nutriments: Record<string, unknown> & {
+                additional_100g: Record<string, { value: number }>;
+                additional_serving: Record<string, unknown>;
+              };
+            };
+          }
+        ).product;
+        expect(nutriments).toMatchObject({
+          energy_kcal_100g: 327,
+          fat_100g: 5.4,
+          saturated_fat_100g: 2.2,
+          stored_as_sold: { status: 'read' },
+        });
+        expect(nutriments).not.toHaveProperty('sugars_100g');
+        for (const key of ['energy_kcal_serving', 'fat_serving', 'sugars_serving']) {
+          expect(nutriments).not.toHaveProperty(key);
+        }
+        const servingKeys = Object.keys(nutriments.additional_serving);
+        expect(servingKeys.length).toBeGreaterThan(0);
+        expect(servingKeys.every((key) => key.endsWith('_prepared'))).toBe(true);
+        expect(nutriments.additional_100g.energy_kcal_prepared?.value).toBe(68);
+        expect(nutriments.additional_100g.alcohol?.value).toBe(0);
+
+        const text = JSON.stringify(result.content);
+        expect(text).toContain('**Energy:** 327 kcal');
+        expect(text).toContain('**Fat:** 5.4g');
+        expect(text).toContain('  - Saturated fat: 2.2g');
+        expect(text).toContain(
+          '**As-sold nutrition (stored set: read):** The product read returned only prepared figures, so the as-sold figures above come from the as-sold set the record stores.',
+        );
+        expect(sent.map(({ api, code }) => `${api} ${code}`)).toEqual([
+          `v2 ${NESQUIK}`,
+          `v3.5 ${NESQUIK}`,
+        ]);
+        expect(sent[1]?.url).toBe(v35Url(NESQUIK));
+      });
+
+      it.each([
+        ['an as-sold read', { barcode: '3017620422003' }, v2Capture('3017620422003')],
+        [
+          'a subset without nutriments',
+          { barcode: NESQUIK, fields: ['product_name' as const] },
+          // Open Food Facts answers a fields subset with exactly those fields.
+          { status: 1, product: { product_name: v2Capture(NESQUIK).product.product_name } },
+        ],
+      ])('sends no v3.5 request for %s', async (_label, input, body) => {
+        const sent = routeFetch({ v2: { [input.barcode]: [{ status: 200, body }] } });
+
+        const result = await runToolContract(offGetProductTool, input);
+
+        expect(result.isError).toBeFalsy();
+        expect(sent.map(({ api }) => api)).toEqual(['v2']);
+        expect(JSON.stringify(result.structuredContent)).not.toContain('stored_as_sold');
+      });
+
+      it('settles inside 55 s when a slow v2 read is followed by a v3.5 route that never answers', async () => {
+        // The v2 read answers at 34.999 s: 15 s stall, 0.5 s backoff, 15 s stall, 1 s backoff, 3.499 s.
+        const sent = routeFetch({
+          v2: {
+            [NESQUIK]: ['hang', 'hang', { status: 200, body: v2Capture(NESQUIK), afterMs: 3_499 }],
+          },
+          'v3.5': { [NESQUIK]: ['hang'] },
+        });
+
+        const { settledAtMs, value } = await clockedRun(() =>
+          runToolContract(offGetProductTool, { barcode: NESQUIK }),
+        );
+
+        expect(settledAtMs).toBe(54_999);
+        expect(value?.isError).toBeFalsy();
+        const output = value?.structuredContent as
+          | { product: { nutriments: { stored_as_sold: object } } }
+          | undefined;
+        expect(output?.product.nutriments.stored_as_sold).toMatchObject({
+          status: 'unread',
+          reason: 'upstream_timeout',
+        });
+        expect(sent.filter(({ api }) => api === 'v3.5').map(({ atMs }) => atMs)).toEqual([
+          34_999, 50_499,
+        ]);
+      });
+
+      it('ends as RequestCancelled when the caller aborts during the v3.5 request', async () => {
+        const controller = new AbortController();
+        routeFetch(
+          {
+            v2: { [NESQUIK]: [{ status: 200, body: v2Capture(NESQUIK) }] },
+            'v3.5': { [NESQUIK]: ['hang'] },
+          },
+          ({ api }) => {
+            if (api === 'v3.5') controller.abort();
+          },
+        );
+
+        const result = await runToolContract(
+          offGetProductTool,
+          { barcode: NESQUIK },
+          { context: { signal: controller.signal, errors: offGetProductTool.errors } },
+        );
+
+        expect(result.isError).toBe(true);
+        const { error } = result.structuredContent as { error: McpErrorish };
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        // The v3.5 request's own abort. A handler that settled the abort as unread and returned
+        // would end on the bare signal's "This operation was aborted" instead.
+        const aborted = 'fetch GET https://world.openfoodfacts.org/…?… was aborted.';
+        expect(error.message).toBe(aborted);
+        expect(JSON.stringify(result.content)).toContain(aborted);
+        expect(JSON.stringify(result)).not.toContain('stored_as_sold');
+        expect(JSON.stringify(result)).not.toContain('unread');
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+    });
+  });
+
+  // ── #79: barcode reads and tag-only searches from the local export mirror ──
+
+  describe('local export mirror (#79)', () => {
+    type Line = Record<string, unknown>;
+    type StoredSet = {
+      preparation?: string;
+      source?: string;
+      nutrients: Record<string, { value?: number }>;
+    };
+    /** A `tests/fixtures/mirror/` capture: the export line and the live reads of the same record. */
+    type MirrorFixture = {
+      code: string;
+      line: Line;
+      live: { product: Record<string, unknown> };
+      liveInputSets?: { body: { product: { nutrition: { input_sets: StoredSet[] } } } };
+    };
+    type ToolRun = {
+      isError?: boolean | undefined;
+      structuredContent?: unknown;
+      content?: unknown;
+    };
+
+    const FIXTURE_DIR = new URL('../../fixtures/mirror/', import.meta.url);
+    const FIXTURE_FILES = readdirSync(FIXTURE_DIR);
+
+    function mirrorFixture(code: string): MirrorFixture {
+      const file = FIXTURE_FILES.find((name) => name.endsWith(`-${code}.json`));
+      if (!file) throw new Error(`No mirror fixture for ${code}`);
+      return JSON.parse(readFileSync(new URL(file, FIXTURE_DIR), 'utf8')) as MirrorFixture;
+    }
+
+    /** Prepared figures only; the record stores its as-sold set (327 kcal per 100 g). */
+    const NESQUIK = '7613035530799';
+    /** As-sold figures; Product Opener stores it as 0030000010402, read as 030000010402 too. */
+    const OATS = '0030000010402';
+    /** As-sold and prepared figures. */
+    const BOTH = '0016000289994';
+
+    /** The as-of time the store's checkpoint encodes, as a mirror read cites it. */
+    const AS_OF = '2026-11-01T06:25:32.000Z';
+
+    /** Every field a product read asks Open Food Facts for. */
+    const PRODUCT_FIELD_LIST = [
+      'product_name',
+      'brands',
+      'quantity',
+      'ingredients_text',
+      'ingredients',
+      'allergens_tags',
+      'traces_tags',
+      'additives_tags',
+      'ingredients_analysis_tags',
+      'nutriscore_grade',
+      'nova_group',
+      'ecoscore_grade',
+      'nutriments',
+      'serving_size',
+      'serving_quantity',
+      'serving_quantity_unit',
+      'categories_tags',
+      'labels_tags',
+      'packaging_tags',
+      'origins_tags',
+      'countries_tags',
+      'image_url',
+      'completeness',
+      'data_quality_tags',
+    ];
+
+    const FAILED_READ = 'Mirror read failed — reading Open Food Facts live instead';
+
+    let dir: string;
+    const storePath = () => join(dir, 'store.sqlite');
+
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), 'off-mirror-routing-'));
+      initOpenFoodFactsService();
+    });
+
+    afterEach(async () => {
+      await closeMirrorStore();
+      mirrorConfig.mirrorPath = undefined;
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    /**
+     * Builds a completed store from export lines as a sync page writes them (builder, tag ids, one
+     * batch upsert), runs `sql` on it, and points `OFF_MIRROR_PATH` at it. The checkpoint encodes
+     * `AS_OF` unless `checkpoint` is false. `firstLoadRunning` writes the state the sync runner
+     * holds while a store's first full load is still ingesting instead: in progress, with no
+     * completion time and no checkpoint, over rows already stored.
+     */
+    async function writeMirror(
+      lines: Line[],
+      options: { checkpoint?: boolean; sql?: string[]; firstLoadRunning?: boolean } = {},
+    ): Promise<void> {
+      const writer = openMirrorStore(storePath());
+      try {
+        const handle = await writer.raw();
+        const records = lines.map((line) => {
+          const record = buildMirrorRecord(line);
+          if (!record) throw new Error(`Line ${String(line.code)} is not servable`);
+          return record;
+        });
+        if (records.length > 0) {
+          const ids = new TagIds().resolve(handle, new Set(records.flatMap((r) => r.tags)));
+          await writer.applyBatch(
+            records.map((record) => ({
+              code: record.code,
+              popularity_key: record.popularityKey,
+              unique_scans_n: record.uniqueScansN,
+              created_t: record.createdT,
+              last_modified_t: record.lastModifiedT,
+              generation: 1,
+              record_version: 1,
+              tag_ids: JSON.stringify(
+                [...new Set(record.tags.map((key) => ids.get(key) as number))].sort(
+                  (a, b) => a - b,
+                ),
+              ),
+              doc: JSON.stringify(record.doc),
+            })),
+            [],
+          );
+        }
+        for (const statement of options.sql ?? []) handle.exec(statement);
+        await writer.writeState(
+          options.firstLoadRunning
+            ? { status: 'in_progress', startedAt: '2026-11-01T06:30:00.000Z' }
+            : {
+                status: 'complete',
+                completedAt: '2026-11-01T07:00:00.000Z',
+                total: records.length,
+                ...(options.checkpoint !== false && {
+                  checkpoint: encodeCheckpoint({ generation: 1, asOfSeconds: 1_793_514_332 }),
+                }),
+              },
+        );
+      } finally {
+        await writer.close();
+      }
+      mirrorConfig.mirrorPath = storePath();
+    }
+
+    /** Points `OFF_MIRROR_PATH` at a file that is not a SQLite database. */
+    async function writeGarbageStore(): Promise<void> {
+      await writeFile(storePath(), 'not a database '.repeat(512));
+      mirrorConfig.mirrorPath = storePath();
+    }
+
+    /**
+     * Answers as Open Food Facts answered each fixture's captures: the v2 product read cut to the
+     * `fields` it names, and the v3.5 input-sets read; a barcode matches as Product Opener stores
+     * it. Anything else is an HTTP 400, which no retry absorbs. Returns the paths requested.
+     */
+    function stubLive(fixtures: readonly MirrorFixture[]): string[] {
+      const requests: string[] = [];
+      global.fetch = vi.fn(async (input: unknown) => {
+        const url = new URL(String(input));
+        requests.push(url.pathname);
+        const [, api, code] =
+          /^\/api\/(v2|v3\.5)\/product\/(\d+)(?:\.json)?$/.exec(url.pathname) ?? [];
+        const fixture = fixtures.find(
+          (f) => code !== undefined && normalizeCodeZeroes(f.code) === normalizeCodeZeroes(code),
+        );
+        if (fixture && api === 'v2') {
+          const fields = new Set(url.searchParams.get('fields')?.split(','));
+          const product = Object.fromEntries(
+            Object.entries(fixture.live.product).filter(([field]) => fields.has(field)),
+          );
+          return mockResponse({ ...fixture.live, product });
+        }
+        if (fixture?.liveInputSets && api === 'v3.5') {
+          return mockResponse(fixture.liveInputSets.body);
+        }
+        return mockResponse({ status: 0 }, 400);
+      }) as typeof fetch;
+      return requests;
+    }
+
+    /** A fetch that fails the test if anything is requested. */
+    function forbidFetch(): void {
+      global.fetch = vi.fn(async () => {
+        throw new Error('Unexpected request');
+      }) as typeof fetch;
+    }
+
+    /** The warnings `ctx` logged. */
+    function warnings(ctx: ReturnType<typeof createMockContext>) {
+      return (ctx.log as MockContextLogger).calls.filter((call) => call.level === 'warning');
+    }
+
+    /**
+     * `run` with no mirror configured, then from a store built from `mirrored`, both against the
+     * captures of `fixtures`.
+     */
+    async function liveThenMirror(
+      fixtures: readonly MirrorFixture[],
+      mirrored: readonly MirrorFixture[],
+      run: () => Promise<ToolRun>,
+    ) {
+      const liveRequests = stubLive(fixtures);
+      const live = await run();
+      await writeMirror(mirrored.map((f) => f.line));
+      const mirrorRequests = stubLive(fixtures);
+      const mirror = await run();
+      return { live, liveRequests, mirror, mirrorRequests };
+    }
+
+    /**
+     * Where a run says its answer was read: the top-level `source`, `mirror_as_of`, and
+     * `mirror_snapshot` fields present, each compare row's `source` and `mirror_as_of` in row
+     * order, and the text that says it — the `**Source:**` line of the format() block, then every
+     * block after it (the enrichment trailer) verbatim.
+     */
+    type Provenance = {
+      structured: Record<string, unknown>;
+      rows?: Record<string, unknown>[];
+      text: string[];
+    };
+
+    const PROVENANCE_FIELDS = new Set(['source', 'mirror_as_of', 'mirror_snapshot']);
+
+    /** `run` cut into its provenance and everything else, on both surfaces. */
+    function splitProvenance(run: ToolRun) {
+      const { products, ...top } = run.structuredContent as {
+        products?: Record<string, unknown>[];
+        [field: string]: unknown;
+      };
+      const pick = (fields: Record<string, unknown>, keep: boolean) =>
+        Object.fromEntries(
+          Object.entries(fields).filter(([field]) => PROVENANCE_FIELDS.has(field) === keep),
+        );
+      const [formatted = '', ...trailer] = (run.content as { type: string; text?: string }[]).map(
+        (block) => (block.type === 'text' ? (block.text ?? '') : block.type),
+      );
+      const lines = formatted.split('\n');
+      const isSourceLine = (line: string) => line.startsWith('**Source:**');
+      const provenance: Provenance = {
+        structured: pick(top, true),
+        ...(products && { rows: products.map((row) => pick(row, true)) }),
+        text: [...lines.filter(isSourceLine), ...trailer],
+      };
+      return {
+        provenance,
+        rest: {
+          structured: {
+            ...pick(top, false),
+            ...(products && { products: products.map((row) => pick(row, false)) }),
+          },
+          text: lines.filter((line) => !isSourceLine(line)),
+        },
+      };
+    }
+
+    /**
+     * The mirror run answers exactly as the live run does, on both surfaces, apart from where each
+     * says it was read: `expected.live` and `expected.mirror` name that.
+     */
+    function expectSameAnswer(
+      live: ToolRun,
+      mirror: ToolRun,
+      expected: { live: Provenance; mirror: Provenance },
+    ): void {
+      expect(live.isError).toBeFalsy();
+      const liveRun = splitProvenance(live);
+      const mirrorRun = splitProvenance(mirror);
+      expect(liveRun.provenance).toEqual(expected.live);
+      expect(mirrorRun.provenance).toEqual(expected.mirror);
+      expect(mirrorRun.rest).toEqual(liveRun.rest);
+    }
+
+    const LIVE_SOURCE = '**Source:** off_api (Open Food Facts)';
+    const MIRROR_LABEL = `off_mirror (this server's local copy of the Open Food Facts export, as of ${AS_OF})`;
+    const PRODUCT_NOTE = `This product comes from this server's local copy of the Open Food Facts export, current as of ${AS_OF}, not the live database, so an edit made to it since then is not reflected.`;
+    const ROWS_NOTE = `The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, current as of ${AS_OF}, not the live database, so an edit made to them since then is not reflected.`;
+
+    /** Where an off_get_product answer read live, and then from the mirror, says it was read. */
+    const PRODUCT_PROVENANCE = {
+      live: { structured: { source: 'off_api' }, text: [LIVE_SOURCE] },
+      mirror: {
+        structured: { source: 'off_mirror', mirror_as_of: AS_OF, mirror_snapshot: PRODUCT_NOTE },
+        text: [`**Source:** ${MIRROR_LABEL}`, `\n\n**Mirror freshness:** ${PRODUCT_NOTE}`],
+      },
+    };
+
+    describe('product reads', () => {
+      it('opens no store and reads live when OFF_MIRROR_PATH is unset', async () => {
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorReady(ctx)).resolves.toBe(false);
+        const read = await svc.getProduct(OATS, ctx);
+
+        expect(read?.source).toBe('off_api');
+        expect(getMirrorStore()).toBeUndefined();
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+      });
+
+      it('serves a mirrored barcode with no request and no budget slot, its provenance beside the product', async () => {
+        await writeMirror([mirrorFixture(NESQUIK).line]);
+        const budgeted = new OpenFoodFactsService({
+          baseUrl: 'https://world.openfoodfacts.org',
+          rateLimitProduct: 1,
+          rateLimitSearch: 100,
+          rateLimitTaxonomy: 100,
+        });
+        forbidFetch();
+        const ctx = createMockContext();
+
+        await expect(budgeted.mirrorReady(ctx)).resolves.toBe(true);
+        const read = await budgeted.getProduct(NESQUIK, ctx);
+        const subset = await budgeted.getProductFields(NESQUIK, 'brands,product_name', ctx);
+        if (read?.source !== 'off_mirror') throw new Error('Expected a mirror read');
+        const asSold = await budgeted.readStoredAsSold(NESQUIK, ctx, read);
+
+        expect(read.mirrorAsOf).toBe(AS_OF);
+        // The doc stores `code` and `_input_sets`; neither, nor any provenance, is a product field.
+        expect(Object.keys(read.product).filter((f) => !PRODUCT_FIELD_LIST.includes(f))).toEqual(
+          [],
+        );
+        expect(read.product.product_name).toBe('NESQUIK Moins de Sucres');
+        expect(read.storedSets).toHaveLength(3);
+        expect(subset).toMatchObject({ source: 'off_mirror', mirrorAsOf: AS_OF });
+        expect(Object.keys(subset?.product ?? {}).sort()).toEqual(['brands', 'product_name']);
+        expect(asSold.status === 'read' && asSold.nutriments).toMatchObject({
+          'energy-kcal_100g': 327,
+          fat_100g: 5.4,
+          'saturated-fat_100g': 2.2,
+        });
+        expect(global.fetch).not.toHaveBeenCalled();
+        expect(warnings(ctx)).toEqual([]);
+
+        // The one slot is still free: a barcode the mirror lacks is read live.
+        const requests = stubLive([mirrorFixture(BOTH)]);
+        await expect(budgeted.getProduct(BOTH, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        expect(requests).toEqual([`/api/v2/product/${BOTH}.json`]);
+      });
+
+      it.each([
+        [
+          'an as-sold record, asked for without a leading zero',
+          OATS,
+          '030000010402',
+          ['/api/v2/product/030000010402.json'],
+        ],
+        [
+          'an as-sold record per 100 ml',
+          '0008017310112',
+          '0008017310112',
+          ['/api/v2/product/0008017310112.json'],
+        ],
+        [
+          'a record storing as-sold and prepared sets, whose read serves the prepared',
+          BOTH,
+          BOTH,
+          [`/api/v2/product/${BOTH}.json`, `/api/v3.5/product/${BOTH}`],
+        ],
+        [
+          'a prepared-only record, with its stored as-sold set',
+          NESQUIK,
+          NESQUIK,
+          [`/api/v2/product/${NESQUIK}.json`, `/api/v3.5/product/${NESQUIK}`],
+        ],
+      ])(
+        'off_get_product answers %s from the mirror as it does live, sending nothing',
+        async (_label, code, barcode, livePaths) => {
+          const fixture = mirrorFixture(code);
+
+          const runs = await liveThenMirror([fixture], [fixture], () =>
+            runToolContract(offGetProductTool, { barcode }),
+          );
+
+          expect(runs.liveRequests).toEqual(livePaths);
+          expect(runs.mirrorRequests).toEqual([]);
+          expect(runs.mirror.structuredContent).toMatchObject({
+            barcode,
+            product: { product_name: fixture.live.product.product_name },
+          });
+          expectSameAnswer(runs.live, runs.mirror, PRODUCT_PROVENANCE);
+        },
+      );
+
+      it('off_get_product serves the stored as-sold set of a mirrored prepared-only record', async () => {
+        await writeMirror([mirrorFixture(NESQUIK).line]);
+        forbidFetch();
+
+        const result = await runToolContract(offGetProductTool, { barcode: NESQUIK });
+
+        expect(result.structuredContent).toMatchObject({
+          product: {
+            nutriments: {
+              energy_kcal_100g: 327,
+              fat_100g: 5.4,
+              stored_as_sold: { status: 'read' },
+            },
+          },
+          source: 'off_mirror',
+          mirror_as_of: AS_OF,
+          mirror_snapshot: PRODUCT_NOTE,
+        });
+        const text = JSON.stringify(result.content);
+        expect(text).toContain('**As-sold nutrition (stored set: read):**');
+        expect(text).toContain(`**Source:** ${MIRROR_LABEL}`);
+        expect(text).toContain(`**Mirror freshness:** ${PRODUCT_NOTE}`);
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('off_compare_products answers mirrored rows as it does live, reading only the barcode the mirror lacks', async () => {
+        const fixtures = [OATS, NESQUIK, BOTH].map(mirrorFixture);
+
+        const runs = await liveThenMirror(fixtures, fixtures.slice(0, 2), () =>
+          runToolContract(offCompareProductsTool, { barcodes: ['030000010402', NESQUIK, BOTH] }),
+        );
+
+        expect([...runs.liveRequests].sort()).toEqual(
+          [
+            '/api/v2/product/030000010402.json',
+            `/api/v2/product/${NESQUIK}.json`,
+            `/api/v2/product/${BOTH}.json`,
+            `/api/v3.5/product/${NESQUIK}`,
+            `/api/v3.5/product/${BOTH}`,
+          ].sort(),
+        );
+        expect(runs.mirrorRequests).toEqual([
+          `/api/v2/product/${BOTH}.json`,
+          `/api/v3.5/product/${BOTH}`,
+        ]);
+        // Each row names its own read: the two the mirror holds, and the one it lacks read live.
+        const live = { source: 'off_api' };
+        const mirrored = { source: 'off_mirror', mirror_as_of: AS_OF };
+        expectSameAnswer(runs.live, runs.mirror, {
+          live: { structured: {}, rows: [live, live, live], text: [LIVE_SOURCE] },
+          mirror: {
+            structured: { mirror_snapshot: ROWS_NOTE },
+            rows: [mirrored, mirrored, live],
+            text: [
+              `**Source:** ${MIRROR_LABEL} for 030000010402, ${NESQUIK}; off_api (Open Food Facts) for ${BOTH}`,
+              `\n\n**Mirror freshness:** ${ROWS_NOTE}`,
+            ],
+          },
+        });
+      });
+
+      it('reads a barcode the mirror lacks live, without a warning', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        const requests = stubLive([mirrorFixture(BOTH)]);
+        const ctx = createMockContext();
+
+        await expect(svc.getProduct(BOTH, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        expect(requests).toEqual([`/api/v2/product/${BOTH}.json`]);
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('reads a field subset the mirror does not hold live, even for a mirrored barcode', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        const requests = stubLive([mirrorFixture(OATS)]);
+
+        const read = await svc.getProductFields(
+          OATS,
+          'product_name,last_modified_t',
+          createMockContext(),
+        );
+
+        expect(read).toEqual({
+          source: 'off_api',
+          product: {
+            product_name: 'Old Fashioned Oats',
+            last_modified_t: mirrorFixture(OATS).live.product.last_modified_t,
+          },
+        });
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+      });
+
+      it.each<[string, () => Promise<void>, Record<string, unknown>]>([
+        ['a file that is not a SQLite database', writeGarbageStore, {}],
+        [
+          'a store whose products table lost its doc column',
+          () =>
+            writeMirror([mirrorFixture(OATS).line], {
+              sql: ['ALTER TABLE products RENAME COLUMN doc TO doc_gone'],
+            }),
+          {},
+        ],
+        [
+          'a ready store that records no as-of time',
+          () => writeMirror([mirrorFixture(OATS).line], { checkpoint: false }),
+          { message: 'The mirror is ready but records no as-of time.' },
+        ],
+      ])('reads live past %s, logging the store error', async (_label, build, logged) => {
+        await build();
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: expect.objectContaining({ operation: 'product read', ...logged }),
+          },
+        ]);
+      });
+
+      it('logs a stored document that is not JSON by its error name alone, never its text', async () => {
+        await writeMirror([mirrorFixture(OATS).line], {
+          sql: [`UPDATE products SET doc = '{"product_name": Leaked-label-text}'`],
+        });
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+        // Node's JSON.parse message quotes the text it failed on ("Leaked-lab"…).
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: { operation: 'product read', error: 'SyntaxError' },
+          },
+        ]);
+      });
+
+      it('reads live from a completed load of zero products, which is not ready', async () => {
+        await writeMirror([]);
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorReady(ctx)).resolves.toBe(false);
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('reads live while the first full load is still running, over rows it has stored', async () => {
+        await writeMirror([mirrorFixture(OATS).line], { firstLoadRunning: true });
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        // The barcode is stored: only the unfinished load keeps it from being served.
+        await expect(getMirrorStore()?.count()).resolves.toBe(1);
+        await expect(svc.mirrorReady(ctx)).resolves.toBe(false);
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('answers mirrorReady false on a store error, logging it', async () => {
+        await writeGarbageStore();
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorReady(ctx)).resolves.toBe(false);
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: expect.objectContaining({ operation: 'readiness check' }),
+          },
+        ]);
+      });
+
+      it('reads live past a sync write lock its store open meets, logging it, and opens the store on the next read', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        // A sync process mid-transaction, as a page upsert or a sort index build holds it.
+        const sync = openMirrorStore(storePath());
+        const syncHandle = await sync.raw();
+        syncHandle.exec('BEGIN IMMEDIATE');
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        try {
+          await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        } finally {
+          syncHandle.exec('ROLLBACK');
+          await sync.close();
+        }
+
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: {
+              operation: 'product read',
+              error: 'McpError',
+              code: JsonRpcErrorCode.DatabaseError,
+              message: 'Failed to initialize mirror store "store.sqlite".',
+            },
+          },
+        ]);
+        forbidFetch();
+        await expect(svc.getProduct(OATS, createMockContext())).resolves.toMatchObject({
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+        });
+      });
+
+      it('reads live, creating no store or directory, while OFF_MIRROR_PATH names no file, and serves the store once one is built there', async () => {
+        const unmounted = join(dir, 'unmounted');
+        mirrorConfig.mirrorPath = join(unmounted, 'store.sqlite');
+        const requests = stubLive([mirrorFixture(OATS)]);
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorReady(ctx)).resolves.toBe(false);
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        expect(existsSync(unmounted)).toBe(false);
+
+        mirrorConfig.mirrorPath = storePath();
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({ source: 'off_api' });
+        expect(existsSync(storePath())).toBe(false);
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`, `/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([]);
+
+        await writeMirror([mirrorFixture(OATS).line]);
+        forbidFetch();
+        await expect(svc.getProduct(OATS, ctx)).resolves.toMatchObject({
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+        });
+      });
+    });
+
+    describe('stored as-sold sets', () => {
+      it('settles a mirrored prepared-only record that stores no sets as none, with no request', async () => {
+        await writeMirror([mirrorFixture(NESQUIK).line], {
+          sql: [`UPDATE products SET doc = json_remove(doc, '$._input_sets')`],
+        });
+        forbidFetch();
+        const ctx = createMockContext();
+
+        const read = await svc.getProduct(NESQUIK, ctx);
+        if (read?.source !== 'off_mirror') throw new Error('Expected a mirror read');
+
+        expect(read.storedSets).toBeUndefined();
+        await expect(svc.readStoredAsSold(NESQUIK, ctx, read)).resolves.toEqual({ status: 'none' });
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('reads a live read of a mirrored barcode from API v3.5, never from the stored sets', async () => {
+        const fixture = mirrorFixture(NESQUIK);
+        await writeMirror([fixture.line]);
+        // The live record has moved on: its as-sold set now says 999 kcal, the mirror's 327.
+        const moved = structuredClone(fixture);
+        for (const set of moved.liveInputSets?.body.product.nutrition.input_sets ?? []) {
+          const kcal = set.nutrients['energy-kcal'];
+          if (set.preparation === 'as_sold' && set.source !== 'estimate' && kcal) kcal.value = 999;
+        }
+        const requests = stubLive([moved]);
+        const ctx = createMockContext();
+
+        // A field the mirror does not hold sends the read of this mirrored barcode live.
+        const read = await svc.getProductFields(NESQUIK, 'nutriments,last_modified_t', ctx);
+        if (read?.source !== 'off_api') throw new Error('Expected a live read');
+        const asSold = await svc.readStoredAsSold(NESQUIK, ctx, read);
+
+        expect(asSold.status === 'read' && asSold.nutriments['energy-kcal_100g']).toBe(999);
+        expect(requests).toEqual([
+          `/api/v2/product/${NESQUIK}.json`,
+          `/api/v3.5/product/${NESQUIK}`,
+        ]);
+      });
+
+      it('reads a record whose stored sets are not a list live, product and as-sold set alike', async () => {
+        await writeMirror([mirrorFixture(NESQUIK).line], {
+          sql: [`UPDATE products SET doc = json_set(doc, '$._input_sets', json('{}'))`],
+        });
+        const requests = stubLive([mirrorFixture(NESQUIK)]);
+        const ctx = createMockContext();
+
+        const read = await svc.getProduct(NESQUIK, ctx);
+        if (read?.source !== 'off_api') throw new Error('Expected a live read');
+        const asSold = await svc.readStoredAsSold(NESQUIK, ctx, read);
+
+        expect(asSold.status === 'read' && asSold.nutriments['energy-kcal_100g']).toBe(327);
+        expect(requests).toEqual([
+          `/api/v2/product/${NESQUIK}.json`,
+          `/api/v3.5/product/${NESQUIK}`,
+        ]);
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: expect.objectContaining({
+              operation: 'product read',
+              message: 'The stored nutrition sets of this record are not a list.',
+            }),
+          },
+        ]);
+      });
+    });
+
+    describe('tag-only searches', () => {
+      const NOVA_4 = 'en:4-ultra-processed-food-and-drink-products';
+
+      /** A synthetic schema 1004 export line; a popularity left out is one the record lacks. */
+      function taggedLine(
+        code: string,
+        popularity: number | null,
+        tags: Record<string, string[]>,
+      ): Line {
+        return {
+          code,
+          schema_version: 1004,
+          lc: 'en',
+          product_name: `Product ${code}`,
+          quantity: '100 g',
+          ...(popularity !== null && { popularity_key: popularity }),
+          ...Object.fromEntries(
+            Object.entries(tags).map(([facet, values]) => [`${facet}_tags`, values]),
+          ),
+        };
+      }
+
+      const organic = (
+        code: string,
+        popularity: number | null,
+        tags: Record<string, string[]> = {},
+      ) =>
+        taggedLine(code, popularity, { ...tags, labels: ['en:organic', ...(tags.labels ?? [])] });
+
+      /** Twelve organic products and one other; nulls and a tie exercise the default order. */
+      const CORPUS: Line[] = [
+        organic('20000001', 50, { nova_groups: [NOVA_4] }),
+        organic('20000002', 90, { allergens: ['en:milk'] }),
+        organic('20000003', null, { labels: ['en:fair-trade'] }),
+        organic('20000004', 70, { labels: ['en:fair-trade'] }),
+        organic('20000005', 70),
+        organic('20000006', 10),
+        organic('20000007', 80, { allergens: ['en:milk', 'en:nuts'] }),
+        organic('20000008', null),
+        organic('20000009', 60, { labels: ['en:fair-trade'] }),
+        organic('20000010', 40, { nova_groups: [NOVA_4] }),
+        organic('20000011', 30, { brands: ['xx:nutella'] }),
+        organic('20000012', 20, { brands: ['xx:nutella'] }),
+        taggedLine('30000001', 100, { brands: ['xx:nutella'], labels: ['en:vegan'] }),
+      ];
+
+      /** The organic products by popularity, highest first, missing last, then by barcode. */
+      const ORGANIC_ORDER = [
+        '20000002',
+        '20000007',
+        '20000004',
+        '20000005',
+        '20000009',
+        '20000001',
+        '20000010',
+        '20000011',
+        '20000012',
+        '20000006',
+        '20000003',
+        '20000008',
+      ];
+
+      const codes = (outcome: SearchOutcome) => served(outcome).products.map((row) => row.code);
+
+      beforeEach(async () => {
+        await writeMirror(CORPUS);
+        forbidFetch();
+      });
+
+      it('serves page 11 with the exact total and the stored rows cut to the summary fields', async () => {
+        const outcome = await svc.searchProducts(
+          { labels_tag: 'en:organic', page: 11, page_size: 1, tags_confirmed: true },
+          createMockContext(),
+        );
+
+        expect(outcome).toEqual({
+          status: 'served',
+          count: 12,
+          count_is_exact: true,
+          page: 11,
+          page_count: 1,
+          page_size: 1,
+          products: [{ code: '20000003', product_name: 'Product 20000003' }],
+          dropped: 0,
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+        });
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('orders by popularity, missing values last and ties by barcode, across pages', async () => {
+        const ctx = createMockContext();
+        const page = (n: number) =>
+          svc.searchProducts(
+            { labels_tag: 'en:organic', page: n, page_size: 5, tags_confirmed: true },
+            ctx,
+          );
+
+        expect([...codes(await page(1)), ...codes(await page(2)), ...codes(await page(3))]).toEqual(
+          ORGANIC_ORDER,
+        );
+      });
+
+      it('answers a page past the last, and a tag nothing carries, with no rows and their totals', async () => {
+        const ctx = createMockContext();
+
+        const past = served(
+          await svc.searchProducts(
+            { labels_tag: 'en:organic', page: 13, page_size: 1, tags_confirmed: true },
+            ctx,
+          ),
+        );
+        const none = served(
+          await svc.searchProducts({ labels_tag: 'en:kosher', tags_confirmed: true }, ctx),
+        );
+
+        expect(past).toMatchObject({ count: 12, page: 13, page_count: 0, products: [] });
+        expect(none).toMatchObject({ count: 0, count_is_exact: true, page: 1, products: [] });
+      });
+
+      describe('the result window', () => {
+        beforeEach(() => {
+          vi.mocked(searchByTags).mockClear();
+        });
+
+        // page * page_size at exactly 10,000 is served and the next page is not, at the default
+        // page_size of 20 too; page_size 3 reaches 9,999 at page 3,333, so the bound is on the
+        // product, never a rounded page count.
+        const BOUNDARIES: [string, ProductSearch, ProductSearch][] = [
+          ['page_size 50', { page: 200, page_size: 50 }, { page: 201, page_size: 50 }],
+          ['page_size 1', { page: 10_000, page_size: 1 }, { page: 10_001, page_size: 1 }],
+          ['page_size 3', { page: 3_333, page_size: 3 }, { page: 3_334, page_size: 3 }],
+          ['the default page_size', { page: 500 }, { page: 501 }],
+        ];
+
+        it.each(BOUNDARIES)(
+          'serves the last page inside the window at %s from the store',
+          async (_label, inside) => {
+            const outcome = served(
+              await svc.searchProducts(
+                { labels_tag: 'en:organic', ...inside, tags_confirmed: true },
+                createMockContext(),
+              ),
+            );
+
+            expect(outcome).toMatchObject({
+              count: 12,
+              page: inside.page,
+              products: [],
+              source: 'off_mirror',
+            });
+            expect(searchByTags).toHaveBeenCalledOnce();
+            expect(global.fetch).not.toHaveBeenCalled();
+          },
+        );
+
+        it.each(BOUNDARIES)(
+          'refuses the next page at %s without running the search',
+          async (_label, _inside, past) => {
+            const ctx = createMockContext();
+
+            const outcome = await svc.searchProducts(
+              { labels_tag: 'en:organic', ...past, tags_confirmed: true },
+              ctx,
+            );
+
+            expect(outcome).toEqual({ status: 'page_out_of_range', bound: 'mirror_window' });
+            expect(searchByTags).not.toHaveBeenCalled();
+            expect(global.fetch).not.toHaveBeenCalled();
+            expect(warnings(ctx)).toEqual([]);
+          },
+        );
+      });
+
+      it.each<[string, ProductSearch, string[], number]>([
+        [
+          'an allergen exclusion',
+          { labels_tag: 'en:organic', exclude_allergens: ['en:milk'], page_size: 3 },
+          ['20000004', '20000005', '20000009'],
+          10,
+        ],
+        [
+          'two labels, both required',
+          { labels_tag: ['en:organic', 'en:fair-trade'] },
+          ['20000004', '20000009', '20000003'],
+          3,
+        ],
+        [
+          'NOVA group 4, as its stored taxonomy id',
+          { nova_group: '4' },
+          ['20000001', '20000010'],
+          2,
+        ],
+      ])('filters on %s', async (_label, params, expected, total) => {
+        const outcome = served(
+          await svc.searchProducts({ ...params, tags_confirmed: true }, createMockContext()),
+        );
+
+        expect(outcome.products.map((row) => row.code)).toEqual(expected);
+        expect(outcome.count).toBe(total);
+        expect(outcome.source).toBe('off_mirror');
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('finds a brand by the value off_search_products canonicalizes "Nutella" to', async () => {
+        initTaxonomyService();
+        const brand = await getTaxonomyService().canonicalizeTag(
+          'brands',
+          'Nutella',
+          createMockContext(),
+        );
+
+        const outcome = await svc.searchProducts(
+          { brands_tag: brand.value, tags_confirmed: true },
+          createMockContext(),
+        );
+
+        expect(codes(outcome)).toEqual(['30000001', '20000011', '20000012']);
+      });
+    });
+
+    describe('searches read live', () => {
+      it('reads a tag-only search without tags_confirmed live, beside a ready mirror', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_HITS));
+
+        const outcome = served(
+          await svc.searchProducts({ labels_tag: 'en:organic', page: 11 }, createMockContext()),
+        );
+
+        expect(outcome.source).toBe('off_api');
+        expect(new URL(String(vi.mocked(global.fetch).mock.calls[0]?.[0])).pathname).toBe(
+          '/api/v2/search',
+        );
+      });
+
+      it.each<[string, ProductSearch]>([
+        ['a query', { query: 'oats', labels_tag: 'en:organic' }],
+        [
+          'nutrient filters',
+          {
+            labels_tag: 'en:organic',
+            nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 5 }],
+          },
+        ],
+      ])(
+        'reads a search carrying %s from the text index, whatever tags_confirmed says',
+        async (_label, params) => {
+          await writeMirror([mirrorFixture(OATS).line]);
+          global.fetch = vi.fn().mockResolvedValue(mockResponse(TEXT_SEARCH_HITS));
+
+          const outcome = served(
+            await svc.searchProducts({ ...params, tags_confirmed: true }, createMockContext()),
+          );
+
+          expect(outcome.source).toBe('off_api');
+          expect(sentRequest().url).toBe(TEXT_SEARCH_URL);
+        },
+      );
+
+      /** A store whose first full load has stored rows and is still running. */
+      const writeRunningFirstLoad = () =>
+        writeMirror([mirrorFixture(OATS).line], { firstLoadRunning: true });
+
+      it.each<[string, () => Promise<void>, number, ProductSearch]>([
+        ['no mirror configured', async () => undefined, 0, { page: 11 }],
+        ['a store error', writeGarbageStore, 1, { page: 11 }],
+        ['a first load still running', writeRunningFirstLoad, 0, { page: 11 }],
+        // Past the mirror's window too: with no mirror to serve it, the live bound decides.
+        ['no mirror configured', async () => undefined, 0, { page: 201, page_size: 50 }],
+        ['a store error', writeGarbageStore, 1, { page: 201, page_size: 50 }],
+        ['a first load still running', writeRunningFirstLoad, 0, { page: 201, page_size: 50 }],
+      ])(
+        'refuses a tags_confirmed page past 10 with %s by the live bound, sending nothing (%#)',
+        async (_label, build, logged, paging) => {
+          await build();
+          forbidFetch();
+          const ctx = createMockContext();
+
+          const outcome = await svc.searchProducts(
+            { labels_tag: 'en:organic', ...paging, tags_confirmed: true },
+            ctx,
+          );
+
+          expect(outcome).toEqual({ status: 'page_out_of_range', bound: 'live_max_page' });
+          expect(global.fetch).not.toHaveBeenCalled();
+          expect(warnings(ctx)).toHaveLength(logged);
+        },
+      );
+
+      it('refuses a tags_confirmed page past the window by the live bound when the store holds no completed sync', async () => {
+        const writer = openMirrorStore(storePath());
+        await writer.raw();
+        await writer.close();
+        mirrorConfig.mirrorPath = storePath();
+        forbidFetch();
+        const ctx = createMockContext();
+
+        const outcome = await svc.searchProducts(
+          { labels_tag: 'en:organic', page: 201, page_size: 50, tags_confirmed: true },
+          ctx,
+        );
+
+        expect(outcome).toEqual({ status: 'page_out_of_range', bound: 'live_max_page' });
+        expect(global.fetch).not.toHaveBeenCalled();
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('reads a tags_confirmed search within the live ceiling live on a store error', async () => {
+        await writeGarbageStore();
+        global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_HITS));
+        const ctx = createMockContext();
+
+        const outcome = served(
+          await svc.searchProducts(
+            { labels_tag: 'en:organic', page: 3, tags_confirmed: true },
+            ctx,
+          ),
+        );
+
+        expect(outcome.source).toBe('off_api');
+        expect(global.fetch).toHaveBeenCalledOnce();
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: expect.objectContaining({ operation: 'tag search' }),
+          },
+        ]);
+      });
+
+      it('reads a tags_confirmed search within the live ceiling live while the first full load runs', async () => {
+        await writeRunningFirstLoad();
+        global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_HITS));
+        const ctx = createMockContext();
+
+        const outcome = served(
+          await svc.searchProducts(
+            { labels_tag: 'en:organic', page: 3, tags_confirmed: true },
+            ctx,
+          ),
+        );
+
+        expect(outcome.source).toBe('off_api');
+        expect(global.fetch).toHaveBeenCalledOnce();
+        expect(new URL(sentRequest().url).pathname).toBe('/api/v2/search');
+        expect(warnings(ctx)).toEqual([]);
+      });
+    });
+
+    describe('cancellation', () => {
+      /** Aborts `controller` the first time the serving store reads its sync state. */
+      function abortOnReadState(controller: AbortController, failToo: boolean): void {
+        const store = getMirrorStore();
+        if (!store) throw new Error('Expected a configured mirror');
+        const readState = store.readState.bind(store);
+        vi.spyOn(store, 'readState').mockImplementation(async () => {
+          controller.abort();
+          if (failToo) throw new Error('disk gone');
+          return readState();
+        });
+      }
+
+      it.each([
+        ['while it serves', false],
+        ['as it fails', true],
+      ])(
+        'rethrows a caller abort raised during the mirror read %s, reading nothing live',
+        async (_label, failToo) => {
+          await writeMirror([mirrorFixture(OATS).line]);
+          forbidFetch();
+          const controller = new AbortController();
+          abortOnReadState(controller, failToo);
+          const ctx = createMockContext({ signal: controller.signal });
+
+          await expect(svc.getProduct(OATS, ctx)).rejects.toBe(controller.signal.reason);
+          expect(global.fetch).not.toHaveBeenCalled();
+          expect(warnings(ctx)).toEqual([]);
+        },
+      );
+
+      it('rethrows a caller abort raised during the readiness check', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        const controller = new AbortController();
+        abortOnReadState(controller, false);
+
+        await expect(
+          svc.mirrorReady(createMockContext({ signal: controller.signal })),
+        ).rejects.toBe(controller.signal.reason);
+      });
+
+      it('ends a read the mirror lacks as RequestCancelled when the caller aborts it live', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        const controller = new AbortController();
+        global.fetch = vi.fn(
+          (_input: unknown, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              const signal = init?.signal as AbortSignal;
+              signal.addEventListener('abort', () => reject(signal.reason));
+              controller.abort();
+            }),
+        ) as typeof fetch;
+
+        const error = await captureError(
+          svc.getProduct(BOTH, createMockContext({ signal: controller.signal })),
+        );
+
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        expect(global.fetch).toHaveBeenCalledOnce();
       });
     });
   });

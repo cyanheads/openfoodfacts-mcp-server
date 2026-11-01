@@ -89,7 +89,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .string()
       .optional()
       .describe(
-        `Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, that the live vocabulary could not be reached or gave no usable answer, that nothing matched and why, or that the limit cut matches, naming how many matched and the next call: a larger limit while one would list more, otherwise a narrower term, which is the only route past the first ${TAXONOMY_LIMIT_CAP} (a limit above ${TAXONOMY_LIMIT_CAP} is named too).`,
+        `Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, that the live vocabulary went unchecked and why (unreachable or no usable answer, Open Food Facts rate-limiting this server, or this server's own taxonomy budget spent, with the wait in seconds when one is known), that nothing matched and why, or that the limit cut matches, naming how many matched and the next call: a larger limit while one would list more, otherwise a narrower term, which is the only route past the first ${TAXONOMY_LIMIT_CAP} (a limit above ${TAXONOMY_LIMIT_CAP} is named too).`,
       ),
     truncated: z.boolean().optional().describe('True when more tags exist beyond the limit.'),
     shown: z.number().optional().describe('Number of tags returned.'),

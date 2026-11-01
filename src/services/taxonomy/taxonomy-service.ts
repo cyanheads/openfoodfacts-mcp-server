@@ -7,8 +7,13 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  BudgetExhaustedError,
+  getOpenFoodFactsService,
+  TAXONOMY_RETRY_DEADLINE_MS,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
 
 export type TaxonomyEntry = {
   id: string;
@@ -362,23 +367,79 @@ function rankExactTagFirst(live: TaxonomyEntry[], term: string): TaxonomyEntry[]
 export type TagFacet = LiveFacet | 'brands';
 
 /**
+ * Why a live lookup settled nothing, and the wait in whole seconds when one is known.
+ *
+ * - `budget_spent` — this server's own taxonomy budget refused the lookup, so nothing was sent;
+ *   `retryAfter` is the time until the budget frees a slot.
+ * - `rate_limited` — Open Food Facts answered 429; `retryAfter` is its `Retry-After`, when it sent
+ *   one that reads.
+ * - `unavailable` — anything else: unreachable, a 5xx, a timeout, a malformed or timed-out answer,
+ *   a refusal, or a lookup deadline that ran out.
+ */
+export type LookupFailure =
+  | { cause: 'budget_spent'; retryAfter: number }
+  | { cause: 'rate_limited'; retryAfter?: number }
+  | { cause: 'unavailable' };
+
+/**
  * The value to quote into an exact tag clause, and how it was arrived at.
  *
  * - `vocabulary` — an Open Food Facts tag has exactly this ID: the offline sample or the live
  *   autocomplete confirmed it.
  * - `normalized` — only local normalization was applied, and `reason` says why nothing confirmed
  *   it: the facet has no vocabulary to check (`no_vocabulary`, brands), the vocabulary answered
- *   with no exact entry (`no_match`), or it could not be consulted — a failed lookup or a spent
- *   taxonomy budget (`lookup_failed`). A caller that must not send an unconfirmed value (an
- *   exclusion, which a wrong value turns into a silent no-op) refuses anything but `vocabulary`.
+ *   with no exact entry (`no_match`), or it could not be consulted (`lookup_failed`, with its
+ *   `LookupFailure`). A caller that must not send an unconfirmed value (an exclusion, which a
+ *   wrong value turns into a silent no-op) refuses anything but `vocabulary`.
  */
 export type CanonicalTag =
   | { value: string; resolution: 'vocabulary' }
-  | {
-      value: string;
-      resolution: 'normalized';
-      reason: 'no_vocabulary' | 'no_match' | 'lookup_failed';
-    };
+  | { value: string; resolution: 'normalized'; reason: 'no_vocabulary' | 'no_match' }
+  | ({ value: string; resolution: 'normalized'; reason: 'lookup_failed' } & LookupFailure);
+
+/**
+ * Classifies a failed live lookup. Only the budget refusal's type tells it apart from an upstream
+ * 429: both arrive as the declared `rate_limited` failure. A budget refusal always carries its
+ * wait, as the seconds until a slot frees; an upstream 429 carries one only when Open Food Facts
+ * sent a readable `Retry-After`.
+ */
+function lookupFailure(error: unknown): LookupFailure {
+  if (error instanceof BudgetExhaustedError) {
+    return { cause: 'budget_spent', retryAfter: error.retryAfter };
+  }
+  if (error instanceof McpError && error.data?.reason === 'rate_limited') {
+    const retryAfter = error.data.retryAfter;
+    return typeof retryAfter === 'number'
+      ? { cause: 'rate_limited', retryAfter }
+      : { cause: 'rate_limited' };
+  }
+  return { cause: 'unavailable' };
+}
+
+/**
+ * The notice for a search answered from the offline sample because the live lookup failed. Only an
+ * unavailable vocabulary is blamed on the vocabulary, with the failure's own message: a spent
+ * budget sent nothing, and a 429 is a limit to wait out. Each names its wait when one is known.
+ */
+function fallbackNotice(
+  failure: LookupFailure,
+  facet: string,
+  message: string,
+  sample: string,
+): string {
+  switch (failure.cause) {
+    case 'budget_spent':
+      return `This server's own per-minute taxonomy budget is spent, so nothing was sent to Open Food Facts and the live ${facet} vocabulary went unchecked. ${sample} A lookup slot frees in about ${failure.retryAfter} s; retry then for an authoritative answer.`;
+    case 'rate_limited':
+      return `Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429), so the live ${facet} vocabulary went unchecked. ${sample} ${failure.retryAfter === undefined ? 'Retry in about a minute for an authoritative answer.' : `Open Food Facts asked for a wait of ${failure.retryAfter} s; retry then for an authoritative answer.`}`;
+    case 'unavailable':
+      return `The live Open Food Facts ${facet} vocabulary could not be reached or gave no usable answer (${message}). ${sample} Retry for an authoritative answer.`;
+    default: {
+      const unhandled: never = failure;
+      throw new Error(`Unhandled lookup failure: ${JSON.stringify(unhandled)}`);
+    }
+  }
+}
 
 /**
  * Characters Product Opener turns into `-` when it builds a tag ID from text
@@ -434,6 +495,30 @@ function comparableName(text: string): string {
 }
 
 /**
+ * A taxonomy value the offline sample did not confirm, as the live lookup needs it: the trimmed
+ * input, its normalized tag ID, the autocomplete term, and the ID-or-name match of the accept rule.
+ */
+type LiveLookupValue = {
+  trimmed: string;
+  normalized: string;
+  term: string;
+  isMatch: (entry: TaxonomyEntry) => boolean;
+};
+
+/**
+ * A shared lookup as one caller that joined it waits on it: its answer, or that caller's own
+ * cancellation the moment it lands. The lookup itself runs on for the callers still waiting.
+ */
+function untilCancelled<T>(lookup: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const cancel = () => reject(signal.reason);
+    signal.addEventListener('abort', cancel, { once: true });
+    lookup.then(resolve, reject).finally(() => signal.removeEventListener('abort', cancel));
+  });
+}
+
+/**
  * Most resolutions kept in process. Keys are caller-supplied values, so the cache is bounded and
  * evicts oldest-first; at a few dozen bytes an entry the bound costs nothing.
  */
@@ -456,8 +541,10 @@ export type TaxonomySearchResult = {
   matched_in_facet: number;
   /**
    * Agent-facing caveat about how this answer was produced — that the vocabulary listed is the
-   * offline sample, that the live vocabulary could not be reached or gave no usable answer, or that
-   * nothing matched. Absent when the live resolution answered normally.
+   * offline sample, that the live vocabulary went unchecked and why (unreachable or no usable
+   * answer, Open Food Facts rate-limiting this server, or this server's own taxonomy budget spent,
+   * with the wait when one is known), or that nothing matched. Absent when the live resolution
+   * answered normally.
    */
   notice?: string;
 };
@@ -471,26 +558,36 @@ export class TaxonomyService {
   constructor(private readonly off: OpenFoodFactsService) {}
 
   /**
-   * Canonicalize one tag value before it is quoted into an exact tag clause. Brands are slugged.
-   * A taxonomy value is confirmed against the offline sample first, then the live autocomplete,
-   * accepting only an entry whose ID equals the normalized value, whose name equals the value
-   * with its language prefix stripped (compared case-insensitively, hyphens read as spaces), or —
+   * Canonicalize one tag value before it is quoted into an exact tag clause. Brands are slugged,
+   * after any language prefix is dropped: Product Opener matches `brands_tags=xx:nutella` and
+   * `=en:nutella` as it matches `=nutella`, and slugging the prefix would turn its colon into part
+   * of the slug (`xx-nutella`), which no brand carries. A taxonomy value is confirmed against the
+   * offline sample first, then the live autocomplete, accepting only an entry whose ID equals the
+   * normalized value, whose name equals the value with its language prefix stripped (compared
+   * case-insensitively, hyphens read as spaces), or —
    * live only — whose ID is the normalized value plus `s` or `es`. So a synonym (`US` →
    * `en:united-states`) or singular (`en:peanut` → `en:peanuts`, `en:nut` → `en:nuts`) resolves,
    * and a prefix or partial match never does (`nutell` is not `nutella`, `US` is not `USSR`).
    *
    * Throws only when the caller cancels (`ctx.signal` aborted), so a cancellation ends the call
    * rather than reading as a failed lookup. Anything nothing confirms comes back normalized the way
-   * Product Opener would store it, with the reason. Settled answers are cached in process per facet
+   * Product Opener would store it, with the reason, and a failed lookup with its cause and any known
+   * wait (see `LookupFailure`). Settled answers are cached in process per facet
    * and value, bounded at `MAX_CANONICAL_CACHE_ENTRIES`; a failed lookup is not, so the next search
    * retries it.
-   * Concurrent calls for one value share a single lookup. A live lookup spends the taxonomy
-   * budget, not the search budget.
+   * Concurrent calls for one value share a single lookup, and each call's lookup ends within
+   * `TAXONOMY_RETRY_DEADLINE_MS` of the call, a restarted one included. A live lookup spends the
+   * taxonomy budget, not the search budget.
    */
   async canonicalizeTag(facet: TagFacet, value: string, ctx: Context): Promise<CanonicalTag> {
+    const deadlineAt = Date.now() + TAXONOMY_RETRY_DEADLINE_MS;
     const trimmed = value.trim();
     if (facet === 'brands') {
-      return { value: slugTagValue(trimmed), resolution: 'normalized', reason: 'no_vocabulary' };
+      return {
+        value: slugTagValue(trimmed.replace(LANGUAGE_PREFIX, '')),
+        resolution: 'normalized',
+        reason: 'no_vocabulary',
+      };
     }
 
     const normalized = normalizeTaxonomyValue(trimmed);
@@ -502,24 +599,61 @@ export class TaxonomyService {
     const offline = TAXONOMY[facet].find(isMatch);
     if (offline) return { value: offline.id, resolution: 'vocabulary' };
 
-    const cacheKey = `${facet}\u0000${normalized}`;
+    return await this.lookUp(
+      facet,
+      { trimmed, normalized, term, isMatch },
+      `${facet}\u0000${normalized}`,
+      deadlineAt,
+      ctx,
+    );
+  }
+
+  /**
+   * The cache, the shared lookup, and the live lookup of `canonicalizeTag`, for a value the
+   * offline sample did not confirm. `deadlineAt` is when the caller's lookup budget runs out.
+   */
+  private async lookUp(
+    facet: LiveFacet,
+    value: LiveLookupValue,
+    cacheKey: string,
+    deadlineAt: number,
+    ctx: Context,
+  ): Promise<CanonicalTag> {
     const cached = this.canonicalCache.get(cacheKey);
     if (cached) return cached;
 
-    // Concurrent calls for one value — an inclusion and an exclusion of the same allergen in one
-    // search — share the lookup in flight. The entry leaves the map once the lookup settles, so a
-    // failed one is retried by the next call just as an uncached one is. A shared lookup rejects
-    // only when the caller that started it was cancelled; a joiner still waiting starts over, so
-    // the first one back owns the replacement lookup and the rest join it.
+    /**
+     * Concurrent calls for one value — an inclusion and an exclusion of the same allergen in one
+     * search — share the lookup in flight. The entry leaves the map once the lookup settles, so a
+     * failed one is retried by the next call just as an uncached one is. A shared lookup rejects
+     * only when the caller that started it was cancelled; a joiner still waiting starts over with
+     * what is left of its own budget, so the first one back owns the replacement lookup and the
+     * rest join it. Joiners resume in the order they joined, so the owner of any lookup is the
+     * earliest caller still waiting, and its budget never outlasts a joiner's. A joiner that is
+     * itself cancelled ends at once, never waiting on the lookup or reading its answer.
+     */
     const inFlight = this.inFlightLookups.get(cacheKey);
     if (inFlight) {
-      return inFlight.catch((error: unknown) => {
+      return untilCancelled(inFlight, ctx.signal).catch((error: unknown) => {
         if (ctx.signal.aborted) throw error;
         if (this.inFlightLookups.get(cacheKey) === inFlight) this.inFlightLookups.delete(cacheKey);
-        return this.canonicalizeTag(facet, value, ctx);
+        return this.lookUp(facet, value, cacheKey, deadlineAt, ctx);
       });
     }
-    const lookup = this.resolveLive(facet, { trimmed, normalized, term, isMatch }, cacheKey, ctx);
+    /**
+     * A joiner is left nothing only by a cancellation landing at its owner's deadline; a request
+     * then could not be answered in time, so none is sent.
+     */
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      return {
+        value: value.normalized,
+        resolution: 'normalized',
+        reason: 'lookup_failed',
+        cause: 'unavailable',
+      };
+    }
+    const lookup = this.resolveLive(facet, value, cacheKey, remainingMs, ctx);
     this.inFlightLookups.set(cacheKey, lookup);
     try {
       return await lookup;
@@ -539,32 +673,30 @@ export class TaxonomyService {
    */
   private async resolveLive(
     facet: LiveFacet,
-    value: {
-      trimmed: string;
-      normalized: string;
-      term: string;
-      isMatch: (entry: TaxonomyEntry) => boolean;
-    },
+    value: LiveLookupValue,
     cacheKey: string,
+    deadlineMs: number,
     ctx: Context,
   ): Promise<CanonicalTag> {
     const { trimmed, normalized, term, isMatch } = value;
     let live: TaxonomyEntry[];
     try {
-      live = await this.off.suggestTaxonomy(LIVE_TAXONOMY_NAME[facet], term, ctx);
+      live = await this.off.suggestTaxonomy(LIVE_TAXONOMY_NAME[facet], term, ctx, deadlineMs);
     } catch (error) {
       // A caller that went away ends the call as cancelled; only an upstream failure degrades.
       if (ctx.signal.aborted) throw error;
+      const failure = lookupFailure(error);
       ctx.log.warning(
         'Tag value could not be checked against the live vocabulary — sending it normalized',
         {
           facet,
           value: trimmed,
           sent: normalized,
+          cause: failure.cause,
           error: error instanceof Error ? error.message : String(error),
         },
       );
-      return { value: normalized, resolution: 'normalized', reason: 'lookup_failed' };
+      return { value: normalized, resolution: 'normalized', reason: 'lookup_failed', ...failure };
     }
 
     const plurals = new Set([
@@ -649,21 +781,20 @@ export class TaxonomyService {
       live = await this.off.suggestTaxonomy(taxonomyName, term, ctx);
     } catch (error) {
       if (ctx.signal.aborted) throw error;
-      const cause = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = lookupFailure(error);
       ctx.log.warning('Live taxonomy resolution failed — falling back to the offline sample', {
         facet,
         term,
-        error: cause,
+        cause: failure.cause,
+        error: message,
       });
+      const sample = `These ${offline.length} result(s) come from this server's offline sample of ${embedded.length} entries, so a term the sample does not cover reads as no match here even when the tag exists upstream.`;
       return {
         facet,
         tags: offline.slice(0, limit).map(toTag),
         matched_in_facet: offline.length,
-        notice:
-          `The live Open Food Facts ${facet} vocabulary could not be reached or gave no usable answer ` +
-          `(${cause}). These ${offline.length} result(s) come ` +
-          `from this server's offline sample of ${embedded.length} entries, so a term the sample does not ` +
-          'cover reads as no match here even when the tag exists upstream. Retry for an authoritative answer.',
+        notice: fallbackNotice(failure, facet, message, sample),
       };
     }
 

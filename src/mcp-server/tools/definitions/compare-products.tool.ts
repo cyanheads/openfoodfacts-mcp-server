@@ -5,7 +5,22 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  mirrorCopyNote,
+  mirrorSnapshotTrailer,
+  type SourceGroup,
+  sourcesLine,
+} from '@/mcp-server/tools/read-source.js';
+import {
+  applyAsSoldSelection,
+  holdsOnlyPreparedFigures,
+} from '@/services/openfoodfacts/nutrition-sets.js';
+import {
+  getOpenFoodFactsService,
+  type ProductRead,
+  type ReadSource,
+  type StoredAsSoldRead,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
 import {
   BARCODE_PATTERN,
   BARCODE_PATTERN_MESSAGE,
@@ -85,6 +100,9 @@ type CompareRow = NutritionFigures & {
   ecoscore_grade?: string;
   prepared?: NutritionFigures;
   completeness?: number;
+  stored_as_sold?: StoredAsSold;
+  source?: ReadSource['source'];
+  mirror_as_of?: string;
 };
 
 /** Extract a numeric value from the raw nutriments map. */
@@ -151,6 +169,8 @@ type FailedFetch = {
   barcode: string;
   reason: FailureReason;
   error: string;
+  /** Whole seconds to wait before retrying, when the failure named a wait. */
+  retryAfter?: number;
 };
 
 /**
@@ -170,7 +190,122 @@ function describeFailure(
   const reason = FAILURE_REASONS.find((known) => known === raised) ?? 'upstream_error';
   const text = error instanceof Error ? error.message : String(error);
   const message = /[.!?]$/.test(text) ? text : `${text}.`;
-  return { barcode, reason, error: `${message} ${hintFor(reason)}` };
+  // The service publishes a wait in whole seconds: its own budget's, or Open Food Facts' Retry-After.
+  const retryAfter = error instanceof McpError ? error.data?.retryAfter : undefined;
+  return {
+    barcode,
+    reason,
+    error: `${message} ${hintFor(reason)}`,
+    ...(typeof retryAfter === 'number' && { retryAfter }),
+  };
+}
+
+/**
+ * How the read of a record's stored as-sold set went, on a product or row whose read returned only
+ * prepared figures. `unread` is shaped like a `failed` entry, less the barcode its holder carries.
+ */
+export type StoredAsSold =
+  | { status: 'read' }
+  | { status: 'none' }
+  | { status: 'unread'; reason: FailureReason; error: string; retryAfter?: number };
+
+/**
+ * The next step for an unread stored set, per reason. Not the tools' own contract hints: those are
+ * written for a failed call or a barcode in `failed`, while here the call succeeded and the remedy
+ * is reading the barcode again.
+ */
+const STORED_SET_HINTS: Readonly<Record<FailureReason, string>> = {
+  upstream_error:
+    'Read the barcode again with off_get_product after a brief pause to fetch its stored as-sold figures.',
+  upstream_timeout:
+    'Read the barcode again with off_get_product to fetch its stored as-sold figures.',
+  upstream_rejected:
+    'Do not repeat the read unchanged: Open Food Facts refused it as formed, so the prepared figures are what this call can report.',
+  rate_limited:
+    'Wait the seconds in retryAfter, or about a minute when it is absent, then read the barcode again with off_get_product to fetch its stored as-sold figures.',
+};
+
+/**
+ * Settle a stored as-sold read onto the product read it follows: a chosen set joins the product's
+ * `nutriments`, and a failure leaves the product as it was beside an `unread` entry built the way
+ * `describeFailure` builds a `failed` one.
+ */
+export function settleStoredAsSold(
+  barcode: string,
+  product: RawProduct,
+  read: StoredAsSoldRead,
+): { product: RawProduct; stored_as_sold: StoredAsSold } {
+  if (read.status !== 'unread') return applyAsSoldSelection(product, read);
+  const { reason, error, retryAfter } = describeFailure(
+    barcode,
+    read.error,
+    (failure) => STORED_SET_HINTS[failure],
+  );
+  return {
+    product,
+    stored_as_sold: {
+      status: 'unread',
+      reason,
+      error,
+      ...(retryAfter !== undefined && { retryAfter }),
+    },
+  };
+}
+
+/**
+ * The `stored_as_sold` output field, one schema for both product tools. `subject` names what
+ * carries it ("this product", "this row").
+ */
+export function storedAsSoldSchema(subject: string) {
+  return z
+    .discriminatedUnion('status', [
+      z
+        .object({
+          status: z
+            .literal('read')
+            .describe('One stored as-sold set was read into the as-sold fields.'),
+        })
+        .describe(
+          'The as-sold fields hold one stored set, never merged: per 100 g, or per 100 ml for liquids, when the record stores it so, else a serving of at least 5 g or ml scaled to 100 as Open Food Facts scales it, from the manufacturer, packaging, USDA, or another non-estimate source, in that order. Each nutrient is the entered value, or the one Open Food Facts computed when none was entered; IU and % DV figures are left out.',
+        ),
+      z
+        .object({
+          status: z
+            .literal('none')
+            .describe('The record stores no as-sold set the as-sold fields can be read from.'),
+        })
+        .describe(
+          'Open Food Facts stores no entered as-sold figures for it that can be given per 100 g, or per 100 ml for liquids: the record stores no sets, or only prepared ones, ones estimated from the ingredients, servings under 5 g or ml, or figures in units that do not convert. The as-sold fields stay absent because nothing is entered.',
+        ),
+      z
+        .object({
+          status: z
+            .literal('unread')
+            .describe('The stored sets could not be read; the call itself succeeded.'),
+          reason: z
+            .string()
+            .describe(
+              'Declared failure reason — one of upstream_error, upstream_timeout, upstream_rejected, rate_limited.',
+            ),
+          error: z
+            .string()
+            .describe('What went wrong reading the stored sets and what to do about it.'),
+          retryAfter: z
+            .number()
+            .int()
+            .optional()
+            .describe(
+              "Whole seconds to wait before reading again: the time until this server's own product budget frees a slot, or the Retry-After Open Food Facts sent with a 429. Absent when the failure named no wait.",
+            ),
+        })
+        .describe(
+          'The as-sold figures the record can still hold were not read, so the prepared figures are all this call holds. Never a failed call.',
+        ),
+    ])
+    .optional()
+    .describe(
+      `How the read of the record's stored as-sold figures went for ${subject}. Present only when its product read returned prepared figures and no as-sold one, which is when that second read of the record's stored nutrition sets runs (Open Food Facts serves one preparation state per product read, and prepared wins).`,
+    );
 }
 
 /**
@@ -190,7 +325,10 @@ const RETRYABLE_REASONS: ReadonlySet<string> = new Set<FailureReason>([
  * while a `not_found` barcode was answered for — so the text reads them off rather than flattening
  * both into one "no products found" that fits neither.
  */
-function zeroFoundSummary(notFound: string[], failed: readonly { reason: string }[]): string {
+function zeroFoundSummary(
+  notFound: string[],
+  failed: readonly { reason: string; retryAfter?: number | undefined }[],
+): string {
   const uncheckable = failed.length > 0;
   const missing = notFound.length > 0;
 
@@ -202,9 +340,18 @@ function zeroFoundSummary(notFound: string[], failed: readonly { reason: string 
   }
 
   if (uncheckable) {
-    const recovery = failed.some((f) => RETRYABLE_REASONS.has(f.reason))
-      ? 'Retry them once Open Food Facts is answering again.'
-      : 'Open Food Facts refused every request as formed, so check the barcode digits before sending them again.';
+    // A batch refused only for rate limits closes on the longest wait any entry named.
+    const waits = failed.every((f) => f.reason === 'rate_limited')
+      ? failed.flatMap((f) => (f.retryAfter === undefined ? [] : [f.retryAfter]))
+      : [];
+    let recovery: string;
+    if (waits.length > 0) recovery = `Retry them after ${Math.max(...waits)} s.`;
+    else if (failed.some((f) => RETRYABLE_REASONS.has(f.reason))) {
+      recovery = 'Retry them once Open Food Facts is answering again.';
+    } else {
+      recovery =
+        'Open Food Facts refused every request as formed, so check the barcode digits before sending them again.';
+    }
     return `No barcode could be checked — every fetch failed, so nothing was learned about these products. ${recovery}`;
   }
 
@@ -229,10 +376,39 @@ function rowLabel(row: {
   return row.brands ? `${label} (${mdInline(row.brands)})` : label;
 }
 
-/** Build a comparison row from a raw product. */
-function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
-  if (!raw) return { barcode, found: false };
+/**
+ * The rows that carry a source, grouped by source and as-of time in the order each first appears,
+ * every group naming its rows' barcodes in row order. A refresh can commit between two reads of one
+ * comparison, so rows the local copy served can cite different times. A not-found row carries no
+ * source and joins no group.
+ */
+function sourceGroups(
+  rows: readonly {
+    barcode: string;
+    source?: ReadSource['source'] | undefined;
+    mirror_as_of?: string | undefined;
+  }[],
+): SourceGroup[] {
+  const groups: SourceGroup[] = [];
+  for (const { barcode, source, mirror_as_of } of rows) {
+    if (source === undefined) continue;
+    const group = groups.find((g) => g.source === source && g.mirrorAsOf === mirror_as_of);
+    if (group) group.barcodes.push(barcode);
+    else groups.push({ source, mirrorAsOf: mirror_as_of, barcodes: [barcode] });
+  }
+  return groups;
+}
 
+/**
+ * Build a comparison row from a raw product, where its read was answered, and how its stored
+ * as-sold read went when one ran.
+ */
+function buildCompareRow(
+  barcode: string,
+  raw: RawProduct,
+  from: ReadSource,
+  storedAsSold?: StoredAsSold,
+): CompareRow {
   const row: CompareRow = { barcode, found: true };
 
   if (raw.product_name) row.product_name = raw.product_name;
@@ -247,6 +423,9 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
     const prepared = readFigures(raw.nutriments, '_prepared_100g');
     if (Object.keys(prepared).length > 0) row.prepared = prepared;
   }
+  if (storedAsSold) row.stored_as_sold = storedAsSold;
+  row.source = from.source;
+  if (from.source === 'off_mirror') row.mirror_as_of = from.mirrorAsOf;
 
   return row;
 }
@@ -254,7 +433,7 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
 export const offCompareProductsTool = tool('off_compare_products', {
   title: 'Compare Food Products Side-by-Side',
   description:
-    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, carbohydrates, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score, NOVA group, and Green-Score. Open Food Facts returns one preparation state per read, so figures for the prepared product arrive in a prepared object on the row, with the same columns and basis, and never fill an as-sold field. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, carbohydrates, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score, NOVA group, and Green-Score. Open Food Facts returns one preparation state per read, so figures for the prepared product arrive in a prepared object on the row, with the same columns and basis, and never fill an as-sold field; a row whose read returned only prepared figures gets one more product read, of the as-sold set its record stores, once the read of every barcode has settled, with stored_as_sold saying how it went. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -305,7 +484,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
               ),
             ...nutritionFields(
               (measure) =>
-                `${measure} per 100 g, or per 100 ml for liquids, as sold. Absent when not entered, or when this read returned only prepared figures (see prepared).`,
+                `${measure} per 100 g, or per 100 ml for liquids, as sold. When the product read returned only prepared figures, read from the record's stored as-sold set instead (see stored_as_sold). Absent when not entered, or when that stored set was not read.`,
             ),
             prepared: z
               .object(
@@ -316,12 +495,25 @@ export const offCompareProductsTool = tool('off_compare_products', {
               )
               .optional()
               .describe(
-                "Figures for the prepared product, on the same columns and basis as the as-sold fields, read from Open Food Facts' *_prepared_100g keys and never derived or substituted for an as-sold figure. Open Food Facts returns one preparation state per read, so as-sold fields absent beside this object mean this read returned none, not that the record holds none. Absent when the read carried none of these figures.",
+                "Figures for the prepared product, on the same columns and basis as the as-sold fields, read from Open Food Facts' *_prepared_100g keys and never derived or substituted for an as-sold figure. Open Food Facts returns one preparation state per read, so when the product read returned only prepared figures the record's stored as-sold set is read for the as-sold fields, and stored_as_sold says how that went. Absent when the read carried none of these figures.",
               ),
+            stored_as_sold: storedAsSoldSchema('this row'),
             completeness: z
               .number()
               .optional()
               .describe('Data completeness 0–1. Low values mean many fields are missing.'),
+            source: z
+              .enum(['off_api', 'off_mirror'])
+              .optional()
+              .describe(
+                'Where this row was read: "off_api", Open Food Facts itself, or "off_mirror", this server\'s local copy of the Open Food Facts export, which serves a barcode it holds on a deployment that keeps one, so one comparison can mix the two. The stored as-sold read behind stored_as_sold, when one runs, reads the same source. Present on every row whose found is true.',
+              ),
+            mirror_as_of: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 time of the newest Open Food Facts change the local copy reflects. Present only when source is "off_mirror".',
+              ),
           })
           .describe('A single product comparison row.'),
       )
@@ -345,12 +537,19 @@ export const offCompareProductsTool = tool('off_compare_products', {
                 'Declared failure reason — one of upstream_error, upstream_timeout, upstream_rejected, rate_limited.',
               ),
             error: z.string().describe('What went wrong for this barcode and what to do about it.'),
+            retryAfter: z
+              .number()
+              .int()
+              .optional()
+              .describe(
+                "Whole seconds to wait before retrying this barcode: the time until this server's own product budget frees a slot, or the Retry-After Open Food Facts sent with a 429. Absent when the failure named no wait.",
+              ),
           })
           .describe('A single barcode whose fetch failed.'),
       )
       .optional()
       .describe(
-        'Barcodes whose fetch failed, with the per-barcode reason. Absent when every fetch completed. A barcode listed here is unknown, not absent from Open Food Facts — retry it with off_get_product before concluding anything about the product.',
+        'Barcodes whose fetch failed, with the per-barcode reason. Absent when every fetch completed. A barcode listed here is unknown, not absent from Open Food Facts — retry it with off_get_product before concluding anything about the product. A stored as-sold set that could not be read is not a failed fetch: it stays on its row as stored_as_sold.',
       ),
     unprocessed: z
       .array(z.string().describe('Barcode left unprocessed, as provided in input.'))
@@ -359,6 +558,19 @@ export const offCompareProductsTool = tool('off_compare_products', {
         `Distinct barcodes past the ${COMPARE_BARCODE_CAP}th, in input order — never fetched, so nothing is known about them. Absent when the batch held ${COMPARE_BARCODE_CAP} or fewer distinct barcodes. Compare them in another off_compare_products call (2–${COMPARE_BARCODE_CAP} barcodes), or look a single one up with off_get_product.`,
       ),
   }),
+
+  enrichment: {
+    mirror_snapshot: z
+      .string()
+      .optional()
+      .describe(
+        'Present only when a row\'s source is "off_mirror". States that those rows come from the local copy as of their mirror_as_of, so an edit made to them since then is not reflected.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    mirror_snapshot: { render: mirrorSnapshotTrailer },
+  },
 
   errors: [
     {
@@ -412,6 +624,25 @@ export const offCompareProductsTool = tool('off_compare_products', {
       compared.map((barcode) => svc.getProductFields(barcode, COMPARE_FIELDS, ctx)),
     );
 
+    /*
+     * A row whose read returned only prepared figures gets one read of its record's stored sets.
+     * These start once every v2 read has settled: a v2 read's retry spends its budget slot late, and
+     * a follow-up started beside it could take that slot first. The chain stays 35 + 20 = 55 s. Only
+     * the caller's cancellation (or a bug) rejects one; every upstream failure settles as unread.
+     */
+    const followUps = await Promise.allSettled(
+      settlements.map((settled, i) =>
+        settled.status === 'fulfilled' &&
+        settled.value &&
+        holdsOnlyPreparedFigures(settled.value.product.nutriments)
+          ? svc.readStoredAsSold(compared[i] as string, ctx, settled.value)
+          : undefined,
+      ),
+    );
+    for (const followUp of followUps) {
+      if (followUp.status === 'rejected') throw followUp.reason;
+    }
+
     const products: CompareRow[] = [];
     const not_found: string[] = [];
     const failed: FailedFetch[] = [];
@@ -423,7 +654,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     // Failures stay per-barcode so a mixed batch keeps the rows that did resolve.
     for (let i = 0; i < compared.length; i++) {
       const barcode = compared[i] as string;
-      const result = settlements[i] as PromiseSettledResult<RawProduct | null>;
+      const result = settlements[i] as PromiseSettledResult<ProductRead | null>;
 
       if (result.status === 'rejected') {
         failed.push(
@@ -436,14 +667,36 @@ export const offCompareProductsTool = tool('off_compare_products', {
         continue;
       }
 
-      const raw = result.value;
-      if (!raw) {
+      const productRead = result.value;
+      const followUp = followUps[i];
+      const read = followUp?.status === 'fulfilled' ? followUp.value : undefined;
+      if (!productRead) {
         products.push({ barcode, found: false });
         not_found.push(barcode);
       } else {
-        products.push(buildCompareRow(barcode, raw));
+        const settled = read && settleStoredAsSold(barcode, productRead.product, read);
+        products.push(
+          buildCompareRow(
+            barcode,
+            settled?.product ?? productRead.product,
+            productRead,
+            settled?.stored_as_sold,
+          ),
+        );
         succeeded++;
       }
+    }
+
+    // A refresh can commit between two rows' reads, so the copy's rows can cite different times.
+    const [mirrorAsOf, ...otherTimes] = new Set(products.flatMap((row) => row.mirror_as_of ?? []));
+    if (mirrorAsOf !== undefined) {
+      ctx.enrich({
+        mirror_snapshot: mirrorCopyNote(
+          'The rows whose source is off_mirror come',
+          otherTimes.length === 0 ? mirrorAsOf : 'the mirror_as_of each one carries',
+          'an edit made to them since then is not reflected',
+        ),
+      });
     }
 
     ctx.log.info('Product comparison completed', {
@@ -452,6 +705,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       not_found: not_found.length,
       failed: failed.length,
       unprocessed: unprocessed.length,
+      from_mirror: products.filter((row) => row.source === 'off_mirror').length,
     });
 
     return {
@@ -478,7 +732,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
       for (const f of result.failed) {
         // The upstream's own explanation rides in `error`, so it is escaped like any other value
         // this server did not author.
-        lines.push(`- ${f.barcode} (${f.reason}): ${mdInline(f.error)}`);
+        const wait = f.retryAfter === undefined ? '' : `, retry after ${f.retryAfter} s`;
+        lines.push(`- ${f.barcode} (${f.reason}${wait}): ${mdInline(f.error)}`);
       }
       lines.push('');
     }
@@ -515,13 +770,22 @@ export const offCompareProductsTool = tool('off_compare_products', {
 
     // Nutrition tables. Each block stands alone, since a batch can fall entirely to one side. A row
     // with prepared figures and no as-sold one leaves the as-sold table: its N/As would sit under a
-    // footer reading "not yet entered", which is false of a record that holds those figures on a
-    // preparation state this read did not return.
-    const asSold = found.filter((p) => !p.prepared || hasFigure(p));
+    // footer reading "not yet entered", which is false of a record that can hold those figures on a
+    // preparation state the read did not return. A row whose stored as-sold set was read sits in
+    // both tables, even when that set fills none of the columns: its N/As are then true of the
+    // record, whose stored set was read.
+    const asSold = found.filter(
+      (p) => !p.prepared || hasFigure(p) || p.stored_as_sold?.status === 'read',
+    );
     const asPrepared = found.flatMap((p) =>
       p.prepared ? [{ label: rowLabel(p), figures: p.prepared }] : [],
     );
-    const preparedOnly = found.filter((p) => p.prepared && !hasFigure(p));
+    const storedRead = found.filter((p) => p.stored_as_sold?.status === 'read');
+    const storedNone = found.filter((p) => p.stored_as_sold?.status === 'none');
+    const storedUnread = found.flatMap((p) =>
+      p.stored_as_sold?.status === 'unread' ? [{ barcode: p.barcode, ...p.stored_as_sold }] : [],
+    );
+    const preparedOnly = found.filter((p) => p.prepared && !hasFigure(p) && !p.stored_as_sold);
 
     if (asSold.length > 0) {
       lines.push(
@@ -539,8 +803,30 @@ export const offCompareProductsTool = tool('off_compare_products', {
 
     if (preparedOnly.length > 0) {
       lines.push(
-        `*This read returned no as-sold figures for ${preparedOnly.map(rowLabel).join(', ')}. Open Food Facts returns one preparation state per read, so the record can still hold them.*`,
+        `*This read returned no as-sold figures in the compared columns for ${preparedOnly.map(rowLabel).join(', ')}. Open Food Facts returns one preparation state per read, so the record can still hold them.*`,
       );
+    }
+
+    if (storedRead.length > 0) {
+      lines.push(
+        `*As-sold figures for ${storedRead.map(rowLabel).join(', ')} come from the as-sold set each record stores (stored set: read), since the product read returned only prepared figures.*`,
+      );
+    }
+
+    if (storedNone.length > 0) {
+      lines.push(
+        `*No stored as-sold set for ${storedNone.map(rowLabel).join(', ')} (stored set: none): Open Food Facts stores no entered as-sold figures for them that can be given per 100 g, or per 100 ml for liquids.*`,
+      );
+    }
+
+    if (storedUnread.length > 0) {
+      lines.push(
+        '\n**Stored set unread** — these rows show only the prepared figures their read returned, and their records can still hold as-sold ones:',
+      );
+      for (const u of storedUnread) {
+        const wait = u.retryAfter === undefined ? '' : `, retry after ${u.retryAfter} s`;
+        lines.push(`- ${u.barcode} (${u.reason}${wait}): ${mdInline(u.error)}`);
+      }
     }
 
     // Completeness notices
@@ -556,8 +842,12 @@ export const offCompareProductsTool = tool('off_compare_products', {
     // Scoped rather than dropped when an "as prepared" table prints: Scores keeps its N/As even
     // when no as-sold table does.
     const naScope = asPrepared.length > 0 ? ' outside the "as prepared" table' : '';
+    // The rows' sources, one line for the whole comparison, close the answer above its footer.
+    const [firstSource, ...otherSources] = sourceGroups(result.products);
     lines.push(
-      `\n*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A"${naScope} = not yet entered.*`,
+      '',
+      ...(firstSource ? [sourcesLine([firstSource, ...otherSources])] : []),
+      `*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A"${naScope} = not yet entered.*`,
     );
 
     return [{ type: 'text' as const, text: lines.join('\n') }];

@@ -7,9 +7,16 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
+  mirrorCopyNote,
+  mirrorSnapshotTrailer,
+  sourceLine,
+} from '@/mcp-server/tools/read-source.js';
+import {
   countQueryWords,
   getOpenFoodFactsService,
   MAX_QUERY_WORDS,
+  MIRROR_SEARCH_RESULT_WINDOW,
+  type ProductSearch,
   TAG_SEARCH_MAX_PAGE,
   TEXT_SEARCH_LANGS,
   TEXT_SEARCH_RESULT_WINDOW,
@@ -28,6 +35,7 @@ import {
 import {
   type CanonicalTag,
   getTaxonomyService,
+  type LookupFailure,
   type TagFacet,
 } from '@/services/taxonomy/taxonomy-service.js';
 import { mdInline } from '@/utils/markdown.js';
@@ -61,7 +69,10 @@ const TAG_FILTERS = [
   { key: 'countries_tag', facet: 'countries', label: 'country' },
 ] as const satisfies readonly { key: keyof SearchParams; facet: TagFacet; label: string }[];
 
-/** A tag filter value as supplied and as sent; `canonical` is set only on the text path. */
+/**
+ * A tag filter value as supplied and as sent. `canonical` is set on the text path, and on the tag
+ * path when the mirror is ready.
+ */
 type AppliedTagFilter = {
   key: (typeof TAG_FILTERS)[number]['key'];
   label: string;
@@ -162,13 +173,127 @@ function emptyPageNextStep(
     : 'No further page of matches can be requested.';
 }
 
-/** Why an unconfirmed tag value was sent as it was, in the empty-result notice's words. */
-const UNCONFIRMED_TAG_REASONS = {
-  no_vocabulary: 'brand slugs have no vocabulary to check them against',
-  no_match: 'no matching Open Food Facts tag was found',
-  lookup_failed:
-    'the tag vocabulary could not be reached or gave no usable answer, so it went unchecked',
-} as const;
+/** A tag value nothing confirmed, as the taxonomy service returns it. */
+type UnconfirmedTag = Extract<CanonicalTag, { resolution: 'normalized' }>;
+
+/**
+ * Why an unconfirmed tag value was sent as it was, in the empty-result notice's words. A failed
+ * lookup is worded by its cause, with the wait when one is known: only an unavailable vocabulary
+ * is blamed on the vocabulary.
+ */
+function unconfirmedTagReason(canonical: UnconfirmedTag): string {
+  if (canonical.reason !== 'lookup_failed') {
+    return canonical.reason === 'no_vocabulary'
+      ? 'brand slugs have no vocabulary to check them against'
+      : 'no matching Open Food Facts tag was found';
+  }
+  switch (canonical.cause) {
+    case 'budget_spent':
+      return `this server's own per-minute taxonomy budget was spent, so it went unchecked; a lookup slot frees in about ${canonical.retryAfter} s`;
+    case 'rate_limited':
+      return `Open Food Facts was rate-limiting this server's taxonomy lookups, so it went unchecked${canonical.retryAfter === undefined ? '' : `; it asked for a wait of ${canonical.retryAfter} s`}`;
+    case 'unavailable':
+      return 'the tag vocabulary could not be reached or gave no usable answer, so it went unchecked';
+    default: {
+      const unhandled: never = canonical;
+      throw new Error(`Unhandled lookup failure: ${JSON.stringify(unhandled)}`);
+    }
+  }
+}
+
+/**
+ * Why an exclusion value was refused, in the refusal message's words. Like
+ * `unconfirmedTagReason`, a failed lookup is worded by its cause and names its wait.
+ */
+function refusedExclusion(field: string, value: string, canonical: UnconfirmedTag): string {
+  if (canonical.reason !== 'lookup_failed') {
+    return `${field} "${value}" is not an allergen tag ID or name the Open Food Facts vocabulary confirms`;
+  }
+  switch (canonical.cause) {
+    case 'budget_spent':
+      return `${field} "${value}" could not be checked, because this server's own per-minute taxonomy budget is spent, so no lookup was sent; a slot frees in about ${canonical.retryAfter} s`;
+    case 'rate_limited':
+      return `${field} "${value}" could not be checked, because Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429)${canonical.retryAfter === undefined ? '' : ` and asked for a wait of ${canonical.retryAfter} s`}`;
+    case 'unavailable':
+      return `${field} "${value}" could not be checked, because the allergen vocabulary could not be reached or gave no usable answer`;
+    default: {
+      const unhandled: never = canonical;
+      throw new Error(`Unhandled lookup failure: ${JSON.stringify(unhandled)}`);
+    }
+  }
+}
+
+/** Each lookup-failure cause as the retry hint of an exclusion refusal names it. */
+const EXCLUSION_LOOKUP_FAILURES = {
+  budget_spent: "this server's own per-minute taxonomy budget is spent and no lookup was sent",
+  rate_limited: "Open Food Facts is rate-limiting this server's taxonomy lookups",
+  unavailable: 'the allergen vocabulary could not be reached or gave no usable answer',
+} as const satisfies Record<LookupFailure['cause'], string>;
+
+/**
+ * The longest wait the failed lookups named: a spent budget always names one, a 429 when Open Food
+ * Facts sent it.
+ */
+function longestWait(failures: readonly LookupFailure[]): number | undefined {
+  const waits = failures.flatMap((failure) =>
+    failure.cause !== 'unavailable' && failure.retryAfter !== undefined ? [failure.retryAfter] : [],
+  );
+  return waits.length > 0 ? Math.max(...waits) : undefined;
+}
+
+/** A tag value that kept a search off the ready mirror, with what the taxonomy service said of it. */
+type UnconfirmedValue = { field: string; value: string; canonical: UnconfirmedTag };
+
+/**
+ * The refusal of a tag-only page past `TAG_SEARCH_MAX_PAGE` that the ready mirror could not take
+ * because a value went unconfirmed, so the search would read live, where that page is refused.
+ * Like the exclusion refusal, it names each value and why. It is retryable, with the longest wait
+ * known, when every value went unconfirmed only because its lookup failed: the same call is then
+ * served from the mirror once the lookup succeeds.
+ */
+function unconfirmedPageRefusal(
+  page: number,
+  pageSize: number,
+  unconfirmed: readonly UnconfirmedValue[],
+): { message: string; data: Record<string, unknown> } {
+  const failed = unconfirmed.flatMap(({ canonical }) =>
+    canonical.reason === 'lookup_failed' ? [canonical] : [],
+  );
+  const retryable = failed.length === unconfirmed.length;
+  const retryAfter = retryable ? longestWait(failed) : undefined;
+  const values = unconfirmed.length === 1 ? 'the value' : 'the values';
+  const listed = unconfirmed
+    .map(
+      ({ field, value, canonical }) =>
+        // A brand reaches here only when it slugs to nothing; any other slug is matched as stored.
+        `${field} "${value}" went unconfirmed (${canonical.reason === 'no_vocabulary' ? 'it slugs to no brand tag' : unconfirmedTagReason(canonical)})`,
+    )
+    .join('; ');
+  const hint = retryable
+    ? `${retryAfter === undefined ? 'Retry shortly' : `Retry after ${retryAfter} s`} — once ${values} can be confirmed, this server's local copy of the export serves page ${page}. Request page ${TAG_SEARCH_MAX_PAGE} or lower to read the live database now.`
+    : `Replace ${values} with ${unconfirmed.length === 1 ? 'a canonical tag ID' : 'canonical tag IDs'} from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page ${page}, or request page ${TAG_SEARCH_MAX_PAGE} or lower — at page_size ${pageSize} that reaches the first ${TAG_SEARCH_MAX_PAGE * pageSize} matches.`;
+  return {
+    message: `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only when it reads the live database, and page ${page} was requested: this server's local copy of the export serves deeper pages only when it confirms every value, and ${listed}.`,
+    data: {
+      page,
+      page_size: pageSize,
+      max_page: TAG_SEARCH_MAX_PAGE,
+      unconfirmed: unconfirmed.map(({ field, value, canonical }) => ({
+        field,
+        value,
+        reason: canonical.reason,
+        ...(canonical.reason === 'lookup_failed' && { cause: canonical.cause }),
+      })),
+      retryable,
+      ...(retryAfter !== undefined && { retryAfter }),
+      recovery: { hint },
+    },
+  };
+}
+
+/** The retry hint of an exclusion refusal whose every value failed only because nothing was reached. */
+const UNAVAILABLE_EXCLUSION_HINT =
+  'Retry shortly — the allergen vocabulary could not be reached or gave no usable answer, so the value went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.';
 
 /**
  * What still reaches the live database from a search the text index answered, which depends on
@@ -189,15 +314,43 @@ function liveDatabaseRoute(
   }
   if (hasTagPathFilters) {
     return {
-      note: 'The same tag filters without query read the live database.',
-      advice: 're-run the same tag filters without query to read the live database',
+      note: "The same tag filters without query read the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).",
+      advice:
+        "re-run the same tag filters without query to read the live database or this server's local copy of the export",
     };
   }
   return {
-    note: 'A search by tag filters alone, without query, reads the live database.',
+    note: "A search by tag filters alone, without query, reads the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).",
     advice:
-      'a search without query reads the live database, so try expressing the product as tag filters instead (off_browse_taxonomy resolves them)',
+      "a search without query reads the live database or this server's local copy of the export, so try expressing the product as tag filters instead (off_browse_taxonomy resolves them)",
   };
+}
+
+/**
+ * Whether the mirror can match a tag value as stored: a value the vocabulary confirmed, or a brand
+ * slug, the form a brand is stored under, since brands have no vocabulary. An empty slug names no
+ * brand, so it stays unconfirmed and the search reads live, as it did before the mirror.
+ */
+function confirmedForMirror(canonical: CanonicalTag): boolean {
+  return (
+    canonical.resolution === 'vocabulary' ||
+    (canonical.reason === 'no_vocabulary' && canonical.value !== '')
+  );
+}
+
+/**
+ * The freshness disclosure of a search the mirror answered, citing its as-of time where a live
+ * tag-only answer reads the live database. The mirror orders `popularity_key` (the default) and
+ * `unique_scans_n` by the values stored with each record, while the live search ranks both by its
+ * own current scan counts, so those orders can differ page for page; the timestamps sort alike.
+ */
+function mirrorSnapshotNote(mirrorAsOf: string, sortBy: SearchParams['sort_by']): string {
+  const scanSort = sortBy ?? 'popularity_key';
+  const order =
+    scanSort === 'popularity_key' || scanSort === 'unique_scans_n'
+      ? ` ${sortBy === undefined ? 'The default order follows' : 'The order follows'} the ${scanSort} value stored with each record as of then, which can differ page for page from a live search, where Open Food Facts orders it by its current scan counts.`
+      : '';
+  return `${mirrorCopyNote('These results come', mirrorAsOf, 'a product contributed or edited since then is missing or shown as it was')}${order}`;
 }
 
 /** The unit an indexed nutrient value is in: energy in kcal, everything else in grams. */
@@ -252,7 +405,7 @@ const TEXT_INDEX_SNAPSHOT_NOTE =
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, and combine the same way, and each row then carries the indexed values the thresholds were checked against; additives_tag is the one exception, filtering only on searches carrying neither query nor nutrient_filters. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query is answered by the text index, a snapshot that lags the live database, while a tag-only search reads the live database and is current — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, and combine the same way, and each row then carries the indexed values the thresholds were checked against; additives_tag is the one exception, filtering only on searches carrying neither query nor nutrient_filters. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query is answered by the text index, a snapshot that lags the live database, while a tag-only search reads the live database and is current, or, where this server keeps a local copy of the Open Food Facts export, can be served from that copy, which source and mirror_as_of then report and whose default order and popularity_key or unique_scans_n sort follow the values stored with each record, so they can differ from a live search, which ranks by its current scan counts — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -260,7 +413,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database; drop it to run the same tag filters against the current data.`,
+        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database; drop it to run the same tag filters against the live database or, where this server keeps one, its local copy of the export.`,
       ),
     categories_tag: z
       .string()
@@ -378,7 +531,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'])
       .optional()
       .describe(
-        'Sort order, applied on every search. Each value orders newest or highest first: "unique_scans_n" surfaces the most-scanned products, "last_modified_t" and "created_t" the most recently updated and newest records, "popularity_key" the most popular. Omitting it leaves text searches relevance-ranked and tag-only searches in the default order.',
+        'Sort order, applied on every search. Each value orders newest or highest first: "unique_scans_n" surfaces the most-scanned products, "last_modified_t" and "created_t" the most recently updated and newest records, "popularity_key" the most popular. Omitting it leaves text searches relevance-ranked and tag-only searches in the default order. Where this server serves a tag-only search from its local copy of the export (source "off_mirror"), the default order and "popularity_key" and "unique_scans_n" follow the values stored with each record, so they can differ from a live search, which ranks by its current scan counts; "last_modified_t" and "created_t" sort alike.',
       ),
     page: z
       .number()
@@ -386,7 +539,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .min(1)
       .default(1)
       .describe(
-        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size 80 is results 51–100). A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches. A search carrying query or nutrient_filters serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past either bound is rejected rather than sent; narrow the filters or change sort_by to bring other products forward.`,
+        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size 80 is results 51–100). A search by tag filters alone that reads the live database is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches; where this server keeps a local copy of the export, a tag-only search whose every value it confirms (canonical IDs from off_browse_taxonomy, or a brand slug) is served from that copy through its first ${MIRROR_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${MIRROR_SEARCH_RESULT_WINDOW} there. A search carrying query or nutrient_filters serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past any of these bounds is rejected rather than sent; narrow the filters or change sort_by to bring other products forward.`,
       ),
     page_size: z
       .number()
@@ -430,7 +583,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .number()
       .optional()
       .describe(
-        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone and by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers. Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all. On a search constraining a whole-number nutrient it counts pages of the whole-number answer, so a page up to it can list few products or none.`,
+        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone that read the live database, by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers, and by the local copy's ${MIRROR_SEARCH_RESULT_WINDOW}-result window when source is "off_mirror". Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all. On a search constraining a whole-number nutrient it counts pages of the whole-number answer, so a page up to it can list few products or none.`,
       ),
     omitted: z
       .number()
@@ -443,6 +596,17 @@ export const offSearchProductsTool = tool('off_search_products', {
       .optional()
       .describe(
         'Rows the text index returned on this page that fail nutrient_filters on their indexed values, compared at the 32-bit precision the index uses, and so left off. The index returns them because it compares some nutrients as whole numbers. Separate from omitted, whose rows are matches; a row both unservable and outside counts only in omitted. total, total_is_lower_bound, and last_page still count these rows, and each page keeps its place in the result set. Absent when none was.',
+      ),
+    source: z
+      .enum(['off_api', 'off_mirror'])
+      .describe(
+        'Where this answer was read: "off_api", Open Food Facts itself, or "off_mirror", this server\'s local copy of the Open Food Facts export, which serves a search by tag filters alone on a deployment that keeps one.',
+      ),
+    mirror_as_of: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 time of the newest Open Food Facts change the local copy reflects. Present only when source is "off_mirror".',
       ),
     products: z
       .array(
@@ -506,7 +670,13 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. When a constraint falls on a whole-number nutrient (see nutrient_filters) it also says that total, total_is_lower_bound, and last_page describe the whole-number answer and that rows outside the constraints count in outside_constraints. Absent on tag-only searches, which read the live database.',
+        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. When a constraint falls on a whole-number nutrient (see nutrient_filters) it also says that total, total_is_lower_bound, and last_page describe the whole-number answer and that rows outside the constraints count in outside_constraints. Absent on tag-only searches, which read the live database or, when source is "off_mirror", the local copy mirror_snapshot describes.',
+      ),
+    mirror_snapshot: z
+      .string()
+      .optional()
+      .describe(
+        'Present only when source is "off_mirror". States that the results come from the local copy as of mirror_as_of, so a product contributed or edited since is missing or shown as it was, and, under the default order or a popularity_key or unique_scans_n sort, that the order follows the values stored with each record and can differ from a live search.',
       ),
     exclusion_coverage: z
       .string()
@@ -537,6 +707,7 @@ export const offSearchProductsTool = tool('off_search_products', {
   enrichmentTrailer: {
     notice: { render: (v) => `> ${mdInline(String(v))}` },
     text_index_snapshot: { render: (v) => `**Index freshness:** ${mdInline(String(v))}` },
+    mirror_snapshot: { render: mirrorSnapshotTrailer },
     exclusion_coverage: { render: (v) => `**Exclusions:** ${mdInline(String(v))}` },
     page_size_capped: { render: (v) => `**Page size:** ${mdInline(String(v))}` },
   },
@@ -553,7 +724,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'unrecognized_exclusion',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'An exclude_allergens or exclude_traces value is not an allergen tag the Open Food Facts vocabulary confirms, or the vocabulary could not be reached or gave no usable answer when checking it — an unrecognized exclusion would exclude nothing',
+      when: "An exclude_allergens or exclude_traces value is not an allergen tag the Open Food Facts vocabulary confirms, or could not be checked because the vocabulary could not be reached or gave no usable answer, Open Food Facts rate-limited the lookup, or this server's own taxonomy budget was spent — an unrecognized exclusion would exclude nothing",
       retryable: false,
       severity: 'warning',
       recovery:
@@ -579,7 +750,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'page_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE}, or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
+      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE} and would read the live database — this server keeps no ready local copy of the export, or a tag value is one it cannot confirm — or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, or one the local copy serves beyond its ${MIRROR_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
       retryable: false,
       severity: 'warning',
       recovery:
@@ -633,17 +804,21 @@ export const offSearchProductsTool = tool('off_search_products', {
     // Every page computation below — what is sent, the page bounds, last_page, truncation — runs at
     // the size served, so a repeated over-cap page_size pages contiguously in pages of the cap.
     const pageSize = Math.min(input.page_size, SEARCH_PAGE_SIZE_CAP);
-    // The deepest page this search's backend serves: the text backend's result window at this
-    // page_size, or the tag path's page bound.
-    const maxPage = servedByTextBackend
-      ? Math.floor(TEXT_SEARCH_RESULT_WINDOW / pageSize)
-      : TAG_SEARCH_MAX_PAGE;
+    // The deepest page the text backend's result window, and the mirror's, reach at this page_size.
+    const textMaxPage = Math.floor(TEXT_SEARCH_RESULT_WINDOW / pageSize);
+    const mirrorMaxPage = Math.floor(MIRROR_SEARCH_RESULT_WINDOW / pageSize);
+    // The page_size a window refusal names: as served, and as requested when that was larger.
+    const servedPageSize =
+      pageSize < input.page_size
+        ? `page_size ${input.page_size} served at ${pageSize}`
+        : `page_size ${pageSize}`;
+    const additive = input.additives_tag?.trim();
     const hasExclusion = EXCLUSION_FILTERS.some(({ key }) => tagValues(input[key]).length > 0);
     const hasFilter =
       servedByTextBackend ||
       hasExclusion ||
       TAG_FILTERS.some(({ key }) => tagValues(input[key]).length > 0) ||
-      Boolean(input.additives_tag?.trim()) ||
+      Boolean(additive) ||
       Boolean(input.ingredients_analysis_tag) ||
       Boolean(input.nutrition_grade) ||
       Boolean(input.nova_group);
@@ -655,7 +830,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     // Only the tag-filter backend indexes additives. The text backend accepts an additives clause
     // and answers zero hits for every value, so honoring the combination would report "no such
     // product" about products that plainly exist. Refuse it instead of returning that lie.
-    if (servedByTextBackend && input.additives_tag?.trim()) {
+    if (servedByTextBackend && additive) {
       throw ctx.fail(
         'additives_filter_needs_tag_search',
         'additives_tag filters only on searches the tag backend answers — a query or a nutrient constraint moves the search to a backend with no additives field, so pairing them would match nothing regardless of the additive.',
@@ -674,11 +849,19 @@ export const offSearchProductsTool = tool('off_search_products', {
       );
     }
 
+    const svc = getOpenFoodFactsService();
+    // Only the local mirror serves a tag-only page past TAG_SEARCH_MAX_PAGE, and only a search
+    // whose every value it can match as stored, so a tag-only search asks first whether it is
+    // ready. A search the text backend answers never reads it.
+    const mirror = !servedByTextBackend && (await svc.mirrorReady(ctx));
+
     // Product Opener refuses every anonymous page past 10 with an HTTP 401, whatever the page_size
-    // and however few products match. Reject it here with the bound instead of sending a request
-    // that cannot succeed.
-    if (!servedByTextBackend && input.page > TAG_SEARCH_MAX_PAGE) {
-      throw ctx.fail(
+    // and however few products match. Reject such a page with the bound instead of sending a
+    // request that cannot succeed: here when no mirror is ready, before any lookup is spent, and
+    // when the service answers that the mirror could not serve the search after all. A value the
+    // ready mirror cannot match is refused by `unconfirmedPageRefusal`, which names it.
+    const tagPageRefusal = () =>
+      ctx.fail(
         'page_out_of_range',
         `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only, and page ${input.page} was requested.`,
         {
@@ -690,26 +873,41 @@ export const offSearchProductsTool = tool('off_search_products', {
           },
         },
       );
+    // The mirror serves a search through its result window only, which bounds the work one page
+    // costs the serving process. Refused once the search is known to be the mirror's — every value
+    // confirmed — before the service is called, and when the service answers that bound itself.
+    const mirrorWindowRefusal = () =>
+      ctx.fail(
+        'page_out_of_range',
+        `This server's local copy of the export serves only the first ${MIRROR_SEARCH_RESULT_WINDOW} results of a search, and page ${input.page} at ${servedPageSize} asks for result ${input.page * pageSize}.`,
+        {
+          page: input.page,
+          page_size: pageSize,
+          max_page: mirrorMaxPage,
+          result_window: MIRROR_SEARCH_RESULT_WINDOW,
+          recovery: {
+            hint: `Request page ${mirrorMaxPage} or lower at page_size ${pageSize}, or narrow the filters or change sort_by so the products you need fall inside the first ${MIRROR_SEARCH_RESULT_WINDOW} results.`,
+          },
+        },
+      );
+    if (!servedByTextBackend && !mirror && input.page > TAG_SEARCH_MAX_PAGE) {
+      throw tagPageRefusal();
     }
 
     // The text backend refuses page * page_size beyond its result window with an HTTP 422 that no
     // retry can clear. Reject it here so the caller gets the reachable page bound instead of a
     // backoff sequence.
     if (servedByTextBackend && input.page * pageSize > TEXT_SEARCH_RESULT_WINDOW) {
-      const served =
-        pageSize < input.page_size
-          ? `page_size ${input.page_size} served at ${pageSize}`
-          : `page_size ${pageSize}`;
       throw ctx.fail(
         'page_out_of_range',
-        `The text backend serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, and page ${input.page} at ${served} asks for result ${input.page * pageSize}.`,
+        `The text backend serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, and page ${input.page} at ${servedPageSize} asks for result ${input.page * pageSize}.`,
         {
           page: input.page,
           page_size: pageSize,
-          max_page: maxPage,
+          max_page: textMaxPage,
           result_window: TEXT_SEARCH_RESULT_WINDOW,
           recovery: {
-            hint: `Request page ${maxPage} or lower at page_size ${pageSize}, or add filters so the products you need rank inside the first ${TEXT_SEARCH_RESULT_WINDOW} results.`,
+            hint: `Request page ${textMaxPage} or lower at page_size ${pageSize}, or add filters so the products you need rank inside the first ${TEXT_SEARCH_RESULT_WINDOW} results.`,
           },
         },
       );
@@ -718,22 +916,28 @@ export const offSearchProductsTool = tool('off_search_products', {
     // The text backend's tag fields are exact-match keywords, so a value the tag path would
     // canonicalize (case, synonym, singular, missing prefix) matches nothing there. Canonicalize
     // each value first; resolution is best-effort and fails the search only when the caller
-    // cancels. The tag path is left alone — Product Opener canonicalizes its parameters itself.
+    // cancels. The live tag path is left alone — Product Opener canonicalizes its parameters
+    // itself — but the mirror matches stored tags exactly, so with it ready the tag path's values,
+    // the additive included, are canonicalized too.
     //
     // Exclusions are canonicalized on both paths and must be confirmed: a value neither backend
     // recognizes is a negation that matches nothing, so it would exclude nothing and return every
     // product as though the exclusion held.
+    //
+    // Every lookup runs in this one parallel batch, so a call's longest chain stays one lookup
+    // deadline plus one search read.
+    const canonicalize = servedByTextBackend || mirror;
     const taxonomy = getTaxonomyService();
-    const [tagFilters, exclusions] = await Promise.all([
+    const [resolvedTags, exclusions, canonicalAdditive] = await Promise.all([
       Promise.all(
         TAG_FILTERS.flatMap(({ key, facet, label }) =>
           tagValues(input[key]).map(
-            (given): Promise<AppliedTagFilter> =>
-              servedByTextBackend
+            (given): Promise<Omit<AppliedTagFilter, 'sent'>> =>
+              canonicalize
                 ? taxonomy
                     .canonicalizeTag(facet, given, ctx)
-                    .then((canonical) => ({ key, label, given, sent: canonical.value, canonical }))
-                : Promise.resolve({ key, label, given, sent: given }),
+                    .then((canonical) => ({ key, label, given, canonical }))
+                : Promise.resolve({ key, label, given }),
           ),
         ),
       ),
@@ -747,42 +951,83 @@ export const offSearchProductsTool = tool('off_search_products', {
           ),
         ),
       ),
+      mirror && additive ? taxonomy.canonicalizeTag('additives', additive, ctx) : undefined,
     ]);
 
-    const unrecognized = exclusions.flatMap(({ key, given, canonical }) =>
-      canonical.resolution === 'normalized'
-        ? [{ field: key, value: given, reason: canonical.reason }]
-        : [],
+    const refused = exclusions.flatMap(({ key, given, canonical }) =>
+      canonical.resolution === 'normalized' ? [{ key, given, canonical }] : [],
     );
-    if (unrecognized.length > 0) {
-      // A refusal the vocabulary could not settle — unreachable, or no usable answer — can succeed
-      // on a retry; one it answered cannot, so the retry flag holds only when every refusal is of
-      // the first kind.
-      const retryable = unrecognized.every(({ reason }) => reason === 'lookup_failed');
-      const listed = unrecognized
-        .map(({ field, value, reason }) =>
-          reason === 'lookup_failed'
-            ? `${field} "${value}" could not be checked, because the allergen vocabulary could not be reached or gave no usable answer`
-            : `${field} "${value}" is not an allergen tag ID or name the Open Food Facts vocabulary confirms`,
-        )
+    if (refused.length > 0) {
+      // A refusal the vocabulary could not settle — a lookup that failed for any cause — can
+      // succeed on a retry; one it answered cannot, so the retry flag holds only when every
+      // refusal is of the first kind.
+      const failedLookups = refused.flatMap(({ canonical }) =>
+        canonical.reason === 'lookup_failed' ? [canonical] : [],
+      );
+      const retryable = failedLookups.length === refused.length;
+      const retryAfter = longestWait(failedLookups);
+      const causes = [...new Set(failedLookups.map(({ cause }) => cause))];
+      const hint = causes.every((cause) => cause === 'unavailable')
+        ? UNAVAILABLE_EXCLUSION_HINT
+        : `${retryAfter === undefined ? 'Retry in about a minute' : `Retry after ${retryAfter} s`} — ${causes.map((cause) => EXCLUSION_LOOKUP_FAILURES[cause]).join('; ')}, so ${failedLookups.length === 1 ? 'the value' : 'the values'} went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without a lookup.`;
+      const listed = refused
+        .map(({ key, given, canonical }) => refusedExclusion(key, given, canonical))
         .join('; ');
       throw ctx.fail(
         'unrecognized_exclusion',
         `Exclusions are sent only as allergen tags Open Food Facts confirms, because an unrecognized one excludes nothing: ${listed}.`,
         {
-          unrecognized,
+          unrecognized: refused.map(({ key, given, canonical }) => ({
+            field: key,
+            value: given,
+            reason: canonical.reason,
+            ...(canonical.reason === 'lookup_failed' && { cause: canonical.cause }),
+          })),
           retryable,
-          ...(retryable && {
-            recovery: {
-              hint: 'Retry shortly — the allergen vocabulary could not be reached or gave no usable answer, so the value went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.',
-            },
-          }),
+          ...(retryable && retryAfter !== undefined && { retryAfter }),
+          ...(retryable && { recovery: { hint } }),
         },
       );
     }
 
-    const svc = getOpenFoodFactsService();
-    const searchParams: SearchParams = {
+    // The mirror serves the search only when it can match every value as stored. Exclusions were
+    // confirmed above, and nutrition_grade, nova_group, and ingredients_analysis_tag are closed
+    // vocabularies the input schema enforces.
+    const allConfirmed =
+      mirror &&
+      resolvedTags.every(
+        ({ canonical }) => canonical !== undefined && confirmedForMirror(canonical),
+      ) &&
+      (canonicalAdditive === undefined || canonicalAdditive.resolution === 'vocabulary');
+    // The mirror is ready (an earlier check refused this page without it) but cannot match a value,
+    // so the search would read live, which cannot serve this page. The refusal names each such
+    // value, since one whose lookup failed is served from the mirror on a retry.
+    if (!servedByTextBackend && !allConfirmed && input.page > TAG_SEARCH_MAX_PAGE) {
+      const { message, data } = unconfirmedPageRefusal(input.page, pageSize, [
+        ...resolvedTags.flatMap(({ key, given, canonical }) =>
+          canonical?.resolution === 'normalized' && !confirmedForMirror(canonical)
+            ? [{ field: key, value: given, canonical }]
+            : [],
+        ),
+        ...(additive && canonicalAdditive?.resolution === 'normalized'
+          ? [{ field: 'additives_tag', value: additive, canonical: canonicalAdditive }]
+          : []),
+      ]);
+      throw ctx.fail('page_out_of_range', message, data);
+    }
+    if (allConfirmed && input.page * pageSize > MIRROR_SEARCH_RESULT_WINDOW) {
+      throw mirrorWindowRefusal();
+    }
+
+    // Canonical values reach the text backend always, and the tag path only on a search the mirror
+    // serves; any other tag-only search sends each value as given, as it did before the mirror.
+    const sendCanonical = servedByTextBackend || allConfirmed;
+    const tagFilters: AppliedTagFilter[] = resolvedTags.map((filter) => ({
+      ...filter,
+      sent: sendCanonical && filter.canonical ? filter.canonical.value : filter.given,
+    }));
+
+    const searchParams: ProductSearch = {
       page: input.page,
       page_size: pageSize,
     };
@@ -799,7 +1044,10 @@ export const offSearchProductsTool = tool('off_search_products', {
       const sent = exclusions.filter((e) => e.key === key).map((e) => e.canonical.value);
       if (sent.length > 0) searchParams[key] = sent;
     }
-    if (input.additives_tag?.trim()) searchParams.additives_tag = input.additives_tag.trim();
+    if (additive) {
+      searchParams.additives_tag =
+        allConfirmed && canonicalAdditive ? canonicalAdditive.value : additive;
+    }
     if (input.ingredients_analysis_tag) {
       searchParams.ingredients_analysis_tag = input.ingredients_analysis_tag;
     }
@@ -807,8 +1055,15 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (input.nova_group) searchParams.nova_group = input.nova_group;
     if (nutrientFilters.length > 0) searchParams.nutrient_filters = nutrientFilters;
     if (input.sort_by) searchParams.sort_by = input.sort_by;
+    if (allConfirmed) searchParams.tags_confirmed = true;
 
     const response = await svc.searchProducts(searchParams, ctx);
+    if (response.status === 'page_out_of_range') {
+      throw { live_max_page: tagPageRefusal, mirror_window: mirrorWindowRefusal }[response.bound]();
+    }
+    if (response.source === 'off_mirror') {
+      ctx.enrich({ mirror_snapshot: mirrorSnapshotNote(response.mirrorAsOf, input.sort_by) });
+    }
 
     const liveRoute = liveDatabaseRoute(
       nutrientFilters.length > 0,
@@ -844,8 +1099,16 @@ export const offSearchProductsTool = tool('off_search_products', {
       returned: response.products.length,
       outside_constraints: response.outside_constraints,
       page: response.page,
+      source: response.source,
     });
 
+    // The deepest page the backend that answered serves: the text backend's or the mirror's result
+    // window at this page_size, or the live tag path's page bound.
+    const maxPage = servedByTextBackend
+      ? textMaxPage
+      : response.source === 'off_mirror'
+        ? mirrorMaxPage
+        : TAG_SEARCH_MAX_PAGE;
     // Pages the backend will actually serve, not pages implied by the match total.
     const totalPages = Math.ceil(response.count / pageSize);
     const reachablePages = Math.min(totalPages, maxPage);
@@ -954,7 +1217,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           const unconfirmed = tagFilters.flatMap(({ label, given, sent, canonical }) =>
             canonical?.resolution === 'normalized'
               ? [
-                  `${label}="${given}"${sent === given ? '' : ` was sent as "${sent}"`} (${UNCONFIRMED_TAG_REASONS[canonical.reason]})`,
+                  `${label}="${given}"${sent === given ? '' : ` was sent as "${sent}"`} (${unconfirmedTagReason(canonical)})`,
                 ]
               : [],
           );
@@ -982,7 +1245,9 @@ export const offSearchProductsTool = tool('off_search_products', {
           `Page ${response.page} of ${reachablePages} reachable pages — ${totalPages} pages of matches exist, ` +
           (servedByTextBackend
             ? `but text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results.`
-            : `but a search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only.`);
+            : response.source === 'off_mirror'
+              ? `but this server's local copy of the export serves only the first ${MIRROR_SEARCH_RESULT_WINDOW} results.`
+              : `but a search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only.`);
       } else {
         position = `Page ${response.page} of ${totalPages}.`;
       }
@@ -1029,16 +1294,19 @@ export const offSearchProductsTool = tool('off_search_products', {
       ...(lastPage !== undefined && { last_page: lastPage }),
       ...(response.dropped > 0 && { omitted: response.dropped }),
       ...(outside !== undefined && { outside_constraints: outside }),
+      source: response.source,
+      ...(response.source === 'off_mirror' && { mirror_as_of: response.mirrorAsOf }),
       products,
     };
   },
 
   format: (result) => {
+    const source = sourceLine(result.source, result.mirror_as_of);
     if (result.products.length === 0 && result.total === 0) {
       return [
         {
           type: 'text' as const,
-          text: `**No products found** (total: ${result.total})\n\nTry broadening the search terms or checking tag IDs via off_browse_taxonomy.`,
+          text: `**No products found** (total: ${result.total})\n\nTry broadening the search terms or checking tag IDs via off_browse_taxonomy.\n\n${source}`,
         },
       ];
     }
@@ -1078,6 +1346,8 @@ export const offSearchProductsTool = tool('off_search_products', {
       leftOff.push(
         '',
         emptyPageNextStep(result.page, reachable, moreBeyond, outside !== undefined),
+        '',
+        source,
       );
       return [{ type: 'text' as const, text: leftOff.join('\n') }];
     }
@@ -1094,6 +1364,8 @@ export const offSearchProductsTool = tool('off_search_products', {
         result.last_page === undefined
           ? 'Open Food Facts stopped counting before the end of the matches, so there is no exact last page — request an earlier page.'
           : `Request page ${result.last_page} or lower to reach the matching products.`,
+        '',
+        source,
       );
       return [{ type: 'text' as const, text: exhausted.join('\n') }];
     }
@@ -1139,7 +1411,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       lines.push('');
     }
 
-    lines.push('*Data: Open Food Facts (ODbL 1.0)*');
+    lines.push(source, '*Data: Open Food Facts (ODbL 1.0)*');
 
     return [{ type: 'text' as const, text: lines.join('\n') }];
   },

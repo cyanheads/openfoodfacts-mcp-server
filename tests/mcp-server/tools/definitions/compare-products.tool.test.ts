@@ -3,7 +3,14 @@
  * @module tests/mcp-server/tools/definitions/compare-products.tool.test
  */
 
-import { rateLimited, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  invalidParams,
+  JsonRpcErrorCode,
+  McpError,
+  rateLimited,
+  serviceUnavailable,
+  timeout,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -11,12 +18,37 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
   getOpenFoodFactsService: vi.fn(),
 }));
 
-import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
-import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import {
+  offCompareProductsTool,
+  settleStoredAsSold,
+} from '@/mcp-server/tools/definitions/compare-products.tool.js';
+import {
+  getOpenFoodFactsService,
+  type ProductRead,
+} from '@/services/openfoodfacts/openfoodfacts-service.js';
+import type { RawProduct } from '@/services/openfoodfacts/types.js';
+import { v2Capture, v35Capture } from '../../../fixtures/as-sold-captures.js';
 import { ACCEPTED_BARCODES, REJECTED_BARCODES } from '../../../fixtures/barcode-cases.js';
 import { PRODUCT_FOUND, PRODUCT_NOT_FOUND_404 } from '../../../fixtures/upstream-envelopes.js';
 
 const mockGetProductFields = vi.fn();
+const mockReadStoredAsSold = vi.fn();
+
+/** A live read of `product`, as the service's product reads resolve one. */
+function liveRead(product: RawProduct): ProductRead {
+  return { source: 'off_api', product };
+}
+
+/** The as-of time the local export mirror cites in these tests. */
+const MIRROR_AS_OF = '2026-11-01T06:25:32.000Z';
+
+/**
+ * A read of `product` the local export mirror served as of `mirrorAsOf`. Its stored sets are left
+ * out: the stored-set read is stubbed, and what it selects from them is the service's to test.
+ */
+function mirrorRead(product: RawProduct, mirrorAsOf = MIRROR_AS_OF): ProductRead {
+  return { source: 'off_mirror', mirrorAsOf, product, storedSets: undefined };
+}
 
 /** Create the contract-bearing context wired by the production handler factory. */
 function createToolContext() {
@@ -140,6 +172,26 @@ const NESQUIK = {
   },
 };
 
+/** What the stored sets of 7613035530799 yield for its as-sold fields (#73), as stored in order. */
+const NESQUIK_STORED = {
+  status: 'read',
+  nutriments: {
+    alcohol_100g: 0,
+    'energy-kcal_100g': 327,
+    'energy-kj_100g': 1370,
+    fat_100g: 5.4,
+    'saturated-fat_100g': 2.2,
+    energy_100g: 1370,
+  },
+};
+
+/** The NESQUIK row's label, as every table and note prints it. */
+const NESQUIK_LABEL = 'NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.)';
+
+/** The opening line of the list of rows whose stored set went unread (#73). */
+const UNREAD_HEADING =
+  '**Stored set unread** — these rows show only the prepared figures their read returned, and their records can still hold as-sold ones:';
+
 /** Wrap a JSON body + status in a minimal Response-like mock, as a real fetch would resolve. */
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -175,36 +227,47 @@ describe('off_compare_products', () => {
 
   beforeEach(() => {
     mockGetProductFields.mockReset();
+    mockReadStoredAsSold.mockReset();
+    // A row whose read holds only prepared figures gets a stored-set read (#73). A test with such a
+    // row names the outcome; anywhere else the follow-up must not run, so it fails the call loudly.
+    mockReadStoredAsSold.mockRejectedValue(new Error('Unexpected stored as-sold read'));
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
       getProductFields: mockGetProductFields,
+      readStoredAsSold: mockReadStoredAsSold,
     } as never);
     ctx = createToolContext();
   });
 
   afterEach(() => {
     global.fetch = globalFetch;
+    // A test that freezes the clock must not hand the frozen clock to the next one.
+    vi.useRealTimers();
   });
 
   it('returns comparison rows for two found products', async () => {
     mockGetProductFields
-      .mockResolvedValueOnce({
-        product_name: 'Nutella',
-        brands: 'Ferrero',
-        nutriscore_grade: 'e',
-        nova_group: 4,
-        ecoscore_grade: 'c',
-        completeness: 0.85,
-        nutriments: { 'energy-kcal_100g': 539, fat_100g: 30.9, sugars_100g: 56.3 },
-      })
-      .mockResolvedValueOnce({
-        product_name: 'Peanut Butter',
-        brands: 'Skippy',
-        nutriscore_grade: 'c',
-        nova_group: 3,
-        ecoscore_grade: 'b',
-        completeness: 0.72,
-        nutriments: { 'energy-kcal_100g': 580, fat_100g: 50, sugars_100g: 8 },
-      });
+      .mockResolvedValueOnce(
+        liveRead({
+          product_name: 'Nutella',
+          brands: 'Ferrero',
+          nutriscore_grade: 'e',
+          nova_group: 4,
+          ecoscore_grade: 'c',
+          completeness: 0.85,
+          nutriments: { 'energy-kcal_100g': 539, fat_100g: 30.9, sugars_100g: 56.3 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        liveRead({
+          product_name: 'Peanut Butter',
+          brands: 'Skippy',
+          nutriscore_grade: 'c',
+          nova_group: 3,
+          ecoscore_grade: 'b',
+          completeness: 0.72,
+          nutriments: { 'energy-kcal_100g': 580, fat_100g: 50, sugars_100g: 8 },
+        }),
+      );
 
     const result = await offCompareProductsTool.handler(
       { barcodes: ['3017620422003', '7622210100146'] },
@@ -225,13 +288,15 @@ describe('off_compare_products', () => {
 
   it('marks missing barcodes as not_found without throwing', async () => {
     mockGetProductFields
-      .mockResolvedValueOnce({
-        product_name: 'Nutella',
-        nutriscore_grade: 'e',
-        ecoscore_grade: 'c',
-        completeness: 0.85,
-        nutriments: { 'energy-kcal_100g': 539 },
-      })
+      .mockResolvedValueOnce(
+        liveRead({
+          product_name: 'Nutella',
+          nutriscore_grade: 'e',
+          ecoscore_grade: 'c',
+          completeness: 0.85,
+          nutriments: { 'energy-kcal_100g': 539 },
+        }),
+      )
       .mockResolvedValueOnce(null); // not found
 
     const result = await offCompareProductsTool.handler(
@@ -247,8 +312,8 @@ describe('off_compare_products', () => {
   it('handles sparse upstream payload per product', async () => {
     // Product with no nutriments or scores
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Sparse A' })
-      .mockResolvedValueOnce({ product_name: 'Sparse B', nutriscore_grade: 'b' });
+      .mockResolvedValueOnce(liveRead({ product_name: 'Sparse A' }))
+      .mockResolvedValueOnce(liveRead({ product_name: 'Sparse B', nutriscore_grade: 'b' }));
 
     const result = await offCompareProductsTool.handler(
       { barcodes: ['1111111111111', '2222222222222'] },
@@ -343,11 +408,17 @@ describe('off_compare_products', () => {
     // Design: "When 3 of 5 barcodes resolve and 2 are not found, the caller gets a comparison
     // table for the 3 found products plus a not_found list."
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Product A', nutriscore_grade: 'a', nutriments: {} })
+      .mockResolvedValueOnce(
+        liveRead({ product_name: 'Product A', nutriscore_grade: 'a', nutriments: {} }),
+      )
       .mockResolvedValueOnce(null) // not found
-      .mockResolvedValueOnce({ product_name: 'Product C', nutriscore_grade: 'c', nutriments: {} })
+      .mockResolvedValueOnce(
+        liveRead({ product_name: 'Product C', nutriscore_grade: 'c', nutriments: {} }),
+      )
       .mockResolvedValueOnce(null) // not found
-      .mockResolvedValueOnce({ product_name: 'Product E', nutriscore_grade: 'b', nutriments: {} });
+      .mockResolvedValueOnce(
+        liveRead({ product_name: 'Product E', nutriscore_grade: 'b', nutriments: {} }),
+      );
 
     const result = await offCompareProductsTool.handler(
       {
@@ -381,11 +452,13 @@ describe('off_compare_products', () => {
     // Design: comparison rows for not-found products have {barcode, found: false} — no fabricated
     // nutrition zeros or undefined scores.
     mockGetProductFields
-      .mockResolvedValueOnce({
-        product_name: 'Found Product',
-        nutriscore_grade: 'b',
-        nutriments: { 'energy-kcal_100g': 300 },
-      })
+      .mockResolvedValueOnce(
+        liveRead({
+          product_name: 'Found Product',
+          nutriscore_grade: 'b',
+          nutriments: { 'energy-kcal_100g': 300 },
+        }),
+      )
       .mockResolvedValueOnce(null);
 
     const result = await offCompareProductsTool.handler(
@@ -407,7 +480,7 @@ describe('off_compare_products', () => {
     // Only a resolved null means "no contributor record". A rejection means the barcode was never
     // checked, so it must not enter not_found — and the barcode that did resolve must survive.
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
+      .mockResolvedValueOnce(liveRead({ product_name: 'Good Product', nutriments: {} }))
       .mockRejectedValueOnce(
         serviceUnavailable('Open Food Facts is unavailable (HTTP 503).', {
           reason: 'upstream_error',
@@ -436,7 +509,7 @@ describe('off_compare_products', () => {
     // The upstream's own explanation is appended raw and rarely ends in a period; without a
     // separator the hint runs on from it as a single sentence.
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
+      .mockResolvedValueOnce(liveRead({ product_name: 'Good Product', nutriments: {} }))
       .mockRejectedValueOnce(
         serviceUnavailable('Open Food Facts refused the request (HTTP 400): page too deep', {
           reason: 'upstream_rejected',
@@ -456,7 +529,7 @@ describe('off_compare_products', () => {
   it('keeps a rate-limited barcode out of not_found and out of the comparison rows', async () => {
     // The local limiter refuses the second barcode outright. The already-fetched row is kept.
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
+      .mockResolvedValueOnce(liveRead({ product_name: 'Good Product', nutriments: {} }))
       .mockRejectedValueOnce(
         rateLimited('openfoodfacts-mcp-server declined this product request.', {
           reason: 'rate_limited',
@@ -472,12 +545,186 @@ describe('off_compare_products', () => {
     expect(result.succeeded).toBe(1);
     expect(result.not_found).toHaveLength(0);
     expect(result.failed?.[0]?.reason).toBe('rate_limited');
+    // #76: the wait the failure carries rides the entry.
+    expect(result.failed?.[0]?.retryAfter).toBe(47);
     expect(result.products.map((p) => p.barcode)).toEqual(['1111111111111']);
+  });
+
+  // ── #76: a rate-limited barcode names its wait on both surfaces ───────────
+
+  describe('the wait on a rate-limited barcode (#76)', () => {
+    const BARCODES = ['3017620422003', '7622210100146'];
+
+    /** Answers every product read with HTTP 429, carrying `retryAfter` when one is given. */
+    function answer429(retryAfter?: string): void {
+      global.fetch = vi.fn(async () => {
+        const response = jsonResponse({ status: 0, status_verbose: 'rate limited' }, 429);
+        if (retryAfter !== undefined) response.headers.set('retry-after', retryAfter);
+        return response;
+      });
+    }
+
+    /** Runs a compare to settlement with the retry backoff collapsed onto fake timers. */
+    async function compareOnFakeTimers(barcodes: string[]) {
+      vi.useFakeTimers();
+      try {
+        const pending = runToolContract(offCompareProductsTool, { barcodes });
+        await vi.runAllTimersAsync();
+        return await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it("carries Open Food Facts' Retry-After on every failed entry and closes on the wait", async () => {
+      await useRealService();
+      answer429('60');
+
+      const result = await compareOnFakeTimers(BARCODES);
+
+      const { failed } = result.structuredContent as {
+        failed: { barcode: string; reason: string; retryAfter?: number }[];
+      };
+      expect(
+        failed.map(({ barcode, reason, retryAfter }) => [barcode, reason, retryAfter]),
+      ).toEqual([
+        ['3017620422003', 'rate_limited', 60],
+        ['7622210100146', 'rate_limited', 60],
+      ]);
+      const text = contractText(result);
+      expect(text).toContain('- 3017620422003 (rate_limited, retry after 60 s): ');
+      expect(text).toContain('- 7622210100146 (rate_limited, retry after 60 s): ');
+      expect(text).toContain(
+        'No barcode could be checked — every fetch failed, so nothing was learned about these products. Retry them after 60 s.',
+      );
+      expect(text).not.toContain('once Open Food Facts is answering again');
+    });
+
+    it('closes an all-rate-limited batch on the longest of its waits', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [],
+          succeeded: 0,
+          not_found: [],
+          failed: [
+            {
+              barcode: '3017620422003',
+              reason: 'rate_limited',
+              error: 'Slow down.',
+              retryAfter: 12,
+            },
+            {
+              barcode: '7622210100146',
+              reason: 'rate_limited',
+              error: 'Slow down.',
+              retryAfter: 47,
+            },
+            { barcode: '5449000000996', reason: 'rate_limited', error: 'Slow down.' },
+          ],
+        }),
+      );
+
+      expect(text).toContain('Retry them after 47 s.');
+      expect(text).toContain('- 5449000000996 (rate_limited): ');
+    });
+
+    it('keeps the outage closing line for a mixed batch, naming the wait only on its entry', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [],
+          succeeded: 0,
+          not_found: [],
+          failed: [
+            {
+              barcode: '3017620422003',
+              reason: 'rate_limited',
+              error: 'Slow down.',
+              retryAfter: 60,
+            },
+            { barcode: '7622210100146', reason: 'upstream_error', error: 'Down.' },
+          ],
+        }),
+      );
+
+      expect(text).toContain('- 3017620422003 (rate_limited, retry after 60 s): ');
+      expect(text).toContain('Retry them once Open Food Facts is answering again.');
+    });
+
+    it('adds no retryAfter, and no wait, for a 429 without Retry-After', async () => {
+      await useRealService();
+      answer429();
+
+      const result = await compareOnFakeTimers(BARCODES);
+
+      const { failed } = result.structuredContent as { failed: Record<string, unknown>[] };
+      expect(failed).toHaveLength(2);
+      for (const entry of failed) expect(entry).not.toHaveProperty('retryAfter');
+      const text = contractText(result);
+      expect(text).toContain('- 3017620422003 (rate_limited): ');
+      expect(text).toContain('Retry them once Open Food Facts is answering again.');
+    });
+
+    it("carries the wait this server's own product budget names for each barcode it refused", async () => {
+      await useRealService(15);
+      global.fetch = vi.fn(async () => jsonResponse({ status: 1, product: { product_name: 'x' } }));
+      // Frozen, so the budget's wait is its whole 60 s window.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const batch = (from: number) => Array.from({ length: 10 }, (_, i) => String(from + i));
+      await runToolContract(offCompareProductsTool, { barcodes: batch(3017620422000) });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: batch(3017620423000),
+      });
+
+      const { failed } = result.structuredContent as {
+        failed: { reason: string; error: string; retryAfter?: number }[];
+      };
+      expect(failed).toHaveLength(5);
+      for (const entry of failed) {
+        expect(entry.reason).toBe('rate_limited');
+        expect(entry.retryAfter).toBe(60);
+        expect(entry.error).toContain(`A slot frees in about ${entry.retryAfter}s.`);
+      }
+      expect(global.fetch).toHaveBeenCalledTimes(15);
+    });
+
+    it('rounds a wait that falls between whole seconds up to the next one, on both paths', async () => {
+      // 600 ms into the budget's window, the oldest slot frees in 59.4 s: rounding it to the
+      // nearest second (59) or down would have the caller retry before the slot frees.
+      await useRealService(15);
+      global.fetch = vi.fn(async () => jsonResponse({ status: 1, product: { product_name: 'x' } }));
+      vi.useFakeTimers({ toFake: ['Date'], now: 0 });
+      const batch = (from: number) => Array.from({ length: 10 }, (_, i) => String(from + i));
+      await runToolContract(offCompareProductsTool, { barcodes: batch(3017620422000) });
+      vi.setSystemTime(600);
+
+      const budget = await runToolContract(offCompareProductsTool, {
+        barcodes: batch(3017620423000),
+      });
+
+      const budgetFailed = (budget.structuredContent as { failed: { retryAfter?: number }[] })
+        .failed;
+      expect(budgetFailed.map(({ retryAfter }) => retryAfter)).toEqual([60, 60, 60, 60, 60]);
+      expect(contractText(budget)).toContain('(rate_limited, retry after 60 s): ');
+      expect(contractText(budget)).toContain('A slot frees in about 60s.');
+
+      // An HTTP-date Retry-After 59.4 s ahead, past the retry ceiling, so each read fails at once.
+      await useRealService();
+      vi.setSystemTime(Date.parse('2026-11-01T00:00:00.600Z'));
+      answer429('Sun, 01 Nov 2026 00:01:00 GMT');
+
+      const upstream = await runToolContract(offCompareProductsTool, { barcodes: BARCODES });
+
+      const upstreamFailed = (upstream.structuredContent as { failed: { retryAfter?: number }[] })
+        .failed;
+      expect(upstreamFailed.map(({ retryAfter }) => retryAfter)).toEqual([60, 60]);
+      expect(contractText(upstream)).toContain('Retry them after 60 s.');
+    });
   });
 
   it('describes a plain rejection without a contract reason as an upstream failure', async () => {
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Good Product', nutriments: {} })
+      .mockResolvedValueOnce(liveRead({ product_name: 'Good Product', nutriments: {} }))
       .mockRejectedValueOnce(new Error('Network timeout'));
 
     const result = await offCompareProductsTool.handler(
@@ -546,7 +793,7 @@ describe('off_compare_products', () => {
 
   it('omits failed entirely when every fetch completes', async () => {
     mockGetProductFields
-      .mockResolvedValueOnce({ product_name: 'Found', nutriments: {} })
+      .mockResolvedValueOnce(liveRead({ product_name: 'Found', nutriments: {} }))
       .mockResolvedValueOnce(null);
 
     const result = await offCompareProductsTool.handler(
@@ -783,16 +1030,20 @@ describe('off_compare_products', () => {
     // Design: "Missing nutrition data for any product is preserved as absent — comparisons are
     // not imputed."
     mockGetProductFields
-      .mockResolvedValueOnce({
-        product_name: 'No Nutrition',
-        nutriscore_grade: 'c',
-        // nutriments omitted — contributor hasn't entered them
-      })
-      .mockResolvedValueOnce({
-        product_name: 'Has Nutrition',
-        nutriscore_grade: 'a',
-        nutriments: { 'energy-kcal_100g': 50, proteins_100g: 5 },
-      });
+      .mockResolvedValueOnce(
+        liveRead({
+          product_name: 'No Nutrition',
+          nutriscore_grade: 'c',
+          // nutriments omitted — contributor hasn't entered them
+        }),
+      )
+      .mockResolvedValueOnce(
+        liveRead({
+          product_name: 'Has Nutrition',
+          nutriscore_grade: 'a',
+          nutriments: { 'energy-kcal_100g': 50, proteins_100g: 5 },
+        }),
+      );
 
     const result = await offCompareProductsTool.handler(
       { barcodes: ['1111111111111', '2222222222222'] },
@@ -865,8 +1116,8 @@ describe('off_compare_products', () => {
 
     it('fetches a 7-digit barcode beside an EAN-13, in input order', async () => {
       mockGetProductFields
-        .mockResolvedValueOnce({ product_name: 'Short-code product' })
-        .mockResolvedValueOnce({ product_name: 'Nutella' });
+        .mockResolvedValueOnce(liveRead({ product_name: 'Short-code product' }))
+        .mockResolvedValueOnce(liveRead({ product_name: 'Nutella' }));
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['6035215', '3017620422003'],
@@ -926,7 +1177,7 @@ describe('off_compare_products', () => {
     });
 
     it('fetches the first 10 of 11 barcodes and lists the 11th as unprocessed on both surfaces', async () => {
-      mockGetProductFields.mockResolvedValue({ product_name: 'Found', nutriments: {} });
+      mockGetProductFields.mockResolvedValue(liveRead({ product_name: 'Found', nutriments: {} }));
       const input = barcodes(11);
 
       const result = await runToolContract(offCompareProductsTool, { barcodes: input });
@@ -960,7 +1211,7 @@ describe('off_compare_products', () => {
     });
 
     it('adds no unprocessed key for a batch of exactly 10', async () => {
-      mockGetProductFields.mockResolvedValue({ product_name: 'Found', nutriments: {} });
+      mockGetProductFields.mockResolvedValue(liveRead({ product_name: 'Found', nutriments: {} }));
 
       const result = await runToolContract(offCompareProductsTool, { barcodes: barcodes(10) });
 
@@ -970,7 +1221,7 @@ describe('off_compare_products', () => {
     });
 
     it('fetches a repeated barcode once, in one row, as the description says', async () => {
-      mockGetProductFields.mockResolvedValue({ product_name: 'Found', nutriments: {} });
+      mockGetProductFields.mockResolvedValue(liveRead({ product_name: 'Found', nutriments: {} }));
       const [a, b] = barcodes(2) as [string, string];
 
       const result = await runToolContract(offCompareProductsTool, { barcodes: [a, b, a] });
@@ -994,7 +1245,7 @@ describe('off_compare_products', () => {
       mockGetProductFields
         .mockRejectedValueOnce(serviceUnavailable('Open Food Facts is unavailable.'))
         .mockResolvedValueOnce(null)
-        .mockResolvedValue({ product_name: 'Found', nutriments: {} });
+        .mockResolvedValue(liveRead({ product_name: 'Found', nutriments: {} }));
 
       const result = await runToolContract(offCompareProductsTool, { barcodes: input });
 
@@ -1083,16 +1334,20 @@ describe('off_compare_products', () => {
 
     it('puts a drink and a solid under one per 100 g / 100 ml table, values unchanged', async () => {
       mockGetProductFields
-        .mockResolvedValueOnce({
-          product_name: 'Coca-Cola Zero Sugar',
-          brands: 'Coca-Cola',
-          nutriments: { 'energy-kcal_100g': 0, salt_100g: 0.0246 },
-        })
-        .mockResolvedValueOnce({
-          product_name: 'Old Fashioned Oats',
-          brands: 'Quaker',
-          nutriments: { 'energy-kcal_100g': 375, salt_100g: 0 },
-        });
+        .mockResolvedValueOnce(
+          liveRead({
+            product_name: 'Coca-Cola Zero Sugar',
+            brands: 'Coca-Cola',
+            nutriments: { 'energy-kcal_100g': 0, salt_100g: 0.0246 },
+          }),
+        )
+        .mockResolvedValueOnce(
+          liveRead({
+            product_name: 'Old Fashioned Oats',
+            brands: 'Quaker',
+            nutriments: { 'energy-kcal_100g': 375, salt_100g: 0 },
+          }),
+        );
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['0049000042566', '0030000010402'],
@@ -1106,6 +1361,7 @@ describe('off_compare_products', () => {
         found: true,
         energy_kcal_100g: 0,
         salt_100g: 0.0246,
+        source: 'off_api',
       });
       const text = contractText(result);
       expect(text).toContain('### Nutrition per 100 g / 100 ml');
@@ -1124,13 +1380,15 @@ describe('off_compare_products', () => {
     it('labels a brand-only row "Barcode N (Brand)" in both tables and the note', async () => {
       // 0945666605636 as Open Food Facts returns it: a brand, no product name, low completeness.
       mockGetProductFields
-        .mockResolvedValueOnce({ brands: 'Nutella', completeness: 0.2 })
-        .mockResolvedValueOnce({
-          product_name: 'Old Fashioned Oats',
-          brands: 'Quaker',
-          completeness: 0.9,
-          nutriments: { 'energy-kcal_100g': 375 },
-        });
+        .mockResolvedValueOnce(liveRead({ brands: 'Nutella', completeness: 0.2 }))
+        .mockResolvedValueOnce(
+          liveRead({
+            product_name: 'Old Fashioned Oats',
+            brands: 'Quaker',
+            completeness: 0.9,
+            nutriments: { 'energy-kcal_100g': 375 },
+          }),
+        );
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['0945666605636', '0030000010402'],
@@ -1143,6 +1401,7 @@ describe('off_compare_products', () => {
         brands: 'Nutella',
         found: true,
         completeness: 0.2,
+        source: 'off_api',
       });
       const lines = contractText(result).split('\n');
       expect(rowsStartingWith(lines, 'Barcode 0945666605636 (Nutella)')).toHaveLength(2);
@@ -1283,10 +1542,12 @@ describe('off_compare_products', () => {
     });
 
     it('leaves a non-numeric upstream figure absent rather than coercing it', async () => {
-      mockGetProductFields.mockResolvedValue({
-        product_name: 'Strings',
-        nutriments: { 'energy-kcal_100g': 10, fat_100g: '3.2', sugars_100g: '' },
-      });
+      mockGetProductFields.mockResolvedValue(
+        liveRead({
+          product_name: 'Strings',
+          nutriments: { 'energy-kcal_100g': 10, fat_100g: '3.2', sugars_100g: '' },
+        }),
+      );
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['12345678', '87654321'],
@@ -1298,6 +1559,7 @@ describe('off_compare_products', () => {
         product_name: 'Strings',
         found: true,
         energy_kcal_100g: 10,
+        source: 'off_api',
       });
     });
 
@@ -1318,7 +1580,9 @@ describe('off_compare_products', () => {
     // ── #71: total carbohydrates ────────────────────────────────────────────
 
     it('carries both live carbohydrate figures on both surfaces, one fetch each (#71)', async () => {
-      mockGetProductFields.mockResolvedValueOnce(LINGUINE).mockResolvedValueOnce(SPAGHETTI);
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(LINGUINE))
+        .mockResolvedValueOnce(liveRead(SPAGHETTI));
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['7310100605412', '8076809545440'],
@@ -1355,10 +1619,12 @@ describe('off_compare_products', () => {
     });
 
     it('never derives carbohydrates: no key leaves the field absent and the text N/A (#71)', async () => {
-      mockGetProductFields.mockResolvedValue({
-        product_name: 'Sugars only',
-        nutriments: { sugars_100g: 12, fiber_100g: 3 },
-      });
+      mockGetProductFields.mockResolvedValue(
+        liveRead({
+          product_name: 'Sugars only',
+          nutriments: { sugars_100g: 12, fiber_100g: 3 },
+        }),
+      );
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['12345678', '87654321'],
@@ -1372,11 +1638,13 @@ describe('off_compare_products', () => {
 
     it('leaves a non-numeric carbohydrate figure absent, like the other columns (#71)', async () => {
       mockGetProductFields
-        .mockResolvedValueOnce({
-          product_name: 'String carbs',
-          nutriments: { carbohydrates_100g: '75', sugars_100g: 1 },
-        })
-        .mockResolvedValueOnce(LINGUINE);
+        .mockResolvedValueOnce(
+          liveRead({
+            product_name: 'String carbs',
+            nutriments: { carbohydrates_100g: '75', sugars_100g: 1 },
+          }),
+        )
+        .mockResolvedValueOnce(liveRead(LINGUINE));
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['12345678', '7310100605412'],
@@ -1389,13 +1657,18 @@ describe('off_compare_products', () => {
     });
 
     it('never fills as-sold carbohydrates from a prepared figure (#71)', async () => {
-      mockGetProductFields.mockResolvedValueOnce(NESQUIK).mockResolvedValueOnce(SPAGHETTI);
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(NESQUIK))
+        .mockResolvedValueOnce(liveRead(SPAGHETTI));
+      // The record's stored as-sold set is read, and it holds no carbohydrate figure (#73).
+      mockReadStoredAsSold.mockResolvedValue(NESQUIK_STORED);
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['7613035530799', '8076809545440'],
       });
 
       const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]?.energy_kcal_100g).toBe(327);
       expect(rows[0]).not.toHaveProperty('carbohydrates_100g');
       expect(rows[1]?.carbohydrates_100g).toBe(79);
     });
@@ -1418,9 +1691,30 @@ describe('off_compare_products', () => {
     const SCOPED_FOOTER =
       '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" outside the "as prepared" table = not yet entered.*';
 
+    /** A stored-set read that ran out of time, as the service hands it back (#73). */
+    const UNREAD_TIMEOUT = {
+      status: 'unread',
+      error: timeout('Open Food Facts did not respond within the 20 s retry deadline.', {
+        reason: 'upstream_timeout',
+      }),
+    };
+
+    /** One barcode's entry in the unread list for `UNREAD_TIMEOUT`. */
+    const unreadTimeoutEntry = (barcode: string) =>
+      `- ${barcode} (upstream_timeout): Open Food Facts did not respond within the 20 s retry deadline. Read the barcode again with off_get_product to fetch its stored as-sold figures.`;
+
+    /** The note for rows whose records store no usable as-sold set. */
+    const storedNoneNote = (labels: string) =>
+      `*No stored as-sold set for ${labels} (stored set: none): Open Food Facts stores no entered as-sold figures for them that can be given per 100 g, or per 100 ml for liquids.*`;
+
+    /** The barcodes whose stored set was read, in call order. */
+    const storedReads = () => mockReadStoredAsSold.mock.calls.map(([barcode]) => barcode);
+
     /** Run two records through the tool and return both surfaces. */
     async function compareTwo(first: object, second: object) {
-      mockGetProductFields.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(first))
+        .mockResolvedValueOnce(liveRead(second));
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['7613035530799', '8076809545440'],
       });
@@ -1429,6 +1723,7 @@ describe('off_compare_products', () => {
     }
 
     it('splits a prepared-only row from an as-sold row across the two tables', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { rows, text } = await compareTwo(NESQUIK, SPAGHETTI);
 
       expect(rows[0]).toEqual({
@@ -1446,17 +1741,20 @@ describe('off_compare_products', () => {
           proteins_100g: 3.8,
           fiber_100g: 1.9,
         },
+        stored_as_sold: { status: 'none' },
+        source: 'off_api',
       });
       expect(rows[1]).not.toHaveProperty('prepared');
       expect(rows[1]?.energy_kcal_100g).toBe(358);
+      // Only the prepared-only row's stored set is read.
+      expect(storedReads()).toEqual(['7613035530799']);
 
-      const nesquik = 'NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.)';
       expect(tableUnder(text, AS_SOLD)?.map((row) => row.Product)).toEqual([
         SPAGHETTI.product_name,
       ]);
       expect(tableUnder(text, AS_PREPARED)).toEqual([
         {
-          Product: nesquik,
+          Product: NESQUIK_LABEL,
           'Energy (kcal)': '68',
           'Fat (g)': '1.9',
           'Sat. Fat (g)': '1.1',
@@ -1472,16 +1770,97 @@ describe('off_compare_products', () => {
       expect(mockGetProductFields).toHaveBeenCalledTimes(2);
     });
 
-    it('says the read returned no as-sold figures, never that the record has none', async () => {
-      const { text } = await compareTwo(NESQUIK, SPAGHETTI);
+    it('says the read returned no as-sold figures, never that the record has none', () => {
+      // A row with prepared column figures, no as-sold column figure, and no stored_as_sold: a
+      // read whose only as-sold figures fall outside the columns, as the test below shows.
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [
+            {
+              barcode: '7613035530799',
+              product_name: NESQUIK.product_name,
+              brands: NESQUIK.brands,
+              found: true,
+              prepared: { energy_kcal_100g: 68 },
+            },
+          ],
+          succeeded: 1,
+          not_found: [],
+        }),
+      );
 
       expect(text).toContain(
-        '*This read returned no as-sold figures for NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.). Open Food Facts returns one preparation state per read, so the record can still hold them.*',
+        '*This read returned no as-sold figures in the compared columns for NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.). Open Food Facts returns one preparation state per read, so the record can still hold them.*',
       );
       expect(text).not.toMatch(/(record|product) (has|holds|carries) no/i);
     });
 
+    /**
+     * The stored set is read only for a read holding no as-sold figure at all, while the note counts
+     * the compared columns alone, so it names the columns: a read whose as-sold figures all fall
+     * outside them, beside prepared column figures, reaches the note from the handler.
+     */
+    it.each([
+      ['an as-sold kJ figure', { 'energy-kj_100g': 1370, fat_prepared_100g: 1.9 }],
+      ['an as-sold per-serving figure', { 'energy-kcal_serving': 80, fat_prepared_100g: 1.9 }],
+    ])(
+      'reaches the note from the handler for a read holding %s beside prepared columns',
+      async (_label, nutriments) => {
+        const { rows, text } = await compareTwo({ product_name: 'Legacy', nutriments }, SPAGHETTI);
+
+        expect(storedReads()).toEqual([]);
+        expect(rows[0]?.prepared).toEqual({ fat_100g: 1.9 });
+        expect(rows[0]).not.toHaveProperty('stored_as_sold');
+        expect(text).toContain(
+          '*This read returned no as-sold figures in the compared columns for Legacy. Open Food Facts returns one preparation state per read, so the record can still hold them.*',
+        );
+      },
+    );
+
+    it.each([
+      ['unread', UNREAD_TIMEOUT, ['', UNREAD_HEADING, unreadTimeoutEntry('7613035530799')]],
+      ['none', { status: 'none' }, [storedNoneNote(NESQUIK_LABEL)]],
+    ])(
+      'says how the stored-set read went for a prepared-only row (stored set %s)',
+      async (_status, read, statement) => {
+        mockReadStoredAsSold.mockResolvedValue(read);
+        const { text } = await compareTwo(NESQUIK, SPAGHETTI);
+        const lines = text.split('\n');
+
+        const at = lines.indexOf(statement[statement.length - 1] as string);
+        expect(at).toBeGreaterThan(0);
+        expect(lines.slice(at - statement.length + 1, at + 1)).toEqual(statement);
+        expect(text).not.toContain('*This read returned no as-sold figures');
+        expect(text).not.toMatch(/(record|product) (has|holds|carries) no/i);
+      },
+    );
+
+    it('keeps a row whose stored set was read in the as-sold table when that set fills no compared column', async () => {
+      // A stored set qualifies on any figure it yields, so the one read here holds kJ energy and
+      // vitamin C, neither a compared column (energy is compared in kcal).
+      mockReadStoredAsSold.mockResolvedValue({
+        status: 'read',
+        nutriments: { 'energy-kj_100g': 1370, energy_100g: 1370, 'vitamin-c_100g': 0.15 },
+      });
+      const { rows, text } = await compareTwo(NESQUIK, SPAGHETTI);
+
+      expect(rows[0]).toMatchObject({ stored_as_sold: { status: 'read' }, source: 'off_api' });
+      expect(rows[0]).not.toHaveProperty('energy_kcal_100g');
+      // The record's stored as-sold set was read, so its N/As are "not yet entered" in that set,
+      // as the footer says: the row sits in both tables, as any row whose stored set was read does.
+      const asSold = tableUnder(text, AS_SOLD);
+      expect(asSold?.map((row) => row.Product)).toEqual([NESQUIK_LABEL, SPAGHETTI.product_name]);
+      expect(asSold?.[0]).toMatchObject({ 'Energy (kcal)': 'N/A', 'Fat (g)': 'N/A' });
+      expect(tableUnder(text, AS_PREPARED)?.map((row) => row.Product)).toEqual([NESQUIK_LABEL]);
+      expect(text).toContain(
+        `*As-sold figures for ${NESQUIK_LABEL} come from the as-sold set each record stores (stored set: read), since the product read returned only prepared figures.*`,
+      );
+      expect(text).not.toContain('*This read returned no as-sold figures');
+      expect(text.split('\n').at(-1)).toBe(SCOPED_FOOTER);
+    });
+
     it('gives the "as prepared" table N/A wording true of it, scoping the footer', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { text } = await compareTwo(
         { product_name: 'One figure', nutriments: { fat_prepared_100g: 1.9 } },
         SPAGHETTI,
@@ -1496,6 +1875,7 @@ describe('off_compare_products', () => {
     });
 
     it('renders a row with one prepared figure, N/A in every other column', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { rows, text } = await compareTwo(
         { product_name: 'One figure', nutriments: { fat_prepared_100g: 1.9 } },
         SPAGHETTI,
@@ -1517,7 +1897,10 @@ describe('off_compare_products', () => {
       ]);
     });
 
-    it('prints no as-sold table when every found row is prepared-only', async () => {
+    it('prints no as-sold table when no prepared-only row had a stored set read', async () => {
+      mockReadStoredAsSold.mockImplementation(async (barcode: string) =>
+        barcode === '7613035530799' ? { status: 'none' } : UNREAD_TIMEOUT,
+      );
       const { text } = await compareTwo(NESQUIK, {
         product_name: 'Cacao',
         nutriments: { 'energy-kcal_prepared_100g': 72 },
@@ -1527,13 +1910,16 @@ describe('off_compare_products', () => {
       expect(tableUnder(text, AS_PREPARED)).toHaveLength(2);
       expect(tableUnder(text, '### Scores')).toHaveLength(2);
       expect(text.split('\n').at(-1)).toBe(SCOPED_FOOTER);
-      expect(text).toContain(
-        '*This read returned no as-sold figures for NESQUIK Moins de Sucres (Société des Produits Nestlé S.A.), Cacao.',
-      );
+      const lines = text.split('\n');
+      expect(lines).toContain(storedNoneNote(NESQUIK_LABEL));
+      expect(lines).toContain(unreadTimeoutEntry('8076809545440'));
+      expect(storedReads().sort()).toEqual(['7613035530799', '8076809545440']);
     });
 
     it('prints no "as prepared" table or wording when no row carries prepared figures', async () => {
-      mockGetProductFields.mockResolvedValueOnce(LINGUINE).mockResolvedValueOnce(SPAGHETTI);
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(LINGUINE))
+        .mockResolvedValueOnce(liveRead(SPAGHETTI));
 
       const result = await runToolContract(offCompareProductsTool, {
         barcodes: ['7310100605412', '8076809545440'],
@@ -1551,6 +1937,7 @@ describe('off_compare_products', () => {
     });
 
     it('keeps a row holding both states in both tables, with no read-only claim', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { rows, text } = await compareTwo(
         {
           product_name: 'Both states',
@@ -1569,12 +1956,14 @@ describe('off_compare_products', () => {
         'Fat (g)': '2',
         'Sugars (g)': '1',
       });
-      // Only the prepared-only row is named as having no as-sold figures.
-      expect(text).toContain('no as-sold figures for NESQUIK');
-      expect(text).not.toContain('no as-sold figures for Both states');
+      // Only the prepared-only row has its stored set read, and only it is named in a note.
+      expect(storedReads()).toEqual(['8076809545440']);
+      expect(text).toContain(storedNoneNote(NESQUIK_LABEL));
+      expect(text).not.toContain('for Both states');
     });
 
     it('reads no figure the prepared columns do not name', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { rows } = await compareTwo(
         { product_name: 'kJ only', nutriments: { 'energy-kj_prepared_100g': 287 } },
         {
@@ -1588,6 +1977,7 @@ describe('off_compare_products', () => {
     });
 
     it('builds no prepared object from per-serving figures alone', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { rows, text } = await compareTwo(
         {
           product_name: 'Serving only',
@@ -1601,6 +1991,7 @@ describe('off_compare_products', () => {
     });
 
     it('leaves a non-numeric prepared figure absent', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { rows } = await compareTwo(
         {
           product_name: 'Strings',
@@ -1614,10 +2005,11 @@ describe('off_compare_products', () => {
 
     it('keeps the settlement fields beside a prepared row', async () => {
       mockGetProductFields.mockImplementation(async (barcode: string) => {
-        if (barcode === '7613035530799') return NESQUIK;
+        if (barcode === '7613035530799') return liveRead(NESQUIK);
         if (barcode === '8076809545440') return null;
         throw serviceUnavailable('Open Food Facts is down.');
       });
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const failing = Array.from({ length: 10 }, (_, i) => String(1000000000001 + i));
 
       const result = await runToolContract(offCompareProductsTool, {
@@ -1637,6 +2029,8 @@ describe('off_compare_products', () => {
       expect(output.unprocessed).toEqual(failing.slice(8));
       // One fetch per distinct barcode compared: the repeat and the unprocessed two cost none.
       expect(mockGetProductFields).toHaveBeenCalledTimes(10);
+      // A stored-set read follows the found prepared-only row alone, never a missing or failed one.
+      expect(storedReads()).toEqual(['7613035530799']);
     });
 
     it('adds nothing to a batch in which no barcode resolved', async () => {
@@ -1656,13 +2050,28 @@ describe('off_compare_products', () => {
     });
 
     it('escapes a prepared row label in its table and its note', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
       const { text } = await compareTwo(
         { product_name: 'A | B', nutriments: { fat_prepared_100g: 1 } },
         SPAGHETTI,
       );
 
       expect(tableUnder(text, AS_PREPARED)?.[0]?.Product).toBe('A \\| B');
-      expect(text).toContain('no as-sold figures for A \\| B.');
+      expect(text).toContain('No stored as-sold set for A \\| B (stored set: none)');
+    });
+
+    it('escapes the label of a row whose stored set was read in both tables and its note, raw in structuredContent', async () => {
+      mockReadStoredAsSold.mockResolvedValue({ status: 'read', nutriments: { fat_100g: 5.4 } });
+      const { rows, text } = await compareTwo(
+        { product_name: 'A | *B*', nutriments: { fat_prepared_100g: 1 } },
+        SPAGHETTI,
+      );
+
+      expect(rows[0]).toMatchObject({ product_name: 'A | *B*', fat_100g: 5.4 });
+      expect(tableUnder(text, AS_SOLD)?.[0]?.Product).toBe('A \\| \\*B\\*');
+      expect(tableUnder(text, AS_PREPARED)?.[0]?.Product).toBe('A \\| \\*B\\*');
+      expect(text).toContain('*As-sold figures for A \\| \\*B\\* come from the as-sold set');
+      expect(text).not.toContain('A | *B*');
     });
 
     it('holds exactly the as-sold column keys, each on the stated basis', () => {
@@ -1688,11 +2097,639 @@ describe('off_compare_products', () => {
 
     it('states on the schema and the tool that an as-sold absence is about the read', () => {
       for (const key of ['energy_kcal_100g', 'carbohydrates_100g', 'fiber_100g'] as const) {
-        expect(ROW[key].description, key).toContain('this read returned only prepared figures');
+        // Since #73 a prepared-only read's as-sold fields come from the record's stored set.
+        expect(ROW[key].description, key).toContain(
+          "When the product read returned only prepared figures, read from the record's stored as-sold set instead (see stored_as_sold).",
+        );
+        expect(ROW[key].description, key).toContain('or when that stored set was not read');
       }
       expect(ROW.prepared.description).toContain('*_prepared_100g');
       expect(ROW.prepared.description).toContain('one preparation state per read');
       expect(offCompareProductsTool.description).toContain('prepared object');
+    });
+  });
+
+  // ── #73: a prepared-only row is followed by a read of its stored as-sold set ──
+
+  describe('stored as-sold sets (#73)', () => {
+    const AS_SOLD = '### Nutrition per 100 g / 100 ml';
+    const AS_PREPARED = '### Nutrition per 100 g / 100 ml, as prepared';
+    const RATE_LIMITED_HINT =
+      'Wait the seconds in retryAfter, or about a minute when it is absent, then read the barcode again with off_get_product to fetch its stored as-sold figures.';
+
+    /** The two prepared-only captures and the as-sold one, labelled as their rows print. */
+    const NESQUIK_CODE = '7613035530799';
+    const POULAIN = '3664346306027';
+    const NUTELLA = '3017620422003';
+    const POULAIN_LABEL = '1848 (Poulain)';
+
+    /** One answer: held until its signal aborts, or a JSON body with a status, optionally late. */
+    type Answer = 'hang' | { status: number; body: unknown; afterMs?: number };
+
+    /** A request the fake saw: when on the clock, which API version, and the barcode. */
+    type Sent = { atMs: number; api: 'v2' | 'v3.5'; code: string };
+
+    /**
+     * Route each request by API version and barcode, serving its answers in order and repeating the
+     * last. `onSend` runs as a request goes out, so a test can abort once its requests are in
+     * flight. An unrouted request is still recorded, so the request counts show it.
+     */
+    function routeFetch(
+      answers: Record<'v2' | 'v3.5', Record<string, Answer[]>>,
+      onSend?: (sent: Sent, all: Sent[]) => void,
+    ): Sent[] {
+      const sent: Sent[] = [];
+      const served = new Map<string, number>();
+      global.fetch = vi.fn((input: unknown, init?: RequestInit) => {
+        const { pathname } = new URL(String(input));
+        const api = pathname.startsWith('/api/v3.5/') ? 'v3.5' : 'v2';
+        const code = (pathname.split('/').at(-1) ?? '').replace(/\.json$/, '');
+        const request: Sent = { atMs: Date.now(), api, code };
+        sent.push(request);
+        const queue = answers[api][code];
+        if (!queue) return Promise.reject(new Error(`Unrouted ${api} request for ${code}`));
+        const n = served.get(`${api} ${code}`) ?? 0;
+        served.set(`${api} ${code}`, n + 1);
+        const answer = queue[Math.min(n, queue.length - 1)] as Answer;
+        return new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal as AbortSignal;
+          signal.addEventListener('abort', () => reject(signal.reason));
+          onSend?.(request, sent);
+          if (answer === 'hang') return;
+          const respond = () =>
+            resolve(
+              new Response(JSON.stringify(answer.body), {
+                status: answer.status,
+                headers: { 'content-type': 'application/json' },
+              }),
+            );
+          if (answer.afterMs === undefined) respond();
+          else setTimeout(respond, answer.afterMs);
+        });
+      }) as typeof fetch;
+      return sent;
+    }
+
+    /** Every capture answering at once; no v3.5 route for the as-sold record. */
+    function captures(): Record<'v2' | 'v3.5', Record<string, Answer[]>> {
+      return {
+        v2: {
+          [NESQUIK_CODE]: [{ status: 200, body: v2Capture(NESQUIK_CODE) }],
+          [POULAIN]: [{ status: 200, body: v2Capture(POULAIN) }],
+          [NUTELLA]: [{ status: 200, body: v2Capture(NUTELLA) }],
+        },
+        'v3.5': {
+          [NESQUIK_CODE]: [{ status: 200, body: v35Capture(NESQUIK_CODE) }],
+          [POULAIN]: [{ status: 200, body: v35Capture(POULAIN) }],
+        },
+      };
+    }
+
+    type Row = {
+      barcode: string;
+      energy_kcal_100g?: number;
+      sugars_100g?: number;
+      prepared?: { energy_kcal_100g?: number };
+      stored_as_sold?: { status: string; reason?: string; error?: string; retryAfter?: number };
+    };
+    type Output = {
+      products: Row[];
+      failed?: unknown[];
+      error?: { code: number; message: string };
+    };
+
+    /** Run a compare on fake timers from 0 ms with jitter off, reporting when it settled. */
+    async function clockedCompare(
+      answers: Record<'v2' | 'v3.5', Record<string, Answer[]>>,
+    ): Promise<{ output: Output; isError: unknown; settledAtMs: number; sent: Sent[] }> {
+      vi.useFakeTimers({ now: 0 });
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      try {
+        const sent = routeFetch(answers);
+        const pending = runToolContract(offCompareProductsTool, {
+          barcodes: [NESQUIK_CODE, POULAIN, NUTELLA],
+        }).then((result) => ({ result, settledAtMs: Date.now() }));
+        await vi.advanceTimersByTimeAsync(200_000);
+        const { result, settledAtMs } = await pending;
+        return {
+          output: result.structuredContent as Output,
+          isError: result.isError,
+          settledAtMs,
+          sent,
+        };
+      } finally {
+        random.mockRestore();
+        vi.useRealTimers();
+      }
+    }
+
+    describe('settleStoredAsSold', () => {
+      it.each([
+        [
+          serviceUnavailable('Open Food Facts is unavailable (HTTP 503)', {
+            reason: 'upstream_error',
+          }),
+          'upstream_error',
+          'Open Food Facts is unavailable (HTTP 503). Read the barcode again with off_get_product after a brief pause to fetch its stored as-sold figures.',
+        ],
+        [
+          timeout('Open Food Facts did not respond within the 20 s retry deadline.', {
+            reason: 'upstream_timeout',
+          }),
+          'upstream_timeout',
+          'Open Food Facts did not respond within the 20 s retry deadline. Read the barcode again with off_get_product to fetch its stored as-sold figures.',
+        ],
+        [
+          invalidParams('Open Food Facts refused the request (HTTP 400)', {
+            reason: 'upstream_rejected',
+          }),
+          'upstream_rejected',
+          'Open Food Facts refused the request (HTTP 400). Do not repeat the read unchanged: Open Food Facts refused it as formed, so the prepared figures are what this call can report.',
+        ],
+        [
+          rateLimited('Open Food Facts is rate-limiting this client (HTTP 429)', {
+            reason: 'rate_limited',
+          }),
+          'rate_limited',
+          `Open Food Facts is rate-limiting this client (HTTP 429). ${RATE_LIMITED_HINT}`,
+        ],
+        [
+          new McpError(JsonRpcErrorCode.InternalError, 'Unclassified failure'),
+          'upstream_error',
+          'Unclassified failure. Read the barcode again with off_get_product after a brief pause to fetch its stored as-sold figures.',
+        ],
+      ])('leaves the product as read beside an unread entry: %s', (error, reason, message) => {
+        const product = { product_name: 'Cocoa', nutriments: { fat_prepared_100g: 2 } };
+
+        const settled = settleStoredAsSold(NESQUIK_CODE, product, { status: 'unread', error });
+
+        expect(settled.product).toBe(product);
+        // Shaped like a failed entry, less the barcode its holder already carries.
+        expect(settled.stored_as_sold).toEqual({ status: 'unread', reason, error: message });
+      });
+
+      // The rows above name no wait and carry no retryAfter; this one names a wait.
+      it('carries the wait a failure names', () => {
+        const product = { nutriments: { fat_prepared_100g: 2 } };
+        const waited = settleStoredAsSold(NESQUIK_CODE, product, {
+          status: 'unread',
+          error: rateLimited('Slow down.', { reason: 'rate_limited', retryAfter: 30 }),
+        });
+
+        expect(waited.stored_as_sold).toEqual({
+          status: 'unread',
+          reason: 'rate_limited',
+          error: `Slow down. ${RATE_LIMITED_HINT}`,
+          retryAfter: 30,
+        });
+      });
+    });
+
+    it('renders each outcome on both surfaces, none of them a failed fetch', async () => {
+      const prepared = (name: string) => ({
+        product_name: name,
+        nutriments: { 'energy-kcal_prepared_100g': 68, fat_prepared_100g: 1.9 },
+      });
+      mockGetProductFields.mockImplementation(async (barcode: string) =>
+        liveRead(
+          prepared(
+            { '11111111': 'Cocoa read', '22222222': 'Cocoa none' }[barcode] ?? 'Cocoa unread',
+          ),
+        ),
+      );
+      mockReadStoredAsSold.mockImplementation(async (barcode: string) => {
+        if (barcode === '11111111') {
+          return { status: 'read', nutriments: { 'energy-kcal_100g': 327, fat_100g: 5.4 } };
+        }
+        if (barcode === '22222222') return { status: 'none' };
+        return {
+          status: 'unread',
+          error: rateLimited('Open Food Facts is rate-limiting this client (HTTP 429): *slow*', {
+            reason: 'rate_limited',
+            retryAfter: 30,
+          }),
+        };
+      });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['11111111', '22222222', '33333333'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const output = result.structuredContent as Output & { succeeded: number };
+      const preparedFigures = { energy_kcal_100g: 68, fat_100g: 1.9 };
+      expect(output.products).toEqual([
+        {
+          barcode: '11111111',
+          product_name: 'Cocoa read',
+          found: true,
+          energy_kcal_100g: 327,
+          fat_100g: 5.4,
+          prepared: preparedFigures,
+          stored_as_sold: { status: 'read' },
+          source: 'off_api',
+        },
+        {
+          barcode: '22222222',
+          product_name: 'Cocoa none',
+          found: true,
+          prepared: preparedFigures,
+          stored_as_sold: { status: 'none' },
+          source: 'off_api',
+        },
+        {
+          barcode: '33333333',
+          product_name: 'Cocoa unread',
+          found: true,
+          prepared: preparedFigures,
+          stored_as_sold: {
+            status: 'unread',
+            reason: 'rate_limited',
+            error: `Open Food Facts is rate-limiting this client (HTTP 429): *slow*. ${RATE_LIMITED_HINT}`,
+            retryAfter: 30,
+          },
+          source: 'off_api',
+        },
+      ]);
+      expect(output.succeeded).toBe(3);
+      expect(output).not.toHaveProperty('failed');
+
+      const text = contractText(result);
+      const lines = text.split('\n');
+      expect(
+        tableUnder(text, AS_SOLD)?.map((row) => [
+          row.Product,
+          row['Energy (kcal)'],
+          row['Fat (g)'],
+        ]),
+      ).toEqual([['Cocoa read', '327', '5.4']]);
+      expect(tableUnder(text, AS_PREPARED)?.map((row) => row.Product)).toEqual([
+        'Cocoa read',
+        'Cocoa none',
+        'Cocoa unread',
+      ]);
+      expect(lines).toContain(
+        '*As-sold figures for Cocoa read come from the as-sold set each record stores (stored set: read), since the product read returned only prepared figures.*',
+      );
+      expect(lines).toContain(
+        '*No stored as-sold set for Cocoa none (stored set: none): Open Food Facts stores no entered as-sold figures for them that can be given per 100 g, or per 100 ml for liquids.*',
+      );
+      const unreadAt = lines.indexOf(UNREAD_HEADING);
+      expect(unreadAt).toBeGreaterThan(0);
+      expect(lines.slice(unreadAt + 1, unreadAt + 2)).toEqual([
+        `- 33333333 (rate_limited, retry after 30 s): Open Food Facts is rate-limiting this client (HTTP 429): \\*slow\\*. ${RATE_LIMITED_HINT}`,
+      ]);
+      expect(text).not.toContain('Fetch failed');
+      expect(text).not.toContain('*This read returned no as-sold figures');
+      expect(lines.at(-1)).toBe(
+        '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" outside the "as prepared" table = not yet entered.*',
+      );
+    });
+
+    describe('through the service', () => {
+      beforeEach(async () => {
+        await useRealService();
+      });
+
+      it('sends exactly 5 product requests for two prepared-only barcodes and an as-sold one', async () => {
+        const sent = routeFetch(captures());
+
+        const result = await runToolContract(offCompareProductsTool, {
+          barcodes: [NESQUIK_CODE, POULAIN, NUTELLA],
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(sent.map(({ api, code }) => `${api} ${code}`).sort()).toEqual([
+          `v2 ${NUTELLA}`,
+          `v2 ${POULAIN}`,
+          `v2 ${NESQUIK_CODE}`,
+          `v3.5 ${POULAIN}`,
+          `v3.5 ${NESQUIK_CODE}`,
+        ]);
+        const output = result.structuredContent as Output;
+        expect(
+          output.products.map((row) => [
+            row.barcode,
+            row.energy_kcal_100g,
+            row.sugars_100g,
+            row.prepared?.energy_kcal_100g,
+            row.stored_as_sold,
+          ]),
+        ).toEqual([
+          [NESQUIK_CODE, 327, undefined, 68, { status: 'read' }],
+          [POULAIN, 148, 17, 355, { status: 'read' }],
+          [NUTELLA, 539, 56.3, undefined, undefined],
+        ]);
+        expect(output.products[2]).not.toHaveProperty('stored_as_sold');
+        expect(output).not.toHaveProperty('failed');
+
+        const text = contractText(result);
+        expect(
+          tableUnder(text, AS_SOLD)?.map((row) => [
+            row.Product,
+            row['Energy (kcal)'],
+            row['Sugars (g)'],
+          ]),
+        ).toEqual([
+          [NESQUIK_LABEL, '327', 'N/A'],
+          [POULAIN_LABEL, '148', '17'],
+          ['Nutella (Nutella, Ferrero)', '539', '56.3'],
+        ]);
+        expect(
+          tableUnder(text, AS_PREPARED)?.map((row) => [row.Product, row['Energy (kcal)']]),
+        ).toEqual([
+          [NESQUIK_LABEL, '68'],
+          [POULAIN_LABEL, '355'],
+        ]);
+        expect(text).toContain(
+          `*As-sold figures for ${NESQUIK_LABEL}, ${POULAIN_LABEL} come from the as-sold set each record stores (stored set: read), since the product read returned only prepared figures.*`,
+        );
+      });
+
+      /**
+       * The as-sold record's v2 read answers at 34.999 s: 15 s stall, 0.5 s backoff, 15 s stall,
+       * 1 s backoff, 3.499 s. Both stored-set reads wait for it, so a v2 retry's late budget slot
+       * is never taken by a follow-up started beside it.
+       */
+      const SLOW_V2: Answer[] = [
+        'hang',
+        'hang',
+        { status: 200, body: v2Capture(NUTELLA), afterMs: 3_499 },
+      ];
+
+      it('starts both stored-set reads only after the slow third read settles', async () => {
+        const answers = captures();
+        answers.v2[NUTELLA] = SLOW_V2;
+
+        const { output, isError, settledAtMs, sent } = await clockedCompare(answers);
+
+        expect(isError).toBeFalsy();
+        // Sorted: reads fired together reach a fetch stub in an order the runtime picks.
+        expect(
+          sent
+            .filter(({ api }) => api === 'v2')
+            .map(({ code, atMs }) => [code, atMs])
+            .sort(),
+        ).toEqual([
+          [NUTELLA, 0],
+          [NUTELLA, 15_500],
+          [NUTELLA, 31_500],
+          [POULAIN, 0],
+          [NESQUIK_CODE, 0],
+        ]);
+        expect(
+          sent
+            .filter(({ api }) => api === 'v3.5')
+            .map(({ code, atMs }) => [code, atMs])
+            .sort(),
+        ).toEqual([
+          [POULAIN, 34_999],
+          [NESQUIK_CODE, 34_999],
+        ]);
+        expect(settledAtMs).toBe(34_999);
+        expect(output.products.map((row) => row.stored_as_sold?.status)).toEqual([
+          'read',
+          'read',
+          undefined,
+        ]);
+      });
+
+      it('settles by 55 s when the stored sets behind a slow read never answer, failing no row', async () => {
+        const answers = captures();
+        answers.v2[NUTELLA] = SLOW_V2;
+        answers['v3.5'] = { [NESQUIK_CODE]: ['hang'], [POULAIN]: ['hang'] };
+
+        const { output, isError, settledAtMs, sent } = await clockedCompare(answers);
+
+        expect(isError).toBeFalsy();
+        expect(settledAtMs).toBe(54_999);
+        expect(
+          sent
+            .filter(({ api }) => api === 'v3.5')
+            .map(({ atMs }) => atMs)
+            .sort(),
+        ).toEqual([34_999, 34_999, 50_499, 50_499]);
+        expect(
+          output.products.map((row) => [row.stored_as_sold?.status, row.stored_as_sold?.reason]),
+        ).toEqual([
+          ['unread', 'upstream_timeout'],
+          ['unread', 'upstream_timeout'],
+          [undefined, undefined],
+        ]);
+        expect(output.products[1]?.prepared?.energy_kcal_100g).toBe(355);
+        expect(output).not.toHaveProperty('failed');
+      });
+
+      it('leaves the follow-up the product budget refuses unread as rate_limited, never failed', async () => {
+        await useRealService(4);
+        const sent = routeFetch(captures());
+        // Frozen, so the budget's wait is its whole 60 s window.
+        vi.useFakeTimers({ toFake: ['Date'] });
+
+        const result = await runToolContract(offCompareProductsTool, {
+          barcodes: [NESQUIK_CODE, POULAIN, NUTELLA],
+        });
+
+        expect(result.isError).toBeFalsy();
+        const output = result.structuredContent as Output;
+        expect(output).not.toHaveProperty('failed');
+        // Three v2 reads and one stored-set read spend the 4 slots; the other is refused locally.
+        expect(sent.map(({ api }) => api).sort()).toEqual(['v2', 'v2', 'v2', 'v3.5']);
+        const read = output.products.find((row) => row.stored_as_sold?.status === 'read');
+        const refused = output.products.find((row) => row.stored_as_sold?.status === 'unread');
+        expect(sent.filter(({ api }) => api === 'v3.5').map(({ code }) => code)).toEqual([
+          read?.barcode,
+        ]);
+        expect(refused?.stored_as_sold).toEqual({
+          status: 'unread',
+          reason: 'rate_limited',
+          error: `openfoodfacts-mcp-server declined this product request: its own client-side budget of 4 product requests/min is spent, so nothing was sent to Open Food Facts. A slot frees in about 60s. ${RATE_LIMITED_HINT}`,
+          retryAfter: 60,
+        });
+        expect(refused).not.toHaveProperty('energy_kcal_100g');
+        expect(refused?.prepared?.energy_kcal_100g).toBeGreaterThan(0);
+        expect(contractText(result)).toContain(
+          `- ${refused?.barcode} (rate_limited, retry after 60 s): openfoodfacts-mcp-server declined`,
+        );
+      });
+
+      it('ends as RequestCancelled when the caller aborts during the stored-set reads', async () => {
+        const controller = new AbortController();
+        const answers = captures();
+        answers['v3.5'] = { [NESQUIK_CODE]: ['hang'], [POULAIN]: ['hang'] };
+        const sent = routeFetch(answers, (_request, all) => {
+          if (all.filter(({ api }) => api === 'v3.5').length === 2) controller.abort();
+        });
+
+        const result = await runToolContract(
+          offCompareProductsTool,
+          { barcodes: [NESQUIK_CODE, POULAIN, NUTELLA] },
+          { context: { signal: controller.signal, errors: offCompareProductsTool.errors } },
+        );
+
+        expect(result.isError).toBe(true);
+        const { error } = result.structuredContent as Output;
+        expect(error?.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        // The abort of the stored-set read itself, not a failure of this tool's own.
+        const aborted = 'fetch GET https://world.openfoodfacts.org/…?… was aborted.';
+        expect(error?.message).toBe(aborted);
+        expect(contractText(result)).toContain(aborted);
+        expect(JSON.stringify(result)).not.toContain('stored_as_sold');
+        expect(JSON.stringify(result)).not.toContain('unread');
+        expect(sent).toHaveLength(5);
+      });
+    });
+  });
+
+  // ── #79: where each row was read — the live API or the local export mirror ──
+
+  describe('where each row was read (#79)', () => {
+    const LATER = '2026-11-02T06:25:32.000Z';
+    const FOOTER = '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered.*';
+    const LIVE_LABEL = 'off_api (Open Food Facts)';
+    const mirrorLabel = (asOf: string) =>
+      `off_mirror (this server's local copy of the Open Food Facts export, as of ${asOf})`;
+    const NOTE = `The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, current as of ${MIRROR_AS_OF}, not the live database, so an edit made to them since then is not reflected.`;
+    const LINGUINE_CODE = '7310100605412';
+    const SPAGHETTI_CODE = '8076809545440';
+
+    /**
+     * Compare the barcodes of `reads` in order, each answered by the read paired with it, and
+     * return both surfaces. Pairs rather than an object, which would list integer-like barcodes
+     * first.
+     */
+    async function compareReads(reads: [barcode: string, read: ProductRead | null][]) {
+      const byBarcode = new Map(reads);
+      mockGetProductFields.mockImplementation(async (barcode: string) => byBarcode.get(barcode));
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: reads.map(([barcode]) => barcode),
+      });
+      const structured = result.structuredContent as {
+        products: Record<string, unknown>[];
+        mirror_snapshot?: string;
+      };
+      const text = contractText(result);
+      return {
+        structured,
+        rows: structured.products,
+        text,
+        sourceLines: text.split('\n').filter((line) => line.startsWith('**Source:**')),
+      };
+    }
+
+    it('marks every row of a live comparison off_api in one source line, with no note', async () => {
+      const { structured, rows, text, sourceLines } = await compareReads([
+        [LINGUINE_CODE, liveRead(LINGUINE)],
+        [SPAGHETTI_CODE, liveRead(SPAGHETTI)],
+      ]);
+
+      expect(rows.map((row) => row.source)).toEqual(['off_api', 'off_api']);
+      for (const row of rows) expect(row).not.toHaveProperty('mirror_as_of');
+      expect(structured).not.toHaveProperty('mirror_snapshot');
+      expect(sourceLines).toEqual([`**Source:** ${LIVE_LABEL}`]);
+      expect(text.split('\n').slice(-2)).toEqual([`**Source:** ${LIVE_LABEL}`, FOOTER]);
+      expect(text).not.toMatch(/off_mirror|local copy|Mirror freshness/);
+    });
+
+    it('marks every row the mirror served in one source line with its as-of time, and one note', async () => {
+      const { structured, rows, text, sourceLines } = await compareReads([
+        [LINGUINE_CODE, mirrorRead(LINGUINE)],
+        [SPAGHETTI_CODE, mirrorRead(SPAGHETTI)],
+      ]);
+
+      expect(rows.map((row) => [row.source, row.mirror_as_of])).toEqual([
+        ['off_mirror', MIRROR_AS_OF],
+        ['off_mirror', MIRROR_AS_OF],
+      ]);
+      expect(structured.mirror_snapshot).toBe(NOTE);
+      // One line for the whole comparison: no barcode list when every row shares the source.
+      expect(sourceLines).toEqual([`**Source:** ${mirrorLabel(MIRROR_AS_OF)}`]);
+      const lines = text.split('\n');
+      expect(lines.slice(-5)).toEqual([
+        `**Source:** ${mirrorLabel(MIRROR_AS_OF)}`,
+        FOOTER,
+        '',
+        '',
+        `**Mirror freshness:** ${NOTE}`,
+      ]);
+    });
+
+    it('names each source with the rows it answered when mirror and live rows mix', async () => {
+      const nesquik = mirrorRead(NESQUIK);
+      const cocoa = liveRead({
+        product_name: 'Cacao',
+        nutriments: { 'energy-kcal_prepared_100g': 72 },
+      });
+      mockReadStoredAsSold.mockResolvedValue({ status: 'none' });
+
+      const { structured, rows, text, sourceLines } = await compareReads([
+        [LINGUINE_CODE, mirrorRead(LINGUINE)],
+        ['22222222', cocoa],
+        ['7613035530799', nesquik],
+        ['33333333', null],
+      ]);
+
+      expect(rows.map((row) => [row.barcode, row.source, row.mirror_as_of])).toEqual([
+        [LINGUINE_CODE, 'off_mirror', MIRROR_AS_OF],
+        ['22222222', 'off_api', undefined],
+        ['7613035530799', 'off_mirror', MIRROR_AS_OF],
+        ['33333333', undefined, undefined],
+      ]);
+      expect(rows[3]).toEqual({ barcode: '33333333', found: false });
+      // Each prepared-only row's stored set is read from its own read: the copy for one, live for
+      // the other.
+      expect(
+        new Map(mockReadStoredAsSold.mock.calls.map(([barcode, , read]) => [barcode, read])),
+      ).toEqual(
+        new Map<string, ProductRead>([
+          ['22222222', cocoa],
+          ['7613035530799', nesquik],
+        ]),
+      );
+      expect(structured.mirror_snapshot).toBe(NOTE);
+      expect(sourceLines).toEqual([
+        `**Source:** ${mirrorLabel(MIRROR_AS_OF)} for ${LINGUINE_CODE}, 7613035530799; ${LIVE_LABEL} for 22222222`,
+      ]);
+      expect(text).toContain(`**Mirror freshness:** ${NOTE}`);
+    });
+
+    it('cites each as-of time when a refresh lands between two rows the mirror served', async () => {
+      const { structured, sourceLines } = await compareReads([
+        [LINGUINE_CODE, mirrorRead(LINGUINE)],
+        [SPAGHETTI_CODE, mirrorRead(SPAGHETTI, LATER)],
+      ]);
+
+      expect(sourceLines).toEqual([
+        `**Source:** ${mirrorLabel(MIRROR_AS_OF)} for ${LINGUINE_CODE}; ${mirrorLabel(LATER)} for ${SPAGHETTI_CODE}`,
+      ]);
+      expect(structured.mirror_snapshot).toBe(
+        "The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, current as of the mirror_as_of each one carries, not the live database, so an edit made to them since then is not reflected.",
+      );
+    });
+
+    it('gives a comparison in which no barcode resolved no source line and no note', async () => {
+      const { structured, rows, text } = await compareReads([
+        ['12345678', null],
+        ['87654321', null],
+      ]);
+
+      for (const row of rows) expect(row).not.toHaveProperty('source');
+      expect(structured).not.toHaveProperty('mirror_snapshot');
+      expect(text).not.toContain('**Source:**');
+    });
+
+    it('describes source, mirror_as_of, and the note in the search tool’s terms', () => {
+      const { source, mirror_as_of } = offCompareProductsTool.output.shape.products.element.shape;
+      expect(source.description).toContain(
+        'Where this row was read: "off_api", Open Food Facts itself, or "off_mirror", this server\'s local copy of the Open Food Facts export',
+      );
+      expect(source.description).toContain('Present on every row whose found is true.');
+      expect(mirror_as_of.description).toBe(
+        'ISO 8601 time of the newest Open Food Facts change the local copy reflects. Present only when source is "off_mirror".',
+      );
+      expect(offCompareProductsTool.enrichment?.mirror_snapshot?.description).toBe(
+        'Present only when a row\'s source is "off_mirror". States that those rows come from the local copy as of their mirror_as_of, so an edit made to them since then is not reflected.',
+      );
     });
   });
 });

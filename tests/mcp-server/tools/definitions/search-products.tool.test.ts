@@ -3,9 +3,12 @@
  * @module tests/mcp-server/tools/definitions/search-products.tool.test
  */
 
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Partial mock: only the service accessor is stubbed. TEXT_SEARCH_RESULT_WINDOW comes through from
 // the real module so the handler's page bound and these assertions can never drift apart.
@@ -15,11 +18,22 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', async (importOrigin
 }));
 
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
+import { TagIds } from '@/services/mirror/mirror-ingester.js';
+import { encodeCheckpoint, openMirrorStore } from '@/services/mirror/mirror-store.js';
+import { buildMirrorRecord } from '@/services/mirror/record-builder.js';
 import {
+  BudgetExhaustedError,
   getOpenFoodFactsService,
+  OpenFoodFactsService,
   TEXT_SEARCH_RESULT_WINDOW,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import {
+  TAG_SEARCH_EMPTY,
+  TAG_SEARCH_HITS,
+  TEXT_SEARCH_EMPTY,
+  TEXT_SEARCH_HITS,
+} from '../../../fixtures/upstream-envelopes.js';
 
 const mockSearchProducts = vi.fn();
 /**
@@ -27,6 +41,8 @@ const mockSearchProducts = vi.fn();
  * a tag value the offline sample does not hold reaches the search normalized.
  */
 const mockSuggestTaxonomy = vi.fn();
+/** Whether the local mirror is ready. False by default, the answer with `OFF_MIRROR_PATH` unset. */
+const mockMirrorReady = vi.fn();
 
 /** Create the contract-bearing context wired by the production handler factory. */
 function createToolContext() {
@@ -55,12 +71,19 @@ async function captureError(value: unknown | Promise<unknown>): Promise<unknown>
  * defaults to true because leaving it out reaches the handler as `undefined`, which reads as a
  * clipped count and flips `total_is_lower_bound` in cases that never meant to exercise it.
  * `dropped` defaults to 0, the service's answer for a page whose codes are all servable, and
- * `outside_constraints` stays unset, its answer for a page no row left.
+ * `outside_constraints` stays unset, its answer for a page no row left. A served live answer is
+ * the default outcome.
  */
 function mockSearch(
   result: { count: number; products: unknown[] } & Record<string, unknown>,
 ): void {
-  mockSearchProducts.mockResolvedValue({ count_is_exact: true, dropped: 0, ...result });
+  mockSearchProducts.mockResolvedValue({
+    status: 'served',
+    source: 'off_api',
+    count_is_exact: true,
+    dropped: 0,
+    ...result,
+  });
 }
 
 /** Concatenates every text block of a `runToolContract` result — format() output plus trailer. */
@@ -98,7 +121,10 @@ describe('off_search_products', () => {
     mockSearchProducts.mockReset();
     mockSuggestTaxonomy.mockReset();
     mockSuggestTaxonomy.mockResolvedValue([]);
+    mockMirrorReady.mockReset();
+    mockMirrorReady.mockResolvedValue(false);
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
+      mirrorReady: mockMirrorReady,
       searchProducts: mockSearchProducts,
       suggestTaxonomy: mockSuggestTaxonomy,
     } as never);
@@ -256,6 +282,7 @@ describe('off_search_products', () => {
       page: 1,
       page_size: 20,
       page_count: 1,
+      source: 'off_api' as const,
       products: [
         {
           barcode: '3017620422003',
@@ -282,6 +309,7 @@ describe('off_search_products', () => {
       page: 1,
       page_size: 20,
       page_count: 0,
+      source: 'off_api' as const,
       products: [],
     };
     const blocks = offSearchProductsTool.format!(output);
@@ -498,6 +526,7 @@ describe('off_search_products', () => {
       page: 1,
       page_size: 20,
       page_count: 1,
+      source: 'off_api' as const,
       products: [
         {
           barcode: '1234567890001',
@@ -851,6 +880,7 @@ describe('off_search_products', () => {
           page: 1,
           page_size: 20,
           page_count: 0,
+          source: 'off_api',
           products: [],
         }),
       );
@@ -969,6 +999,7 @@ describe('off_search_products', () => {
           page_size: 20,
           page_count: 0,
           last_page: 1,
+          source: 'off_api',
           products: [],
         }),
       );
@@ -989,6 +1020,7 @@ describe('off_search_products', () => {
           page: 400,
           page_size: 20,
           page_count: 0,
+          source: 'off_api',
           products: [],
         }),
       );
@@ -1211,6 +1243,7 @@ describe('off_search_products', () => {
       page: 1,
       page_size: 20,
       page_count: 1,
+      source: 'off_api' as const,
       products: [
         {
           barcode: '3017620422003',
@@ -1235,6 +1268,7 @@ describe('off_search_products', () => {
       page: 1,
       page_size: 20,
       page_count: 1,
+      source: 'off_api' as const,
       products: [
         {
           barcode: '3017620422003',
@@ -1467,6 +1501,7 @@ describe('off_search_products', () => {
         page: 1,
         page_size: 20,
         page_count: 1,
+        source: 'off_api' as const,
         products: [{ barcode: '1234567890001' }],
       };
 
@@ -1483,6 +1518,7 @@ describe('off_search_products', () => {
         page: 1,
         page_size: 20,
         page_count: 1,
+        source: 'off_api' as const,
         products: [{ barcode: '1234567890001' }],
       };
 
@@ -1511,6 +1547,7 @@ describe('off_search_products', () => {
         page: 1,
         page_size: 20,
         page_count: 1,
+        source: 'off_api' as const,
         products: [{ barcode: '1234567890001', product_name: 'Frozen Pizza', categories_tags }],
       };
 
@@ -1529,6 +1566,7 @@ describe('off_search_products', () => {
         page: 1,
         page_size: 20,
         page_count: 1,
+        source: 'off_api' as const,
         products: [{ barcode: '1234567890001', product_name }],
       };
 
@@ -1546,6 +1584,7 @@ describe('off_search_products', () => {
         page: 1,
         page_size: 20,
         page_count: 1,
+        source: 'off_api' as const,
         products: [
           {
             barcode: '1234\n# not a heading',
@@ -1574,6 +1613,7 @@ describe('off_search_products', () => {
           page: 1,
           page_size: 20,
           page_count: 1,
+          source: 'off_api',
           products: [
             {
               barcode: '3017620422003',
@@ -1925,9 +1965,10 @@ describe('off_search_products', () => {
         ctx,
       );
 
-      expect(String(getEnrichment(ctx).text_index_snapshot ?? '')).toMatch(
-        /same tag filters without query/i,
-      );
+      const note = String(getEnrichment(ctx).text_index_snapshot ?? '');
+      expect(note).toMatch(/same tag filters without query/i);
+      // A deployment with a ready mirror answers that re-run from its local copy, not live.
+      expect(note).toContain("this server's local copy of the export");
     });
 
     it('carries the text-path zero notice on both client surfaces', async () => {
@@ -2288,6 +2329,359 @@ describe('off_search_products', () => {
     });
   });
 
+  // ── #77: a lookup that went unchecked names why, and the wait ────────────
+
+  describe('unchecked lookups (#77)', () => {
+    const globalFetch = global.fetch;
+    const PREFIX =
+      'Exclusions are sent only as allergen tags Open Food Facts confirms, because an unrecognized one excludes nothing: ';
+
+    /**
+     * Serves the tool from a real Open Food Facts client with the given taxonomy budget, so the
+     * limiter and the retry classification on the lookup path run — the module-wide stub bypasses
+     * both. The autocomplete confirms every term it is asked for unless `autocomplete` answers it;
+     * a search answers empty.
+     */
+    function useRealService(rateLimitTaxonomy: number, autocomplete?: () => Response): void {
+      vi.mocked(getOpenFoodFactsService).mockReturnValue(
+        new OpenFoodFactsService({
+          baseUrl: 'https://world.openfoodfacts.org',
+          rateLimitProduct: 100,
+          rateLimitSearch: 100,
+          rateLimitTaxonomy,
+        }),
+      );
+      // The taxonomy service holds the client it was built with, so it is rebuilt over this one.
+      initTaxonomyService();
+      global.fetch = vi.fn(async (input: unknown) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/autocomplete') {
+          if (autocomplete) return autocomplete();
+          const q = url.searchParams.get('q') ?? '';
+          return Response.json({
+            took: 1,
+            timed_out: false,
+            options: [{ id: `en:${q}`, text: q }],
+          });
+        }
+        return Response.json(
+          url.hostname === 'search.openfoodfacts.org' ? TEXT_SEARCH_EMPTY : TAG_SEARCH_EMPTY,
+        );
+      }) as typeof fetch;
+    }
+
+    /** The pathname of every request the stubbed fetch received, in order. */
+    function requestedPaths(): string[] {
+      return vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname);
+    }
+
+    /** Runs a tool call to settlement with the retry backoff collapsed onto fake timers. */
+    async function onFakeTimers<T>(run: () => Promise<T>): Promise<T> {
+      vi.useFakeTimers();
+      try {
+        const pending = run();
+        await vi.runAllTimersAsync();
+        return await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    afterEach(() => {
+      global.fetch = globalFetch;
+      vi.useRealTimers();
+    });
+
+    it('names the spent taxonomy budget and its wait for the exclusion it refused', async () => {
+      useRealService(10);
+      // Frozen, so the budget's wait is its whole 60 s window.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const values = Array.from({ length: 11 }, (_, i) => `en:fruit${String.fromCharCode(97 + i)}`);
+
+      const result = await runToolContract(offSearchProductsTool, {
+        exclude_allergens: values,
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: { message: string; data: Record<string, unknown> };
+      };
+      expect(error.data).toMatchObject({
+        reason: 'unrecognized_exclusion',
+        retryable: true,
+        // #76: the longest wait among the unchecked values.
+        retryAfter: 60,
+        unrecognized: [
+          {
+            field: 'exclude_allergens',
+            value: 'en:fruitk',
+            reason: 'lookup_failed',
+            cause: 'budget_spent',
+          },
+        ],
+      });
+      expect(error.message).toBe(
+        `${PREFIX}exclude_allergens "en:fruitk" could not be checked, because this server's own per-minute taxonomy budget is spent, so no lookup was sent; a slot frees in about 60 s.`,
+      );
+      expect(contractHint(result)).toBe(
+        'Retry after 60 s — this server\'s own per-minute taxonomy budget is spent and no lookup was sent, so the value went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without a lookup.',
+      );
+      expect(JSON.stringify(result)).not.toContain('could not be reached');
+      // Ten values were checked; the eleventh was refused before anything was sent.
+      expect(requestedPaths()).toEqual(Array(10).fill('/autocomplete'));
+    });
+
+    it('names the upstream rate limit for an exclusion whose lookup Open Food Facts refused with 429', async () => {
+      useRealService(100, () => Response.json({ detail: 'slow down' }, { status: 429 }));
+
+      const result = await onFakeTimers(() =>
+        runToolContract(offSearchProductsTool, {
+          exclude_allergens: ['en:kiwi'],
+          page: 1,
+          page_size: 20,
+        }),
+      );
+
+      const { error } = result.structuredContent as {
+        error: { message: string; data: Record<string, unknown> };
+      };
+      expect(error.data).toMatchObject({
+        reason: 'unrecognized_exclusion',
+        retryable: true,
+        unrecognized: [
+          {
+            field: 'exclude_allergens',
+            value: 'en:kiwi',
+            reason: 'lookup_failed',
+            cause: 'rate_limited',
+          },
+        ],
+      });
+      expect(error.message).toBe(
+        `${PREFIX}exclude_allergens "en:kiwi" could not be checked, because Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429).`,
+      );
+      expect(contractHint(result)).toBe(
+        'Retry in about a minute — Open Food Facts is rate-limiting this server\'s taxonomy lookups, so the value went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without a lookup.',
+      );
+      expect(JSON.stringify(result)).not.toContain('could not be reached');
+    });
+
+    it("carries Open Food Facts' Retry-After as data.retryAfter and names it (#76)", async () => {
+      useRealService(100, () =>
+        Response.json({ detail: 'slow down' }, { status: 429, headers: { 'retry-after': '60' } }),
+      );
+
+      const result = await runToolContract(offSearchProductsTool, {
+        exclude_allergens: ['en:kiwi'],
+        page: 1,
+        page_size: 20,
+      });
+
+      const { error } = result.structuredContent as {
+        error: { message: string; data: Record<string, unknown> };
+      };
+      expect(error.data).toMatchObject({
+        reason: 'unrecognized_exclusion',
+        retryable: true,
+        retryAfter: 60,
+      });
+      expect(error.message).toBe(
+        `${PREFIX}exclude_allergens "en:kiwi" could not be checked, because Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429) and asked for a wait of 60 s.`,
+      );
+      expect(contractHint(result)).toMatch(/^Retry after 60 s — /);
+      // A wait past withRetry's 30 s ceiling fails fast: one request.
+      expect(requestedPaths()).toEqual(['/autocomplete']);
+    });
+
+    it('carries retryAfter only on a refusal a retry can clear', async () => {
+      // The first lookup is answered with no match and spends the one-slot budget; the second is
+      // refused by it. A no_match makes the refusal non-retryable, so no wait is offered.
+      useRealService(1, () => Response.json({ took: 1, timed_out: false, options: [] }));
+      vi.useFakeTimers({ toFake: ['Date'] });
+
+      const mixed = await runToolContract(offSearchProductsTool, {
+        exclude_allergens: ['en:nutz', 'en:fruitk'],
+        page: 1,
+        page_size: 20,
+      });
+
+      const { error } = mixed.structuredContent as { error: { data: Record<string, unknown> } };
+      expect(error.data).toMatchObject({ reason: 'unrecognized_exclusion', retryable: false });
+      expect(error.data.unrecognized).toEqual([
+        { field: 'exclude_allergens', value: 'en:nutz', reason: 'no_match' },
+        {
+          field: 'exclude_allergens',
+          value: 'en:fruitk',
+          reason: 'lookup_failed',
+          cause: 'budget_spent',
+        },
+      ]);
+      expect(error.data).not.toHaveProperty('retryAfter');
+
+      // The budget-refused value alone, against the same spent budget, can clear on a retry and
+      // carries the wait, so the no_match beside it is what withheld the wait above.
+      const alone = await runToolContract(offSearchProductsTool, {
+        exclude_allergens: ['en:fruitk'],
+        page: 1,
+        page_size: 20,
+      });
+
+      const aloneData = (alone.structuredContent as { error: { data: Record<string, unknown> } })
+        .error.data;
+      expect(aloneData).toMatchObject({ retryable: true, retryAfter: 60 });
+    });
+
+    it('keeps the unreachable-vocabulary message and hint for an outage', async () => {
+      // Characterization: the wording an unavailable vocabulary has always had.
+      useRealService(100, () => new Response('unavailable', { status: 503 }));
+
+      const result = await onFakeTimers(() =>
+        runToolContract(offSearchProductsTool, {
+          exclude_allergens: ['en:kiwi', 'en:fruita'],
+          page: 1,
+          page_size: 20,
+        }),
+      );
+
+      const { error } = result.structuredContent as {
+        error: { message: string; data: Record<string, unknown> };
+      };
+      expect(error.data).toMatchObject({ reason: 'unrecognized_exclusion', retryable: true });
+      expect(error.message).toBe(
+        `${PREFIX}exclude_allergens "en:kiwi" could not be checked, because the allergen vocabulary could not be reached or gave no usable answer; exclude_allergens "en:fruita" could not be checked, because the allergen vocabulary could not be reached or gave no usable answer.`,
+      );
+      expect(contractHint(result)).toBe(
+        'Retry shortly — the allergen vocabulary could not be reached or gave no usable answer, so the value went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.',
+      );
+    });
+
+    it('stays non-retryable when the vocabulary answered without a match', async () => {
+      useRealService(100, () => Response.json({ took: 1, timed_out: false, options: [] }));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        exclude_allergens: ['en:nutz'],
+        page: 1,
+        page_size: 20,
+      });
+
+      const { error } = result.structuredContent as { error: { data: Record<string, unknown> } };
+      expect(error.data).toMatchObject({ reason: 'unrecognized_exclusion', retryable: false });
+      expect(error.data.unrecognized).toEqual([
+        { field: 'exclude_allergens', value: 'en:nutz', reason: 'no_match' },
+      ]);
+    });
+
+    it('names the spent budget and its wait for a tag value the zero-result notice lists', async () => {
+      useRealService(1);
+      vi.useFakeTimers({ toFake: ['Date'] });
+      // One confirmed exclusion spends the one-lookup budget.
+      await runToolContract(offSearchProductsTool, {
+        exclude_allergens: ['en:fruita'],
+        page: 1,
+        page_size: 20,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'tea',
+        categories_tag: 'en:kombuchas',
+        page: 1,
+        page_size: 20,
+      });
+
+      const notice = String((result.structuredContent as { notice?: string }).notice);
+      expect(notice).toContain(
+        'category="en:kombuchas" (this server\'s own per-minute taxonomy budget was spent, so it went unchecked; a lookup slot frees in about 60 s)',
+      );
+      expect(notice).not.toContain('could not be reached');
+    });
+
+    it("names Open Food Facts' rate limit, and its wait when it sent one, for a tag value the zero-result notice lists", async () => {
+      const cases = [
+        {
+          headers: { 'retry-after': '60' },
+          reason:
+            "Open Food Facts was rate-limiting this server's taxonomy lookups, so it went unchecked; it asked for a wait of 60 s",
+        },
+        {
+          headers: undefined,
+          reason:
+            "Open Food Facts was rate-limiting this server's taxonomy lookups, so it went unchecked",
+        },
+      ];
+      for (const { headers, reason } of cases) {
+        useRealService(100, () =>
+          Response.json({ detail: 'slow down' }, { status: 429, ...(headers && { headers }) }),
+        );
+
+        const result = await onFakeTimers(() =>
+          runToolContract(offSearchProductsTool, {
+            query: 'tea',
+            categories_tag: 'en:kombuchas',
+            page: 1,
+            page_size: 20,
+          }),
+        );
+
+        const notice = String((result.structuredContent as { notice?: string }).notice);
+        // The closing parenthesis pins the end of the reason, so a wait added where none was sent fails.
+        expect(notice, String(headers)).toContain(`category="en:kombuchas" (${reason})`);
+        expect(notice).not.toContain('could not be reached');
+        expect(contractText(result)).toContain(
+          headers ? 'it asked for a wait of 60 s' : 'taxonomy lookups, so it went unchecked',
+        );
+      }
+    });
+
+    it('names the longest wait and every cause when the unchecked exclusions failed for different reasons', async () => {
+      // The one-slot budget sends the first lookup, which Open Food Facts answers 429 with a
+      // 120 s Retry-After (past the retry ceiling, so it fails at once); the second is refused by
+      // the spent budget, whose wait is its 60 s window.
+      useRealService(1, () =>
+        Response.json({ detail: 'slow down' }, { status: 429, headers: { 'retry-after': '120' } }),
+      );
+      vi.useFakeTimers({ toFake: ['Date'] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        exclude_allergens: ['en:kiwi', 'en:fruitk'],
+        page: 1,
+        page_size: 20,
+      });
+
+      const { error } = result.structuredContent as {
+        error: { message: string; data: Record<string, unknown> };
+      };
+      expect(error.data).toMatchObject({
+        reason: 'unrecognized_exclusion',
+        retryable: true,
+        retryAfter: 120,
+      });
+      expect(error.data.unrecognized).toEqual([
+        {
+          field: 'exclude_allergens',
+          value: 'en:kiwi',
+          reason: 'lookup_failed',
+          cause: 'rate_limited',
+        },
+        {
+          field: 'exclude_allergens',
+          value: 'en:fruitk',
+          reason: 'lookup_failed',
+          cause: 'budget_spent',
+        },
+      ]);
+      expect(error.message).toBe(
+        `${PREFIX}exclude_allergens "en:kiwi" could not be checked, because Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429) and asked for a wait of 120 s; exclude_allergens "en:fruitk" could not be checked, because this server's own per-minute taxonomy budget is spent, so no lookup was sent; a slot frees in about 60 s.`,
+      );
+      expect(contractHint(result)).toBe(
+        'Retry after 120 s — Open Food Facts is rate-limiting this server\'s taxonomy lookups; this server\'s own per-minute taxonomy budget is spent and no lookup was sent, so the values went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without a lookup.',
+      );
+      expect(contractText(result)).toContain('Retry after 120 s');
+      expect(requestedPaths()).toEqual(['/autocomplete']);
+    });
+  });
+
   // ── #44: a tag-only search serves pages 1–10 ─────────────────────────────
 
   describe('tag-only page bound (#44)', () => {
@@ -2390,6 +2784,856 @@ describe('off_search_products', () => {
         expect(text).not.toMatch(/unpredictab|no published window|deep page/i);
       }
       expect(inputDescription('page')).toMatch(/page 10/);
+    });
+  });
+
+  // ── #79: tag-only searches the local mirror serves ───────────────────────
+
+  describe('tag-only searches on the local mirror (#79)', () => {
+    const AS_OF = '2026-10-31T23:59:59.000Z';
+    /** The page-11 refusal a tag-only search gets wherever the live database would answer it. */
+    const PAGE_11_REFUSAL = {
+      message:
+        'A search by tag filters alone is served through page 10 only, and page 11 was requested.',
+      data: {
+        reason: 'page_out_of_range',
+        page: 11,
+        page_size: 50,
+        max_page: 10,
+        recovery: {
+          hint: 'Request page 10 or lower — at page_size 50 that reaches the first 500 matches — or narrow the filters or change sort_by to bring the products you need forward.',
+        },
+        retryable: false,
+      },
+    };
+    const MIRROR_NOTE = `These results come from this server's local copy of the Open Food Facts export, current as of ${AS_OF}, not the live database, so a product contributed or edited since then is missing or shown as it was.`;
+
+    /** Stubs one page the mirror served. */
+    function mockMirrorPage(
+      result: { count: number; products: unknown[] } & Record<string, unknown>,
+    ): void {
+      mockSearch({ source: 'off_mirror', mirrorAsOf: AS_OF, ...result });
+    }
+
+    async function refusal(input: Record<string, unknown>): Promise<{
+      message: string;
+      data: unknown;
+    }> {
+      const error = (await captureError(
+        offSearchProductsTool.handler(offSearchProductsTool.input.parse(input), ctx),
+      )) as { message: string; data: unknown };
+      return { message: error.message, data: error.data };
+    }
+
+    it('refuses a page past 10 before any lookup when no mirror is ready, as before', async () => {
+      // Characterization: the cheap refusal the live path has always given.
+      expect(
+        await refusal({
+          categories_tag: 'en:not-in-the-offline-sample',
+          labels_tag: 'Bio',
+          page: 11,
+          page_size: 50,
+        }),
+      ).toEqual(PAGE_11_REFUSAL);
+      expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('sends tag-only values as given, unflagged and unlooked-up, when no mirror is ready', async () => {
+      // Characterization: Product Opener canonicalizes these itself.
+      mockSearch({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler(
+        {
+          brands_tag: 'Nutella',
+          countries_tag: 'US',
+          additives_tag: ' E322 ',
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual({
+        page: 1,
+        page_size: 20,
+        brands_tag: 'Nutella',
+        countries_tag: 'US',
+        additives_tag: 'E322',
+      });
+      expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+    });
+
+    it('never asks for the mirror on a search the text backend answers', async () => {
+      // Characterization: the text path reads neither the mirror nor its readiness.
+      mockMirrorReady.mockResolvedValue(true);
+      mockSearch({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler(
+        { query: 'hummus', categories_tag: 'en:hummus', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      expect(mockMirrorReady).not.toHaveBeenCalled();
+      expect(mockSearchProducts.mock.calls[0]?.[0]).not.toHaveProperty('tags_confirmed');
+    });
+
+    it('canonicalizes every tag-path value and flags the search confirmed when the mirror is ready', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockSuggestTaxonomy.mockImplementation(async (taxonomy: string, term: string) =>
+        taxonomy === 'category' && term === 'Hazelnut spreads'
+          ? [{ id: 'en:hazelnut-spreads', name: 'Hazelnut spreads' }]
+          : [],
+      );
+      mockMirrorPage({
+        count: 600,
+        page: 11,
+        page_count: 1,
+        page_size: 50,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await offSearchProductsTool.handler(
+        offSearchProductsTool.input.parse({
+          categories_tag: 'Hazelnut spreads',
+          brands_tag: ' Nutella ',
+          labels_tag: ['Organic', 'en:fair-trade'],
+          allergens_tag: 'Milk',
+          traces_tag: 'en:nuts',
+          countries_tag: 'France',
+          additives_tag: 'E322',
+          exclude_allergens: ['Peanuts'],
+          ingredients_analysis_tag: 'en:vegan',
+          nutrition_grade: 'e',
+          nova_group: '4',
+          page: 11,
+          page_size: 50,
+        }),
+        ctx,
+      );
+
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual({
+        page: 11,
+        page_size: 50,
+        categories_tag: 'en:hazelnut-spreads',
+        brands_tag: 'nutella',
+        labels_tag: ['en:organic', 'en:fair-trade'],
+        allergens_tag: 'en:milk',
+        traces_tag: 'en:nuts',
+        countries_tag: 'en:france',
+        additives_tag: 'en:e322',
+        exclude_allergens: ['en:peanuts'],
+        ingredients_analysis_tag: 'en:vegan',
+        nutrition_grade: 'e',
+        nova_group: '4',
+        tags_confirmed: true,
+      });
+      // Only the value the offline sample lacks costs a lookup.
+      expect(mockSuggestTaxonomy).toHaveBeenCalledOnce();
+      expect(mockMirrorReady).toHaveBeenCalledOnce();
+      expect(result).toMatchObject({
+        page: 11,
+        source: 'off_mirror',
+        mirror_as_of: AS_OF,
+        last_page: 12,
+      });
+    });
+
+    it('flags a search of closed vocabularies alone confirmed', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] });
+
+      await offSearchProductsTool.handler({ nova_group: '4', page: 1, page_size: 20 }, ctx);
+
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual({
+        page: 1,
+        page_size: 20,
+        nova_group: '4',
+        tags_confirmed: true,
+      });
+      expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+    });
+
+    describe('a value the mirror cannot match', () => {
+      const LEAD =
+        "A search by tag filters alone is served through page 10 only when it reads the live database, and page 11 was requested: this server's local copy of the export serves deeper pages only when it confirms every value, and ";
+      const REPLACE_HINT =
+        "Replace the value with a canonical tag ID from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page 11, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.";
+      /** The page-11 refusal naming one unconfirmed value. */
+      const unconfirmedRefusal = (
+        listed: string,
+        entry: Record<string, unknown>,
+        hint = REPLACE_HINT,
+        retry: { retryable: boolean; retryAfter?: number } = { retryable: false },
+      ) => ({
+        message: `${LEAD}${listed}.`,
+        data: {
+          reason: 'page_out_of_range',
+          page: 11,
+          page_size: 50,
+          max_page: 10,
+          unconfirmed: [entry],
+          ...retry,
+          recovery: { hint },
+        },
+      });
+      const cases: {
+        name: string;
+        input: Record<string, unknown>;
+        arrange?: () => void;
+        refusal: ReturnType<typeof unconfirmedRefusal>;
+      }[] = [
+        {
+          name: 'a country nothing confirms',
+          input: { countries_tag: 'Narnia' },
+          refusal: unconfirmedRefusal(
+            'countries_tag "Narnia" went unconfirmed (no matching Open Food Facts tag was found)',
+            { field: 'countries_tag', value: 'Narnia', reason: 'no_match' },
+          ),
+        },
+        {
+          name: 'a country whose lookup failed',
+          input: { countries_tag: 'Narnia' },
+          arrange: () =>
+            mockSuggestTaxonomy.mockRejectedValue(
+              new Error('Open Food Facts is unavailable (HTTP 503).'),
+            ),
+          refusal: unconfirmedRefusal(
+            'countries_tag "Narnia" went unconfirmed (the tag vocabulary could not be reached or gave no usable answer, so it went unchecked)',
+            {
+              field: 'countries_tag',
+              value: 'Narnia',
+              reason: 'lookup_failed',
+              cause: 'unavailable',
+            },
+            "Retry shortly — once the value can be confirmed, this server's local copy of the export serves page 11. Request page 10 or lower to read the live database now.",
+            { retryable: true },
+          ),
+        },
+        {
+          name: 'a country whose lookup the taxonomy budget refused',
+          input: { countries_tag: 'Narnia' },
+          arrange: () =>
+            mockSuggestTaxonomy.mockRejectedValue(
+              new BudgetExhaustedError('budget spent', {
+                endpoint: 'taxonomy',
+                limit: 10,
+                retryAfter: 42,
+              }),
+            ),
+          refusal: unconfirmedRefusal(
+            'countries_tag "Narnia" went unconfirmed (this server\'s own per-minute taxonomy budget was spent, so it went unchecked; a lookup slot frees in about 42 s)',
+            {
+              field: 'countries_tag',
+              value: 'Narnia',
+              reason: 'lookup_failed',
+              cause: 'budget_spent',
+            },
+            "Retry after 42 s — once the value can be confirmed, this server's local copy of the export serves page 11. Request page 10 or lower to read the live database now.",
+            { retryable: true, retryAfter: 42 },
+          ),
+        },
+        {
+          name: 'an additive nothing confirms',
+          input: { additives_tag: 'E9999' },
+          refusal: unconfirmedRefusal(
+            'additives_tag "E9999" went unconfirmed (no matching Open Food Facts tag was found)',
+            { field: 'additives_tag', value: 'E9999', reason: 'no_match' },
+          ),
+        },
+        {
+          name: 'a brand whose slug is empty',
+          input: { brands_tag: '™' },
+          refusal: unconfirmedRefusal(
+            'brands_tag "™" went unconfirmed (it slugs to no brand tag)',
+            { field: 'brands_tag', value: '™', reason: 'no_vocabulary' },
+          ),
+        },
+      ];
+
+      for (const { name, input, arrange, refusal: expected } of cases) {
+        it(`reads live with the values as given for ${name}`, async () => {
+          mockMirrorReady.mockResolvedValue(true);
+          arrange?.();
+          mockSearch({
+            count: 1,
+            page: 1,
+            page_count: 1,
+            page_size: 20,
+            products: [{ code: '1234567890001' }],
+          });
+
+          const result = await offSearchProductsTool.handler(
+            offSearchProductsTool.input.parse({
+              brands_tag: 'Nutella',
+              ...input,
+              page: 1,
+              page_size: 20,
+            }),
+            ctx,
+          );
+
+          expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual({
+            page: 1,
+            page_size: 20,
+            brands_tag: 'Nutella',
+            ...input,
+          });
+          expect(result.source).toBe('off_api');
+          expect(result).not.toHaveProperty('mirror_as_of');
+          expect(getEnrichment(ctx).mirror_snapshot).toBeUndefined();
+        });
+
+        it(`refuses page 11 naming ${name}, sending nothing`, async () => {
+          mockMirrorReady.mockResolvedValue(true);
+          arrange?.();
+
+          expect(
+            await refusal({ brands_tag: 'Nutella', ...input, page: 11, page_size: 50 }),
+          ).toEqual(expected);
+          expect(mockSearchProducts).not.toHaveBeenCalled();
+        });
+      }
+
+      it('carries the refusal on both surfaces, its hint as the recovery', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockSuggestTaxonomy.mockRejectedValue(
+          new BudgetExhaustedError('budget spent', {
+            endpoint: 'taxonomy',
+            limit: 10,
+            retryAfter: 42,
+          }),
+        );
+        const expected = cases.find(({ name }) => name.includes('budget'))?.refusal;
+
+        const result = await runToolContract(offSearchProductsTool, {
+          countries_tag: 'Narnia',
+          brands_tag: 'Nutella',
+          page: 11,
+          page_size: 50,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { message: expected?.message, data: expected?.data },
+        });
+        expect(contractHint(result)).toBe(expected?.data.recovery.hint);
+        expect(contractText(result)).toContain(String(expected?.message));
+      });
+    });
+
+    it('refuses with the live refusal when the service could not serve a confirmed page past 10', async () => {
+      // The mirror went unready after the check, or its store failed: the service answers this
+      // outcome rather than sending a page the live API refuses.
+      mockMirrorReady.mockResolvedValue(true);
+      mockSearchProducts.mockResolvedValue({ status: 'page_out_of_range', bound: 'live_max_page' });
+
+      expect(await refusal({ categories_tag: 'en:spreads', page: 11, page_size: 50 })).toEqual(
+        PAGE_11_REFUSAL,
+      );
+      expect(mockSearchProducts).toHaveBeenCalledOnce();
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+        tags_confirmed: true,
+        page: 11,
+      });
+    });
+
+    it('serves a deep page on both surfaces with last_page and paging guidance inside the window', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({
+        count: 9_950,
+        page: 11,
+        page_count: 1,
+        page_size: 50,
+        products: [{ code: '1234567890001', product_name: 'Spread' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        page: 11,
+        page_size: 50,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        total: 9_950,
+        total_is_lower_bound: false,
+        page: 11,
+        last_page: 199,
+        source: 'off_mirror',
+        mirror_as_of: AS_OF,
+        truncated: true,
+        notice: 'Page 11 of 199. Use the page parameter to fetch subsequent pages.',
+      });
+      const text = contractText(result);
+      expect(text).toContain('(page 11 of 199, 50 per page, showing 1)');
+      expect(text).toContain(
+        `**Source:** off_mirror (this server's local copy of the Open Food Facts export, as of ${AS_OF})`,
+      );
+      expect(text).not.toMatch(/reachable pages|served through page 10/);
+    });
+
+    it('caps last_page and the paging guidance at the window on a larger result set', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({
+        count: 13_435,
+        page: 11,
+        page_count: 1,
+        page_size: 50,
+        products: [{ code: '1234567890001', product_name: 'Spread' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        page: 11,
+        page_size: 50,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        total: 13_435,
+        total_is_lower_bound: false,
+        page: 11,
+        last_page: 200,
+        source: 'off_mirror',
+        truncated: true,
+        notice:
+          "Page 11 of 200 reachable pages — 269 pages of matches exist, but this server's local copy of the export serves only the first 10000 results. Use the page parameter to fetch subsequent pages.",
+      });
+      const text = contractText(result);
+      expect(text).toContain('(page 11 of 200, 50 per page, showing 1)');
+      expect(text).not.toMatch(/served through page 10/);
+    });
+
+    it('names the window as the end of paging on the last page it serves', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({
+        count: 13_435,
+        page: 200,
+        page_count: 50,
+        page_size: 50,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        page: 200,
+        page_size: 50,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        page: 200,
+        last_page: 200,
+        truncated: true,
+        notice:
+          "Page 200 of 200 reachable pages — 269 pages of matches exist, but this server's local copy of the export serves only the first 10000 results. That is as deep as a tag-only search paginates — narrow the filters or change sort_by to reach other products.",
+      });
+      expect(contractText(result)).toContain('(page 200 of 200, 50 per page, showing 50)');
+    });
+
+    describe('the result window', () => {
+      /** The refusal of a confirmed page past the window, at `pageSize` served. */
+      function windowRefusal(page: number, pageSize: number, served = `page_size ${pageSize}`) {
+        const maxPage = Math.floor(10_000 / pageSize);
+        return {
+          message: `This server's local copy of the export serves only the first 10000 results of a search, and page ${page} at ${served} asks for result ${page * pageSize}.`,
+          data: {
+            reason: 'page_out_of_range',
+            page,
+            page_size: pageSize,
+            max_page: maxPage,
+            result_window: 10_000,
+            recovery: {
+              hint: `Request page ${maxPage} or lower at page_size ${pageSize}, or narrow the filters or change sort_by so the products you need fall inside the first 10000 results.`,
+            },
+            retryable: false,
+          },
+        };
+      }
+
+      // page * page_size at exactly 10,000 is served, and the next page is not; page_size 3
+      // reaches 9,999 at page 3,333, so the bound is on the product, never a rounded page count.
+      const BOUNDARIES = [
+        { pageSize: 50, lastServed: 200 },
+        { pageSize: 1, lastServed: 10_000 },
+        { pageSize: 3, lastServed: 3_333 },
+      ];
+
+      for (const { pageSize, lastServed } of BOUNDARIES) {
+        it(`serves page ${lastServed} at page_size ${pageSize}, the last inside the window`, async () => {
+          mockMirrorReady.mockResolvedValue(true);
+          mockMirrorPage({
+            count: 20_000,
+            page: lastServed,
+            page_count: 1,
+            page_size: pageSize,
+            products: [{ code: '1234567890001' }],
+          });
+
+          const result = await offSearchProductsTool.handler(
+            offSearchProductsTool.input.parse({
+              categories_tag: 'en:spreads',
+              page: lastServed,
+              page_size: pageSize,
+            }),
+            ctx,
+          );
+
+          expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+            page: lastServed,
+            page_size: pageSize,
+            tags_confirmed: true,
+          });
+          expect(result).toMatchObject({
+            page: lastServed,
+            last_page: lastServed,
+            source: 'off_mirror',
+          });
+        });
+
+        it(`refuses page ${lastServed + 1} at page_size ${pageSize} before calling the service`, async () => {
+          mockMirrorReady.mockResolvedValue(true);
+
+          expect(
+            await refusal({
+              categories_tag: 'en:spreads',
+              page: lastServed + 1,
+              page_size: pageSize,
+            }),
+          ).toEqual(windowRefusal(lastServed + 1, pageSize));
+          expect(mockSearchProducts).not.toHaveBeenCalled();
+        });
+      }
+
+      it('refuses past the window on both surfaces, naming the window, the page, and the reachable page', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        const expected = windowRefusal(201, 50, 'page_size 80 served at 50');
+
+        const result = await runToolContract(offSearchProductsTool, {
+          categories_tag: 'en:spreads',
+          page: 201,
+          page_size: 80,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { message: expected.message, data: expected.data },
+        });
+        expect(contractHint(result)).toBe(expected.data.recovery.hint);
+        const text = contractText(result);
+        expect(text).toContain(expected.message);
+        expect(text).toContain(expected.data.recovery.hint);
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      });
+
+      it('refuses with the page-10 bound, not the window, naming a value the mirror cannot match', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+
+        expect(
+          await refusal({
+            categories_tag: 'en:spreads',
+            countries_tag: 'Narnia',
+            page: 201,
+            page_size: 50,
+          }),
+        ).toEqual({
+          message:
+            'A search by tag filters alone is served through page 10 only when it reads the live database, and page 201 was requested: this server\'s local copy of the export serves deeper pages only when it confirms every value, and countries_tag "Narnia" went unconfirmed (no matching Open Food Facts tag was found).',
+          data: {
+            reason: 'page_out_of_range',
+            page: 201,
+            page_size: 50,
+            max_page: 10,
+            unconfirmed: [{ field: 'countries_tag', value: 'Narnia', reason: 'no_match' }],
+            retryable: false,
+            recovery: {
+              hint: "Replace the value with a canonical tag ID from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page 201, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.",
+            },
+          },
+        });
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      });
+
+      it('refuses with the live page-10 refusal when the service read live after a store error', async () => {
+        // The tool checked the mirror ready, then the service's mirror read failed and it read live,
+        // where the page-10 bound holds even inside the window.
+        mockMirrorReady.mockResolvedValue(true);
+        mockSearchProducts.mockResolvedValue({
+          status: 'page_out_of_range',
+          bound: 'live_max_page',
+        });
+
+        expect(await refusal({ categories_tag: 'en:spreads', page: 200, page_size: 50 })).toEqual({
+          message:
+            'A search by tag filters alone is served through page 10 only, and page 200 was requested.',
+          data: { ...PAGE_11_REFUSAL.data, page: 200 },
+        });
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+          tags_confirmed: true,
+          page: 200,
+        });
+      });
+
+      it('keeps the text-window refusal as it was', async () => {
+        // Characterization: the mirror's window leaves the text path's refusal untouched.
+        expect(await refusal({ query: 'spread', page: 201, page_size: 80 })).toEqual({
+          message:
+            'The text backend serves only the first 10000 results, and page 201 at page_size 80 served at 50 asks for result 10050.',
+          data: {
+            reason: 'page_out_of_range',
+            page: 201,
+            page_size: 50,
+            max_page: 200,
+            result_window: 10_000,
+            recovery: {
+              hint: 'Request page 200 or lower at page_size 50, or add filters so the products you need rank inside the first 10000 results.',
+            },
+            retryable: false,
+          },
+        });
+        expect(await refusal({ query: 'spread', page: 10_001, page_size: 1 })).toEqual({
+          message:
+            'The text backend serves only the first 10000 results, and page 10001 at page_size 1 asks for result 10001.',
+          data: {
+            reason: 'page_out_of_range',
+            page: 10_001,
+            page_size: 1,
+            max_page: 10_000,
+            result_window: 10_000,
+            recovery: {
+              hint: 'Request page 10000 or lower at page_size 1, or add filters so the products you need rank inside the first 10000 results.',
+            },
+            retryable: false,
+          },
+        });
+        expect(mockMirrorReady).not.toHaveBeenCalled();
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      });
+    });
+
+    it('names the next page past 10 when a capped page_size reaches it', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({
+        count: 600,
+        page: 10,
+        page_count: 50,
+        page_size: 50,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        page: 10,
+        page_size: 80,
+      });
+
+      expect(result.structuredContent).toMatchObject({ last_page: 12, truncated: true });
+      expect((result.structuredContent as Record<string, unknown>).page_size_capped).toBe(
+        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 11 for results 501–550.',
+      );
+    });
+
+    it('reports a page past the exact last page as exhausted, naming that page', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({ count: 600, page: 15, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        page: 15,
+        page_size: 50,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        total: 600,
+        last_page: 12,
+        source: 'off_mirror',
+        notice:
+          'Page 15 is past the end of this result set — 600 matching products exist, but no page this deep holds any. Request page 12 or lower to reach them.',
+      });
+      const text = contractText(result);
+      expect(text).toContain('Request page 12 or lower to reach the matching products.');
+      expect(text).toContain(`as of ${AS_OF})`);
+    });
+
+    it('keeps the tag-only zero notice on an empty mirror answer, beside the freshness note', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        brands_tag: 'nutell',
+        page: 1,
+        page_size: 20,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.notice).toBe(
+        'No products found for brand="nutell". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+      );
+      expect(structured).not.toHaveProperty('last_page');
+      expect(String(structured.mirror_snapshot)).toContain(MIRROR_NOTE);
+      const text = contractText(result);
+      expect(text).toContain('**No products found** (total: 0)');
+      expect(text).toContain(
+        `**Source:** off_mirror (this server's local copy of the Open Food Facts export, as of ${AS_OF})`,
+      );
+      expect(text).toContain(`current as of ${AS_OF}`);
+    });
+
+    it('discloses the mirror order for each sort, and says nothing of order for a timestamp sort', async () => {
+      const orderOf = {
+        default:
+          ' The default order follows the popularity_key value stored with each record as of then, which can differ page for page from a live search, where Open Food Facts orders it by its current scan counts.',
+        popularity_key:
+          ' The order follows the popularity_key value stored with each record as of then, which can differ page for page from a live search, where Open Food Facts orders it by its current scan counts.',
+        unique_scans_n:
+          ' The order follows the unique_scans_n value stored with each record as of then, which can differ page for page from a live search, where Open Food Facts orders it by its current scan counts.',
+        created_t: '',
+        last_modified_t: '',
+      } as const;
+      mockMirrorReady.mockResolvedValue(true);
+
+      for (const [sort, order] of Object.entries(orderOf)) {
+        mockMirrorPage({
+          count: 1,
+          page: 1,
+          page_count: 1,
+          page_size: 20,
+          products: [{ code: '1234567890001' }],
+        });
+        const sortCtx = createToolContext();
+        await offSearchProductsTool.handler(
+          offSearchProductsTool.input.parse({
+            categories_tag: 'en:spreads',
+            ...(sort !== 'default' && { sort_by: sort }),
+          }),
+          sortCtx,
+        );
+        expect(getEnrichment(sortCtx).mirror_snapshot, sort).toBe(`${MIRROR_NOTE}${order}`);
+      }
+    });
+
+    it('carries the freshness note on both surfaces and never says the mirror reads the live database', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockMirrorPage({
+        count: 1,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        sort_by: 'created_t',
+        page: 1,
+        page_size: 20,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.mirror_snapshot).toBe(MIRROR_NOTE);
+      const text = contractText(result);
+      expect(text).toContain(
+        `**Mirror freshness:** These results come from this server's local copy of the Open Food Facts export, current as of ${AS_OF}`,
+      );
+      expect(text).not.toMatch(/reads? the live database/);
+      expect(structured).not.toHaveProperty('text_index_snapshot');
+    });
+
+    it('marks a live answer off_api on both surfaces, with no as-of time or freshness note', async () => {
+      mockSearch({
+        count: 1,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+        page: 1,
+        page_size: 20,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.source).toBe('off_api');
+      expect(structured).not.toHaveProperty('mirror_as_of');
+      expect(structured).not.toHaveProperty('mirror_snapshot');
+      const text = contractText(result);
+      expect(text).toContain('**Source:** off_api (Open Food Facts)');
+      expect(text).not.toMatch(/off_mirror|local copy/);
+    });
+
+    it('renders the source on every text branch', () => {
+      const base = {
+        total_is_lower_bound: false,
+        page: 1,
+        page_size: 20,
+        source: 'off_mirror' as const,
+        mirror_as_of: AS_OF,
+      };
+      const line = `**Source:** off_mirror (this server's local copy of the Open Food Facts export, as of ${AS_OF})`;
+      const branches = {
+        'zero matches': { ...base, total: 0, page_count: 0, products: [] },
+        'every row left off': {
+          ...base,
+          total: 3,
+          page_count: 0,
+          last_page: 1,
+          omitted: 3,
+          products: [],
+        },
+        'past the end': { ...base, page: 2, total: 3, page_count: 0, last_page: 1, products: [] },
+        rows: {
+          ...base,
+          total: 1,
+          page_count: 1,
+          last_page: 1,
+          products: [{ barcode: '1234567890001' }],
+        },
+      };
+      for (const [name, output] of Object.entries(branches)) {
+        expect(firstText(offSearchProductsTool.format!(output)), name).toContain(line);
+      }
+      expect(
+        firstText(
+          offSearchProductsTool.format!({
+            ...branches.rows,
+            source: 'off_api',
+            mirror_as_of: undefined,
+          }),
+        ),
+      ).toContain('**Source:** off_api (Open Food Facts)\n*Data: Open Food Facts (ODbL 1.0)*');
+    });
+
+    it('states which deployments the page-10 bound applies to, and what source reports', () => {
+      expect(inputDescription('page')).toContain(
+        'A search by tag filters alone that reads the live database is served through page 10 only',
+      );
+      expect(inputDescription('page')).toContain(
+        'is served from that copy through its first 10000 results, so page * page_size (as served) must stay at or below 10000 there.',
+      );
+      expect(inputDescription('page')).toContain('A request past any of these bounds is rejected');
+      expect(inputDescription('page')).not.toMatch(/no page limit/);
+      expect(offSearchProductsTool.output.shape.last_page.description).toContain(
+        'capped at page 10 on a search by tag filters alone that read the live database',
+      );
+      expect(offSearchProductsTool.output.shape.last_page.description).toContain(
+        'and by the local copy\'s 10000-result window when source is "off_mirror"',
+      );
+      const pageBound = (offSearchProductsTool.errors ?? []).find(
+        (e) => e.reason === 'page_out_of_range',
+      );
+      expect(pageBound?.when).toContain(
+        'asks for a page past 10 and would read the live database — this server keeps no ready local copy of the export, or a tag value is one it cannot confirm',
+      );
+      expect(pageBound?.when).toContain(
+        'or one the local copy serves beyond its 10000-result window',
+      );
+      expect(offSearchProductsTool.description).toContain(
+        'which source and mirror_as_of then report',
+      );
+      expect(offSearchProductsTool.output.shape.source.description).toContain('"off_mirror"');
+      expect(offSearchProductsTool.output.shape.mirror_as_of.description).toContain('ISO 8601');
     });
   });
 
@@ -3518,5 +4762,456 @@ describe('off_search_products', () => {
     for (const term of ['"a-plus"', '"f"', '"unknown"', '"not-applicable"']) {
       expect(row.ecoscore_grade.description).toContain(term);
     }
+  });
+});
+
+// ── #79: the local mirror end to end ─────────────────────────────────────────
+
+/**
+ * The tool over the real Open Food Facts client, taxonomy service, and mirror store, against a
+ * store at `OFF_MIRROR_PATH` written through the real write path (record builder, tag ids, the
+ * store's batch upsert), with every upstream request answered by a stubbed fetch and recorded.
+ * Modules are re-imported per test so the store path and the serving store's handle are fresh.
+ */
+describe('off_search_products on a local mirror, end to end (#79)', () => {
+  const AS_OF = '2026-10-31T23:59:59.000Z';
+  const globalFetch = global.fetch;
+  const NOVA_4 = ['en:4-ultra-processed-food-and-drink-products'];
+  const NOVA_3 = ['en:3-processed-foods'];
+
+  /** A schema 1004 export line of a Nutella jar sold in France; `n` makes its 13-digit code. */
+  function jar(n: number, fields: Record<string, unknown>): Record<string, unknown> {
+    return {
+      code: `50000000000${String(n).padStart(2, '0')}`,
+      schema_version: 1004,
+      lc: 'en',
+      product_name: `Jar ${n}`,
+      brands: 'Nutella',
+      brands_tags: ['xx:nutella'],
+      countries_tags: ['en:france'],
+      categories_tags: ['en:spreads'],
+      ...fields,
+    };
+  }
+
+  /**
+   * Twelve Nutella jars and one other brand. popularity_key ties at 100 (jars 3 and 4), and jar 12
+   * has none; jars 1, 3, and 5 carry both labels, jars 1 and 2 declare milk, and jars 1–6 plus
+   * the other brand are NOVA 4.
+   */
+  const LINES = [
+    jar(1, {
+      popularity_key: 120,
+      labels_tags: ['en:organic', 'en:fair-trade'],
+      allergens_tags: ['en:milk'],
+      nova_groups_tags: NOVA_4,
+    }),
+    jar(2, {
+      popularity_key: 110,
+      labels_tags: ['en:organic'],
+      allergens_tags: ['en:milk'],
+      nova_groups_tags: NOVA_4,
+    }),
+    jar(3, {
+      popularity_key: 100,
+      labels_tags: ['en:organic', 'en:fair-trade'],
+      nova_groups_tags: NOVA_4,
+    }),
+    jar(4, { popularity_key: 100, nova_groups_tags: NOVA_4 }),
+    jar(5, {
+      popularity_key: 90,
+      labels_tags: ['en:fair-trade', 'en:organic'],
+      nova_groups_tags: NOVA_4,
+    }),
+    jar(6, {
+      popularity_key: 80,
+      categories_tags: ['en:spreads', 'en:hazelnut-spreads'],
+      nova_groups_tags: NOVA_4,
+    }),
+    jar(7, { popularity_key: 70, nova_groups_tags: NOVA_3 }),
+    jar(8, { popularity_key: 60, nova_groups_tags: NOVA_3 }),
+    jar(9, { popularity_key: 50, nova_groups_tags: NOVA_3 }),
+    jar(10, { popularity_key: 40, nova_groups_tags: NOVA_3 }),
+    jar(11, { popularity_key: 30, nova_groups_tags: NOVA_3 }),
+    jar(12, { nova_groups_tags: NOVA_3 }),
+    jar(13, {
+      popularity_key: 200,
+      brands: 'Ferrero',
+      brands_tags: ['xx:ferrero'],
+      nova_groups_tags: NOVA_4,
+    }),
+  ];
+  const code = (n: number) => `50000000000${String(n).padStart(2, '0')}`;
+
+  let dir: string;
+  /** Host and path of every upstream request, in order. */
+  let requests: string[];
+  let tool: typeof import('@/mcp-server/tools/definitions/search-products.tool.js')['offSearchProductsTool'];
+  let closeStore: (() => Promise<void>) | undefined;
+
+  /** Writes `lines` into a store at `path` as a sync page does; `completed` marks the sync done. */
+  async function writeStore(path: string, lines: Record<string, unknown>[], completed: boolean) {
+    const writer = openMirrorStore(path);
+    try {
+      const handle = await writer.raw();
+      const records = lines.map((line) => {
+        const record = buildMirrorRecord(line);
+        if (!record) throw new Error(`Line ${String(line.code)} is not servable`);
+        return record;
+      });
+      const ids = new TagIds().resolve(handle, new Set(records.flatMap((record) => record.tags)));
+      await writer.applyBatch(
+        records.map((record) => ({
+          code: record.code,
+          popularity_key: record.popularityKey,
+          unique_scans_n: record.uniqueScansN,
+          created_t: record.createdT,
+          last_modified_t: record.lastModifiedT,
+          generation: 1,
+          record_version: 1,
+          tag_ids: JSON.stringify(
+            [...new Set(record.tags.map((key) => ids.get(key) as number))].sort((a, b) => a - b),
+          ),
+          doc: JSON.stringify(record.doc),
+        })),
+        [],
+      );
+      if (completed) {
+        await writer.writeState({
+          status: 'complete',
+          completedAt: AS_OF,
+          total: lines.length,
+          checkpoint: encodeCheckpoint({ generation: 1, asOfSeconds: Date.parse(AS_OF) / 1000 }),
+        });
+      }
+    } finally {
+      await writer.close();
+    }
+  }
+
+  /**
+   * Loads the tool fresh over `mirrorPath` (unset when undefined), on the real service and its own
+   * config, store handle, and budgets. The autocomplete confirms only "Hazelnut spreads"; a tag
+   * search and a text search answer with their recorded live envelopes.
+   */
+  async function serve(mirrorPath: string | undefined): Promise<void> {
+    vi.stubEnv('OFF_MIRROR_PATH', mirrorPath);
+    vi.resetModules();
+    const service = await import('@/services/openfoodfacts/openfoodfacts-service.js');
+    const taxonomy = await import('@/services/taxonomy/taxonomy-service.js');
+    const store = await import('@/services/mirror/mirror-store.js');
+    ({ offSearchProductsTool: tool } = await import(
+      '@/mcp-server/tools/definitions/search-products.tool.js'
+    ));
+    closeStore = store.closeMirrorStore;
+    service.initOpenFoodFactsService();
+    taxonomy.initTaxonomyService();
+    requests = [];
+    global.fetch = vi.fn(async (input: unknown) => {
+      const url = new URL(String(input));
+      requests.push(`${url.hostname}${url.pathname}`);
+      if (url.pathname === '/autocomplete') {
+        const q = url.searchParams.get('q');
+        const options =
+          q === 'Hazelnut spreads' ? [{ id: 'en:hazelnut-spreads', text: 'Hazelnut spreads' }] : [];
+        return Response.json({ took: 1, timed_out: false, options });
+      }
+      return Response.json(
+        url.hostname === 'search.openfoodfacts.org' ? TEXT_SEARCH_HITS : TAG_SEARCH_HITS,
+      );
+    }) as typeof fetch;
+  }
+
+  /** The pathnames of the recorded requests. */
+  const paths = () => requests.map((request) => request.slice(request.indexOf('/')));
+
+  /** One call through the contract runner: schema, handler, format, enrichment, error envelope. */
+  async function call(input: Record<string, unknown>) {
+    const result = await runToolContract(tool, input);
+    const structured = result.structuredContent as Record<string, unknown> & {
+      products?: { barcode: string }[];
+    };
+    return {
+      result,
+      structured,
+      barcodes: (structured.products ?? []).map((product) => product.barcode),
+      text: contractText(result),
+    };
+  }
+
+  /** The handler's own refusal, as thrown. */
+  async function refusalOf(input: Record<string, unknown>) {
+    const error = (await captureError(
+      tool.handler(tool.input.parse(input), createMockContext({ errors: tool.errors })),
+    )) as { message: string; data: unknown };
+    return { message: error.message, data: error.data };
+  }
+
+  const PAGE_11_REFUSAL = {
+    message:
+      'A search by tag filters alone is served through page 10 only, and page 11 was requested.',
+    data: {
+      reason: 'page_out_of_range',
+      page: 11,
+      page_size: 1,
+      max_page: 10,
+      recovery: {
+        hint: 'Request page 10 or lower — at page_size 1 that reaches the first 10 matches — or narrow the filters or change sort_by to bring the products you need forward.',
+      },
+      retryable: false,
+    },
+  };
+
+  // A mocked module is not re-evaluated after resetModules, so the service mock would keep the
+  // first store and config it saw. The modules this group loads are the real ones; the static
+  // bindings the rest of the file uses stay mocked.
+  beforeAll(() => {
+    vi.doUnmock('@/services/openfoodfacts/openfoodfacts-service.js');
+  });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'off-search-mirror-'));
+  });
+
+  afterEach(async () => {
+    await closeStore?.();
+    closeStore = undefined;
+    global.fetch = globalFetch;
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  describe('with a ready store', () => {
+    beforeEach(async () => {
+      const path = join(dir, 'store.sqlite');
+      await writeStore(path, LINES, true);
+      await serve(path);
+    });
+
+    it('serves page 11 of a brand search with an exact total and last_page, sending nothing upstream', async () => {
+      const { structured, barcodes, text } = await call({
+        brands_tag: 'Nutella',
+        page: 11,
+        page_size: 1,
+      });
+
+      expect(structured).toMatchObject({
+        total: 12,
+        total_is_lower_bound: false,
+        page: 11,
+        page_size: 1,
+        page_count: 1,
+        last_page: 12,
+        source: 'off_mirror',
+        mirror_as_of: AS_OF,
+        notice: 'Page 11 of 12. Use the page parameter to fetch subsequent pages.',
+      });
+      expect(barcodes).toEqual([code(11)]);
+      expect(requests).toEqual([]);
+      expect(text).toContain(`current as of ${AS_OF}`);
+      expect(text).toContain(`as of ${AS_OF})`);
+      expect(text).not.toMatch(/reads? the live database/);
+    });
+
+    it('serves the last page inside the result window and refuses the next on both surfaces, sending nothing upstream', async () => {
+      const inside = await call({ brands_tag: 'Nutella', page: 10_000, page_size: 1 });
+
+      expect(inside.result.isError).toBeFalsy();
+      expect(inside.structured).toMatchObject({
+        total: 12,
+        page: 10_000,
+        page_count: 0,
+        last_page: 12,
+        source: 'off_mirror',
+        notice:
+          'Page 10000 is past the end of this result set — 12 matching products exist, but no page this deep holds any. Request page 12 or lower to reach them.',
+      });
+
+      const past = await call({ brands_tag: 'Nutella', page: 10_001, page_size: 1 });
+      const message =
+        "This server's local copy of the export serves only the first 10000 results of a search, and page 10001 at page_size 1 asks for result 10001.";
+      const hint =
+        'Request page 10000 or lower at page_size 1, or narrow the filters or change sort_by so the products you need fall inside the first 10000 results.';
+
+      expect(past.result.isError).toBe(true);
+      expect(past.structured).toMatchObject({
+        error: {
+          message,
+          data: {
+            reason: 'page_out_of_range',
+            page: 10_001,
+            page_size: 1,
+            max_page: 10_000,
+            result_window: 10_000,
+            recovery: { hint },
+            retryable: false,
+          },
+        },
+      });
+      expect(past.text).toContain(message);
+      expect(past.text).toContain(hint);
+      expect(requests).toEqual([]);
+    });
+
+    it('orders by the stored popularity_key by default, code breaking a tie and a missing value last', async () => {
+      const { structured, barcodes } = await call({
+        brands_tag: 'Nutella',
+        page: 1,
+        page_size: 50,
+      });
+
+      expect(barcodes).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(code));
+      expect(structured).toMatchObject({ total: 12, last_page: 1, source: 'off_mirror' });
+      expect(String(structured.mirror_snapshot)).toContain(
+        'The default order follows the popularity_key value stored with each record',
+      );
+      expect(requests).toEqual([]);
+    });
+
+    it.each(['xx:nutella', 'en:nutella'])(
+      'matches brands_tag %j as the brand stored under xx:nutella, as a live search does',
+      async (brand) => {
+        const { structured, barcodes } = await call({ brands_tag: brand, page: 1, page_size: 50 });
+
+        expect(barcodes).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(code));
+        expect(structured).toMatchObject({ total: 12, source: 'off_mirror' });
+        expect(requests).toEqual([]);
+      },
+    );
+
+    it('drops products that declare an excluded allergen', async () => {
+      const { structured, barcodes } = await call({
+        brands_tag: 'Nutella',
+        exclude_allergens: ['Milk'],
+        page: 1,
+        page_size: 50,
+      });
+
+      expect(barcodes).toEqual([3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(code));
+      expect(structured).toMatchObject({ total: 10, source: 'off_mirror' });
+      expect(structured.exclusion_coverage).toBeDefined();
+      expect(requests).toEqual([]);
+    });
+
+    it('ANDs two labels_tag values', async () => {
+      const { structured, barcodes } = await call({
+        labels_tag: ['Organic', 'en:fair-trade'],
+        page: 1,
+        page_size: 50,
+      });
+
+      expect(barcodes).toEqual([1, 3, 5].map(code));
+      expect(structured).toMatchObject({ total: 3, source: 'off_mirror' });
+      expect(requests).toEqual([]);
+    });
+
+    it('matches nova_group "4" by the tag the export stores it under', async () => {
+      const { structured, barcodes } = await call({ nova_group: '4', page: 1, page_size: 50 });
+
+      expect(barcodes).toEqual([13, 1, 2, 3, 4, 5, 6].map(code));
+      expect(structured).toMatchObject({ total: 7, source: 'off_mirror' });
+      expect(requests).toEqual([]);
+    });
+
+    it('confirms a value through the live vocabulary, that lookup its only request', async () => {
+      const { structured, barcodes } = await call({
+        categories_tag: 'Hazelnut spreads',
+        page: 1,
+        page_size: 50,
+      });
+
+      expect(barcodes).toEqual([code(6)]);
+      expect(structured).toMatchObject({ total: 1, source: 'off_mirror', mirror_as_of: AS_OF });
+      expect(paths()).toEqual(['/autocomplete']);
+    });
+
+    it('searches live, as off_api and capped at page 10, for a value nothing confirms', async () => {
+      const { structured, text } = await call({
+        categories_tag: 'en:not-a-category',
+        page: 1,
+        page_size: 2,
+      });
+
+      expect(structured).toMatchObject({ total: 4581, last_page: 10, source: 'off_api' });
+      expect(structured).not.toHaveProperty('mirror_as_of');
+      expect(structured).not.toHaveProperty('mirror_snapshot');
+      expect(text).toContain('**Source:** off_api (Open Food Facts)');
+      expect(paths()).toEqual(['/autocomplete', '/api/v2/search']);
+      const searchUrl = new URL(String(vi.mocked(global.fetch).mock.calls[1]?.[0]));
+      expect(searchUrl.searchParams.get('categories_tags')).toBe('en:not-a-category');
+    });
+
+    it('refuses page 11 of a search a value sends live, naming the value, sending no search', async () => {
+      expect(
+        await refusalOf({ categories_tag: 'en:not-a-category', page: 11, page_size: 1 }),
+      ).toEqual({
+        message:
+          'A search by tag filters alone is served through page 10 only when it reads the live database, and page 11 was requested: this server\'s local copy of the export serves deeper pages only when it confirms every value, and categories_tag "en:not-a-category" went unconfirmed (no matching Open Food Facts tag was found).',
+        data: {
+          ...PAGE_11_REFUSAL.data,
+          unconfirmed: [
+            { field: 'categories_tag', value: 'en:not-a-category', reason: 'no_match' },
+          ],
+          recovery: {
+            hint: "Replace the value with a canonical tag ID from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page 11, or request page 10 or lower — at page_size 1 that reaches the first 10 matches.",
+          },
+        },
+      });
+      expect(paths()).toEqual(['/autocomplete']);
+    });
+
+    it('serves a query search and a nutrient_filters search live, never from the store', async () => {
+      const byQuery = await call({ query: 'nutella', page: 1, page_size: 2 });
+      const byNutrient = await call({
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 60 }],
+        page: 1,
+        page_size: 2,
+      });
+
+      expect(byQuery.structured.source).toBe('off_api');
+      expect(byNutrient.structured.source).toBe('off_api');
+      expect(byQuery.structured).not.toHaveProperty('mirror_as_of');
+      expect(byNutrient.structured).not.toHaveProperty('mirror_snapshot');
+      expect(paths()).toEqual(['/search', '/search']);
+      expect(requests.every((request) => request.startsWith('search.openfoodfacts.org/'))).toBe(
+        true,
+      );
+    });
+  });
+
+  describe('without a ready store', () => {
+    it('refuses page 11 before any lookup when the store holds no completed sync', async () => {
+      const path = join(dir, 'store.sqlite');
+      await writeStore(path, LINES, false);
+      await serve(path);
+
+      expect(
+        await refusalOf({ categories_tag: 'Hazelnut spreads', page: 11, page_size: 1 }),
+      ).toEqual(PAGE_11_REFUSAL);
+      expect(requests).toEqual([]);
+    });
+
+    it('refuses page 11 before any lookup with OFF_MIRROR_PATH unset', async () => {
+      await serve(undefined);
+
+      expect(
+        await refusalOf({ categories_tag: 'Hazelnut spreads', page: 11, page_size: 1 }),
+      ).toEqual(PAGE_11_REFUSAL);
+      expect(requests).toEqual([]);
+    });
+
+    it('reads a tag-only search live, values as given, when the store holds no completed sync', async () => {
+      const path = join(dir, 'store.sqlite');
+      await writeStore(path, LINES, false);
+      await serve(path);
+
+      const { structured } = await call({ brands_tag: 'Nutella', page: 1, page_size: 2 });
+
+      expect(structured.source).toBe('off_api');
+      expect(paths()).toEqual(['/api/v2/search']);
+      const searchUrl = new URL(String(vi.mocked(global.fetch).mock.calls[0]?.[0]));
+      expect(searchUrl.searchParams.get('brands_tags')).toBe('Nutella');
+    });
   });
 });
