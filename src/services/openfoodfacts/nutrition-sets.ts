@@ -435,8 +435,8 @@ export function perlNumber(value: number): number {
  * `*_prepared_100g` or `*_prepared_serving` key, and no other numeric `*_100g` or `*_serving` key
  * once the NOVA class (`nova-group_100g`, `nova-group_serving`) is set aside. API v2 serves one
  * preparation state per record and prepared wins, so such a read says nothing about the as-sold
- * figures the record can still store. The same rule `off_get_product` applies to its normalized
- * output, so the two never disagree about a read.
+ * figures the record can still store. Both product tools and the mirror's record builder decide by
+ * this one rule, so a live read and a mirror record agree on when the stored sets are consulted.
  */
 export function holdsOnlyPreparedFigures(nutriments: Record<string, unknown> | undefined): boolean {
   let prepared = false;
