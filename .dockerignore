@@ -192,5 +192,6 @@ docs/api/
 # =============================================================================
 repomix-output*
 duckdata/
+.mirror
 .claude
 .agents

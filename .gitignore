@@ -72,6 +72,7 @@ worker-configuration.d.ts
 .storage/
 repomix-output*
 /data/
+/.mirror/
 docs/api/
 docs/devdocs.md
 .mcp.json

@@ -143,11 +143,29 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 COPY --from=build /usr/src/app/dist ./dist
 COPY --from=build /usr/src/app/skills ./skills
 
+# Mirror lifecycle scripts (`bun run mirror:init|refresh|status|verify` via
+# `docker exec <container> …`). The shared context shim is imported by the
+# three named scripts, so it travels with them. Bun honors tsconfig `paths` at
+# runtime: a checkout's tsconfig.json maps `@/*` to `./src/*`, and this emitted
+# one maps it to the compiled `./dist/*`, so the same package scripts run in both.
+COPY --from=build /usr/src/app/scripts/mirror-init.ts \
+                  /usr/src/app/scripts/mirror-refresh.ts \
+                  /usr/src/app/scripts/mirror-status.ts \
+                  /usr/src/app/scripts/_mirror-context.ts \
+                  ./scripts/
+RUN echo '{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./dist/*"]}}}' > tsconfig.json
+
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
 
 # Create and set permissions for the log directory, assigning ownership to the 'bun' user.
 RUN mkdir -p /var/log/openfoodfacts-mcp-server && chown -R bun:bun /var/log/openfoodfacts-mcp-server
+
+# Writable home for the export mirror (OFF_MIRROR_PATH, e.g. .mirror/openfoodfacts.sqlite),
+# owned by the runtime user so a volume mounted over it is writable. A full init of the
+# 4.9M-product export peaks at about 27 GB there while the export download sits beside the
+# store, and leaves a store of about 14.3 GB.
+RUN mkdir -p /usr/src/app/.mirror && chown -R bun:bun /usr/src/app/.mirror
 
 # Switch to the non-root user
 USER bun

@@ -47,6 +47,16 @@ const ServerConfigSchema = z.object({
     .min(1)
     .default(10)
     .describe('Taxonomy resolution rate limit (requests/min)'),
+  /**
+   * Unset means no mirror: no store opens and no refresh is scheduled. The `mirror:*` scripts build
+   * the store, and they run only from a checkout or the Docker image, so the variable appears in no
+   * npm-facing manifest.
+   */
+  mirrorPath: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('Local export mirror store path (SQLite file); unset disables the mirror'),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -60,6 +70,7 @@ export function getServerConfig(): ServerConfig {
     rateLimitProduct: 'OFF_RATE_LIMIT_PRODUCT',
     rateLimitSearch: 'OFF_RATE_LIMIT_SEARCH',
     rateLimitTaxonomy: 'OFF_RATE_LIMIT_TAXONOMY',
+    mirrorPath: 'OFF_MIRROR_PATH',
   });
   return _config;
 }

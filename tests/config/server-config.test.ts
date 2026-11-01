@@ -1,7 +1,7 @@
 /**
  * @fileoverview Regression tests for the server config rate-limit defaults — pins each tier to the
  * per-IP ceiling Open Food Facts publishes (GH issue #21) and covers the env override an operator
- * needs on a shared outbound IP.
+ * needs on a shared outbound IP — and for `OFF_MIRROR_PATH`, whose absence keeps the mirror off.
  * @module tests/config/server-config.test
  */
 
@@ -15,6 +15,7 @@ const CONFIG_ENV_VARS = [
   'OFF_RATE_LIMIT_PRODUCT',
   'OFF_RATE_LIMIT_SEARCH',
   'OFF_RATE_LIMIT_TAXONOMY',
+  'OFF_MIRROR_PATH',
 ] as const;
 
 /**
@@ -65,5 +66,33 @@ describe('getServerConfig rate-limit defaults', () => {
   it('rejects a product budget below one request per minute', async () => {
     vi.stubEnv('OFF_RATE_LIMIT_PRODUCT', '0');
     await expect(loadConfig()).rejects.toThrow('OFF_RATE_LIMIT_PRODUCT');
+  });
+});
+
+describe('getServerConfig mirror path', () => {
+  beforeEach(() => {
+    for (const name of CONFIG_ENV_VARS) vi.stubEnv(name, undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('leaves the mirror off when OFF_MIRROR_PATH is unset', async () => {
+    const config = await loadConfig();
+    expect(config.mirrorPath).toBeUndefined();
+  });
+
+  it('reads a blank OFF_MIRROR_PATH, as a host forwards an option left empty, as unset', async () => {
+    vi.stubEnv('OFF_MIRROR_PATH', '');
+    const config = await loadConfig();
+    expect(config.mirrorPath).toBeUndefined();
+  });
+
+  it('takes the store path OFF_MIRROR_PATH names', async () => {
+    vi.stubEnv('OFF_MIRROR_PATH', '/usr/src/app/.mirror/openfoodfacts.sqlite');
+    const config = await loadConfig();
+    expect(config.mirrorPath).toBe('/usr/src/app/.mirror/openfoodfacts.sqlite');
   });
 });

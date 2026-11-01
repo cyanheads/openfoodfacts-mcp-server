@@ -1,0 +1,3241 @@
+{
+  "schema": "1004",
+  "shape": "as_sold",
+  "code": "0030000010402",
+  "capturedAt": "2026-11-01T13:07:31.815Z",
+  "request": "/api/v2/product/030000010402.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
+  "line": {
+    "_id": "0030000010402",
+    "packaging_old": "Paper, Box",
+    "origin": "",
+    "generic_name": "Rolled oats",
+    "ecoscore_tags": ["b"],
+    "quantity": "42 oz",
+    "packaging": "Paper, Box",
+    "ingredients_text_debug": "Whole Grain Rolled Oats",
+    "nutrition_data_prepared_per_imported": "100g",
+    "lang": "en",
+    "pnns_groups_2_tags": ["breakfast-cereals", "known"],
+    "ingredients_tags": ["en:oat-flakes", "en:cereal", "en:oat"],
+    "ingredients_n_tags": ["1", "1-10"],
+    "packaging_shapes_tags": ["en:canister", "en:lid", "en:wrapper"],
+    "packaging_hierarchy": ["en:paper", "en:box"],
+    "ingredients_analysis": {},
+    "nutrient_levels": {
+      "fat": "moderate",
+      "saturated-fat": "low",
+      "sugars": "low",
+      "salt": "low"
+    },
+    "categories_tags": [
+      "en:plant-based-foods-and-beverages",
+      "en:plant-based-foods",
+      "en:breakfasts",
+      "en:cereals-and-potatoes",
+      "en:seeds",
+      "en:cereals-and-their-products",
+      "en:breakfast-cereals",
+      "en:cereal-grains",
+      "en:flakes",
+      "en:cereal-flakes",
+      "en:rolled-flakes",
+      "en:rolled-oats"
+    ],
+    "update_key": "2026-scans",
+    "ingredients_that_may_be_from_palm_oil_tags": [],
+    "creator": "babartareen",
+    "nutrition_score_warning_fruits_vegetables_legumes_estimate_from_ingredients_value": 0,
+    "environmental_score_grade": "b",
+    "scans_n": 48,
+    "nutrition_score_warning_fruits_vegetables_legumes_estimate_from_ingredients": 1,
+    "labels_tags": [
+      "en:kosher",
+      "en:no-artificial-flavors",
+      "en:no-gmos",
+      "en:no-preservatives",
+      "en:source-of-fibre",
+      "en:non-gmo-project",
+      "en:orthodox-union-kosher",
+      "en:whole-grain",
+      "en:American Heart Association Certified"
+    ],
+    "product_name": "Old Fashioned Oats",
+    "states_hierarchy": [
+      "en:to-be-completed",
+      "en:nutrition-facts-completed",
+      "en:ingredients-completed",
+      "en:expiration-date-to-be-completed",
+      "en:packaging-code-to-be-completed",
+      "en:characteristics-to-be-completed",
+      "en:origins-to-be-completed",
+      "en:categories-completed",
+      "en:brands-completed",
+      "en:packaging-completed",
+      "en:quantity-completed",
+      "en:product-name-completed",
+      "en:photos-to-be-validated",
+      "en:packaging-photo-to-be-selected",
+      "en:nutrition-photo-selected",
+      "en:ingredients-photo-selected",
+      "en:front-photo-selected",
+      "en:photos-uploaded"
+    ],
+    "additives_tags": [],
+    "pnns_groups_1_tags": ["cereals-and-potatoes", "known"],
+    "environmental_score_data": {
+      "scores": {
+        "lu": 65,
+        "uk": 65,
+        "gr": 65,
+        "fr": 65,
+        "pt": 65,
+        "mt": 65,
+        "ly": 65,
+        "world": 65,
+        "ad": 65,
+        "va": 65,
+        "sk": 65,
+        "rs": 65,
+        "lt": 65,
+        "li": 65,
+        "hu": 65,
+        "me": 65,
+        "il": 65,
+        "dk": 65,
+        "lv": 65,
+        "ma": 65,
+        "al": 65,
+        "ch": 65,
+        "dz": 65,
+        "cz": 65,
+        "ps": 65,
+        "je": 65,
+        "fo": 65,
+        "be": 65,
+        "fi": 65,
+        "gi": 65,
+        "si": 65,
+        "no": 65,
+        "ie": 65,
+        "tn": 65,
+        "pl": 65,
+        "mc": 65,
+        "ba": 65,
+        "is": 65,
+        "de": 65,
+        "sj": 65,
+        "sm": 65,
+        "bg": 65,
+        "ro": 65,
+        "xk": 65,
+        "mk": 65,
+        "sy": 65,
+        "lb": 65,
+        "tr": 65,
+        "it": 65,
+        "se": 65,
+        "eg": 65,
+        "us": 65,
+        "at": 65,
+        "es": 65,
+        "cy": 65,
+        "ee": 65,
+        "hr": 65,
+        "nl": 65,
+        "ua": 65,
+        "im": 65,
+        "ax": 65,
+        "md": 65,
+        "gg": 65
+      },
+      "status": "known",
+      "grades": {
+        "fr": "b",
+        "gr": "b",
+        "mt": "b",
+        "pt": "b",
+        "ly": "b",
+        "lu": "b",
+        "uk": "b",
+        "ad": "b",
+        "sk": "b",
+        "rs": "b",
+        "va": "b",
+        "lt": "b",
+        "li": "b",
+        "world": "b",
+        "dk": "b",
+        "lv": "b",
+        "al": "b",
+        "ma": "b",
+        "hu": "b",
+        "me": "b",
+        "il": "b",
+        "ps": "b",
+        "je": "b",
+        "fo": "b",
+        "ch": "b",
+        "dz": "b",
+        "cz": "b",
+        "ie": "b",
+        "no": "b",
+        "si": "b",
+        "tn": "b",
+        "pl": "b",
+        "ba": "b",
+        "mc": "b",
+        "be": "b",
+        "gi": "b",
+        "fi": "b",
+        "xk": "b",
+        "sy": "b",
+        "mk": "b",
+        "tr": "b",
+        "lb": "b",
+        "de": "b",
+        "sj": "b",
+        "is": "b",
+        "ro": "b",
+        "sm": "b",
+        "bg": "b",
+        "at": "b",
+        "es": "b",
+        "cy": "b",
+        "it": "b",
+        "us": "b",
+        "eg": "b",
+        "se": "b",
+        "im": "b",
+        "md": "b",
+        "ax": "b",
+        "gg": "b",
+        "ee": "b",
+        "hr": "b",
+        "ua": "b",
+        "nl": "b"
+      },
+      "missing_data_warning": 1,
+      "agribalyse": {
+        "ef_agriculture": 0.227,
+        "is_beverage": 0,
+        "co2_agriculture": 0.895,
+        "version": "3.2",
+        "ef_processing": 0.00292,
+        "co2_transportation": 0.266,
+        "co2_packaging": 0.0186,
+        "ef_transportation": 0.0211,
+        "co2_distribution": 0.0284,
+        "dqr": "4.272483291635131",
+        "name_en": "Oatmeal flakes",
+        "ef_packaging": 0.00179,
+        "co2_consumption": 0,
+        "ef_consumption": 0,
+        "co2_total": 1.22,
+        "code": "9311",
+        "ef_total": 0.261,
+        "score": 82,
+        "co2_processing": 0.0086,
+        "agribalyse_food_code": "9311",
+        "name_fr": "Flocon d'avoine",
+        "ef_distribution": 0.00777
+      },
+      "missing": { "origins": 1, "labels": 1, "packagings": 1 },
+      "adjustments": {
+        "packaging": {
+          "value": -12,
+          "non_recyclable_and_non_biodegradable_materials": 1,
+          "score": -20,
+          "packagings": [
+            {
+              "shape": "en:canister",
+              "environmental_score_shape_ratio": 1,
+              "number_of_units": 1,
+              "material": "en:recycled-paper",
+              "quantity_per_unit_unit": "kg",
+              "quantity_per_unit": "1.19 kg",
+              "quantity_per_unit_value": 1.19,
+              "environmental_score_material_score": 100
+            },
+            {
+              "environmental_score_material_score": 0,
+              "quantity_per_unit_value": 1.19,
+              "quantity_per_unit": "1.19 kg",
+              "non_recyclable_and_non_biodegradable": "maybe",
+              "quantity_per_unit_unit": "kg",
+              "material": "en:plastic",
+              "number_of_units": 1,
+              "environmental_score_shape_ratio": 0.2,
+              "shape": "en:lid"
+            },
+            {
+              "non_recyclable_and_non_biodegradable": "maybe",
+              "quantity_per_unit": "1.19 kg",
+              "environmental_score_material_score": 0,
+              "quantity_per_unit_value": 1.19,
+              "shape": "en:wrapper",
+              "environmental_score_shape_ratio": 1,
+              "number_of_units": 1,
+              "quantity_per_unit_unit": "kg",
+              "material": "en:plastic"
+            }
+          ],
+          "warning": "unscored_shape"
+        },
+        "production_system": { "labels": [], "warning": "no_label", "value": 0 },
+        "threatened_species": {},
+        "origins_of_ingredients": {
+          "epi_value": -5,
+          "warning": "origins_are_100_percent_unknown",
+          "values": {
+            "se": -5,
+            "eg": -5,
+            "us": -5,
+            "it": -5,
+            "es": -5,
+            "at": -5,
+            "cy": -5,
+            "ee": -5,
+            "hr": -5,
+            "nl": -5,
+            "ua": -5,
+            "ax": -5,
+            "md": -5,
+            "im": -5,
+            "gg": -5,
+            "be": -5,
+            "fi": -5,
+            "gi": -5,
+            "si": -5,
+            "ie": -5,
+            "no": -5,
+            "mc": -5,
+            "ba": -5,
+            "tn": -5,
+            "pl": -5,
+            "bg": -5,
+            "sm": -5,
+            "ro": -5,
+            "is": -5,
+            "sj": -5,
+            "de": -5,
+            "mk": -5,
+            "sy": -5,
+            "xk": -5,
+            "lb": -5,
+            "tr": -5,
+            "me": -5,
+            "hu": -5,
+            "il": -5,
+            "dk": -5,
+            "ma": -5,
+            "al": -5,
+            "lv": -5,
+            "dz": -5,
+            "ch": -5,
+            "cz": -5,
+            "ps": -5,
+            "fo": -5,
+            "je": -5,
+            "uk": -5,
+            "lu": -5,
+            "pt": -5,
+            "mt": -5,
+            "gr": -5,
+            "fr": -5,
+            "ly": -5,
+            "world": -5,
+            "va": -5,
+            "sk": -5,
+            "rs": -5,
+            "ad": -5,
+            "li": -5,
+            "lt": -5
+          },
+          "origins_from_categories": ["en:unknown"],
+          "epi_score": 0,
+          "aggregated_origins": [{ "origin": "en:unknown", "percent": 108.66 }],
+          "transportation_scores": {
+            "se": 0,
+            "eg": 0,
+            "us": 0,
+            "it": 0,
+            "cy": 0,
+            "es": 0,
+            "at": 0,
+            "nl": 0,
+            "ua": 0,
+            "ee": 0,
+            "hr": 0,
+            "gg": 0,
+            "ax": 0,
+            "md": 0,
+            "im": 0,
+            "fi": 0,
+            "gi": 0,
+            "be": 0,
+            "mc": 0,
+            "ba": 0,
+            "tn": 0,
+            "pl": 0,
+            "si": 0,
+            "no": 0,
+            "ie": 0,
+            "sm": 0,
+            "bg": 0,
+            "ro": 0,
+            "is": 0,
+            "de": 0,
+            "sj": 0,
+            "tr": 0,
+            "lb": 0,
+            "mk": 0,
+            "sy": 0,
+            "xk": 0,
+            "il": 0,
+            "me": 0,
+            "hu": 0,
+            "ma": 0,
+            "al": 0,
+            "lv": 0,
+            "dk": 0,
+            "cz": 0,
+            "dz": 0,
+            "ch": 0,
+            "fo": 0,
+            "je": 0,
+            "ps": 0,
+            "uk": 0,
+            "lu": 0,
+            "ly": 0,
+            "mt": 0,
+            "pt": 0,
+            "gr": 0,
+            "fr": 0,
+            "world": 0,
+            "li": 0,
+            "lt": 0,
+            "va": 0,
+            "rs": 0,
+            "sk": 0,
+            "ad": 0
+          },
+          "origins_from_origins_field": ["en:unknown"],
+          "transportation_values": {
+            "il": 0,
+            "me": 0,
+            "hu": 0,
+            "ma": 0,
+            "al": 0,
+            "lv": 0,
+            "dk": 0,
+            "cz": 0,
+            "dz": 0,
+            "ch": 0,
+            "fo": 0,
+            "je": 0,
+            "ps": 0,
+            "uk": 0,
+            "lu": 0,
+            "ly": 0,
+            "mt": 0,
+            "pt": 0,
+            "gr": 0,
+            "fr": 0,
+            "world": 0,
+            "li": 0,
+            "lt": 0,
+            "va": 0,
+            "rs": 0,
+            "sk": 0,
+            "ad": 0,
+            "eg": 0,
+            "se": 0,
+            "us": 0,
+            "it": 0,
+            "cy": 0,
+            "es": 0,
+            "at": 0,
+            "nl": 0,
+            "ua": 0,
+            "ee": 0,
+            "hr": 0,
+            "gg": 0,
+            "ax": 0,
+            "md": 0,
+            "im": 0,
+            "fi": 0,
+            "gi": 0,
+            "be": 0,
+            "mc": 0,
+            "ba": 0,
+            "pl": 0,
+            "tn": 0,
+            "si": 0,
+            "no": 0,
+            "ie": 0,
+            "sm": 0,
+            "bg": 0,
+            "ro": 0,
+            "is": 0,
+            "sj": 0,
+            "de": 0,
+            "lb": 0,
+            "tr": 0,
+            "mk": 0,
+            "sy": 0,
+            "xk": 0
+          }
+        }
+      },
+      "score": 65,
+      "grade": "b"
+    },
+    "code": "0030000010402",
+    "product_quantity_unit": "g",
+    "data_quality_info_tags": [
+      "en:packaging-data-incomplete",
+      "en:all-but-one-ingredient-with-specified-percent",
+      "en:food-groups-1-known",
+      "en:food-groups-2-known",
+      "en:food-groups-3-unknown"
+    ],
+    "data_sources_tags": [
+      "databases",
+      "database-usda",
+      "app-yuka",
+      "apps",
+      "app-infood",
+      "app-macrofactor",
+      "labels",
+      "label-non-gmo-project",
+      "app-smoothie-openfoodfacts",
+      "app-caloriecounterapp",
+      "app-qalzy"
+    ],
+    "nutriscore_grade": "a",
+    "languages_codes": { "en": 7 },
+    "nova_groups_tags": ["en:1-unprocessed-or-minimally-processed-foods"],
+    "packaging_materials_tags": ["en:plastic", "en:recycled-paper"],
+    "last_image_t": 1786377586,
+    "brand_owner_imported": "The Quaker Oats Company",
+    "languages_tags": ["en:english", "en:1"],
+    "purchase_places_tags": ["connecticut", "plainville", "redmond", "united-states", "washington"],
+    "allergens_tags": [],
+    "data_quality_dimensions": {
+      "accuracy": { "overall": "0.00" },
+      "completeness": {
+        "nutrition": "1.00",
+        "packaging": "0.50",
+        "general_information": "0.80",
+        "ingredients": "1.00",
+        "overall": "0.83"
+      }
+    },
+    "nutriscore_tags": ["a"],
+    "complete": 0,
+    "packaging_text_en": "1 recycled paperboard canister\r\n1 transparent plastic lid\r\n1 transparent plastic wrapper",
+    "nutrition_grades_tags": ["a"],
+    "brands_tags": ["xx:quaker-oats"],
+    "unknown_ingredients_n": 0,
+    "cities_tags": [],
+    "emb_codes_orig": "",
+    "packaging_old_before_taxonomization": "Box,Paper",
+    "origins_tags": [],
+    "brands": "Quaker Oats",
+    "packagings_materials": { "all": {}, "en:plastic": {}, "en:paper-or-cardboard": {} },
+    "product_name_en_imported": "Old fashioned 100% whole grain oats, old fashioned",
+    "ingredients_with_unspecified_percent_sum": 108.66,
+    "minerals_prev_tags": [],
+    "nutriscore_data": {
+      "negative_points_max": 55,
+      "is_beverage": 0,
+      "is_fat_oil_nuts_seeds": 1,
+      "negative_points": 2,
+      "grade": "a",
+      "is_cheese": 0,
+      "components": {
+        "positive": [
+          { "points_max": 7, "value": 12.5, "unit": "g", "points": 5, "id": "proteins" },
+          { "unit": "g", "points": 5, "id": "fiber", "points_max": 5, "value": 10 },
+          {
+            "points_max": 5,
+            "value": 0,
+            "unit": "%",
+            "id": "fruits_vegetables_legumes",
+            "points": 0
+          }
+        ],
+        "negative": [
+          {
+            "points_max": 10,
+            "value": 46.25,
+            "id": "energy_from_saturated_fat",
+            "points": 0,
+            "unit": "kJ"
+          },
+          { "value": 2.5, "points_max": 15, "unit": "g", "points": 0, "id": "sugars" },
+          {
+            "value": 16.7,
+            "points_max": 10,
+            "unit": "%",
+            "points": 2,
+            "id": "saturated_fat_ratio"
+          },
+          { "points": 0, "id": "salt", "unit": "g", "value": 0, "points_max": 20 }
+        ]
+      },
+      "positive_points": 10,
+      "count_proteins": 1,
+      "score": -8,
+      "positive_nutrients": ["proteins", "fiber", "fruits_vegetables_legumes"],
+      "is_water": 0,
+      "positive_points_max": 17,
+      "count_proteins_reason": "negative_points_less_than_7",
+      "is_red_meat_product": 0
+    },
+    "last_updated_t": 1793122752,
+    "last_editor": "zlima12",
+    "created_t": 1469062987,
+    "ingredients_text_with_allergens_en": "whole grain rolled oats",
+    "ingredients_without_ciqual_codes_n": 0,
+    "max_imgid": 59,
+    "misc_tags": [
+      "en:environmental-score-computed",
+      "en:environmental-score-missing-data-labels",
+      "en:environmental-score-missing-data-origins",
+      "en:environmental-score-missing-data-packagings",
+      "en:environmental-score-missing-data-warning",
+      "en:estimated-ingredients-with-recipe-estimator-cvxpy",
+      "en:nutrients-estimated-from-ingredients",
+      "en:nutriscore-2021-a-2023-a",
+      "en:nutriscore-2021-same-as-2023",
+      "en:nutriscore-computed",
+      "en:nutrition-all-nutriscore-values-known",
+      "en:nutrition-data-per-100g",
+      "en:nutrition-data-per-serving",
+      "en:nutrition-fruits-vegetables-legumes-estimate-from-ingredients",
+      "en:nutrition-fruits-vegetables-nuts-estimate-from-ingredients",
+      "en:packagings-not-complete",
+      "en:packagings-not-empty",
+      "en:packagings-not-empty-but-not-complete",
+      "en:packagings-number-of-components-3"
+    ],
+    "ingredients_without_ciqual_codes": [],
+    "nutrition_score_beverage": 0,
+    "rev": 275,
+    "data_quality_errors_tags": [],
+    "data_quality_bugs_tags": [],
+    "categories_properties": {
+      "agribalyse_proxy_food_code:en": "32135",
+      "agribalyse_food_code:en": "9311",
+      "ciqual_food_code:en": "9311"
+    },
+    "nova_groups_markers": {},
+    "product_quantity": 1190.67997125,
+    "manufacturing_places_tags": [],
+    "packaging_tags": ["en:paper", "en:box"],
+    "id": "3124072888858",
+    "languages_hierarchy": ["en:english"],
+    "ingredients_without_ecobalyse_ids": ["en:oat-flakes"],
+    "nutrition_data_per_imported": "100g",
+    "ingredients_from_palm_oil_n": 0,
+    "vitamins_tags": [],
+    "traces_tags": [],
+    "nutriscore": {
+      "2021": {
+        "nutriscore_computed": 1,
+        "nutrients_available": 1,
+        "category_available": 1,
+        "score": -4,
+        "data": {
+          "proteins_points": 5,
+          "sodium": 0,
+          "fiber": 10,
+          "is_beverage": 0,
+          "sodium_value": 0,
+          "saturated_fat_points": 1,
+          "fruits_vegetables_nuts_colza_walnut_olive_oils": 0,
+          "sodium_points": 0,
+          "is_water": 0,
+          "fruits_vegetables_nuts_colza_walnut_olive_oils_value": 0,
+          "fruits_vegetables_nuts_colza_walnut_olive_oils_points": 0,
+          "fiber_points": 5,
+          "sugars_points": 0,
+          "energy_value": 1717.5,
+          "negative_points": 6,
+          "saturated_fat": 1.25,
+          "proteins": 12.5,
+          "energy": 1717.5,
+          "proteins_value": 12.5,
+          "is_fat": 0,
+          "sugars": 2.5,
+          "saturated_fat_value": 1.3,
+          "sugars_value": 2.5,
+          "energy_points": 5,
+          "fiber_value": 10,
+          "positive_points": 10,
+          "is_cheese": 0
+        },
+        "estimated": 0,
+        "nutriscore_applicable": 1,
+        "preparation": "as_sold",
+        "grade": "a"
+      },
+      "2023": {
+        "nutrients_available": 1,
+        "nutriscore_computed": 1,
+        "category_available": 1,
+        "estimated": 0,
+        "score": -8,
+        "data": {
+          "negative_points": 2,
+          "is_fat_oil_nuts_seeds": 1,
+          "negative_points_max": 55,
+          "is_beverage": 0,
+          "positive_nutrients": ["proteins", "fiber", "fruits_vegetables_legumes"],
+          "is_water": 0,
+          "positive_points_max": 17,
+          "count_proteins_reason": "negative_points_less_than_7",
+          "is_red_meat_product": 0,
+          "is_cheese": 0,
+          "components": {
+            "negative": [
+              {
+                "unit": "kJ",
+                "points": 0,
+                "id": "energy_from_saturated_fat",
+                "value": 46.25,
+                "points_max": 10
+              },
+              { "id": "sugars", "points": 0, "unit": "g", "points_max": 15, "value": 2.5 },
+              {
+                "id": "saturated_fat_ratio",
+                "points": 2,
+                "unit": "%",
+                "points_max": 10,
+                "value": 16.7
+              },
+              { "value": 0, "points_max": 20, "unit": "g", "id": "salt", "points": 0 }
+            ],
+            "positive": [
+              { "points": 5, "id": "proteins", "unit": "g", "points_max": 7, "value": 12.5 },
+              { "value": 10, "points_max": 5, "id": "fiber", "points": 5, "unit": "g" },
+              {
+                "points_max": 5,
+                "value": 0,
+                "points": 0,
+                "id": "fruits_vegetables_legumes",
+                "unit": "%"
+              }
+            ]
+          },
+          "positive_points": 10,
+          "count_proteins": 1
+        },
+        "preparation": "as_sold",
+        "grade": "a",
+        "nutriscore_applicable": 1
+      }
+    },
+    "product_name_en": "Old Fashioned Oats",
+    "nutrition_score_warning_fruits_vegetables_nuts_estimate_from_ingredients_value": 0,
+    "categories_properties_tags": [
+      "all-products",
+      "categories-known",
+      "agribalyse-food-code-9311",
+      "agribalyse-food-code-known",
+      "agribalyse-proxy-food-code-32135",
+      "agribalyse-proxy-food-code-known",
+      "ciqual-food-code-9311",
+      "ciqual-food-code-known",
+      "agribalyse-known",
+      "agribalyse-9311"
+    ],
+    "brand_owner": "The Quaker Oats Company",
+    "languages": { "en:english": 7 },
+    "additives_n": 0,
+    "data_quality_warnings_tags": [
+      "en:nutrition-energy-value-in-kcal-does-not-match-value-computed-from-other-nutrients",
+      "en:nutrition-energy-value-in-kcal-may-not-match-value-computed-from-other-nutrients",
+      "en:environmental-score-origins-of-ingredients-origins-are-100-percent-unknown",
+      "en:environmental-score-packaging-unscored-shape",
+      "en:environmental-score-production-system-no-label"
+    ],
+    "other_nutritional_substances_tags": [],
+    "nutriscore_2021_tags": ["a"],
+    "food_groups": "en:breakfast-cereals",
+    "correctors_tags": [
+      "babartareen",
+      "aaronasachimp",
+      "inf",
+      "org-database-usda",
+      "yuka.sY2b0xO6T85zoF3NwEKvllZDc_3erQ7laQXfn3fV94u1FMD1UdF42IP1HKs",
+      "kiliweb",
+      "packbot",
+      "macrofactor",
+      "sierrakomodo",
+      "org-label-non-gmo-project",
+      "lladylynn",
+      "tyreepeak",
+      "municorn-calorie-counter-app",
+      "jlnimsick",
+      "fgouget",
+      "hiimdannyganz",
+      "qalzy",
+      "zlima12"
+    ],
+    "popularity_key": 25990000054,
+    "generic_name_en": "Rolled oats",
+    "nutrition_score_warning_nutriments_estimated": 1,
+    "ingredients_non_nutritive_sweeteners_n": 0,
+    "data_quality_completeness_tags": [
+      "en:photo-and-data-to-be-checked-by-an-experienced-contributor",
+      "en:ingredients-en-photo-selected",
+      "en:ingredients-en-completed",
+      "en:ingredients-completed-at-least-for-one-language",
+      "en:nutrition-photo-selected",
+      "en:categories-completed",
+      "en:nutrition-completed",
+      "en:packaging-photo-to-be-selected",
+      "en:packagings-completed",
+      "en:front-photo-selected",
+      "en:product-name-completed",
+      "en:quantity-completed",
+      "en:brands-completed",
+      "en:expiration-date-to-be-completed"
+    ],
+    "packagings_n": 3,
+    "removed_countries_tags": [],
+    "ingredients_analysis_tags": ["en:palm-oil-free", "en:vegan", "en:vegetarian"],
+    "nova_group": 1,
+    "recipe_estimator": {
+      "nutrient_variance": 122.035876043379,
+      "ingredient_count": 1,
+      "status_message": "optimal",
+      "penalties": {
+        "mass_less_than_100_penalty": 0,
+        "ingredient_not_half_previous_penalty": 0,
+        "ingredient_more_than_previous_penalty": 0,
+        "total": 15865463.830389,
+        "mass_more_than_100_penalty": 866,
+        "nutrient_penalty": 15864597.830389
+      },
+      "might_be_us": false,
+      "time": 0.01,
+      "nutrients": {
+        "polyunsaturated-fat": {
+          "unweighted_total": 2.5,
+          "weighting": 0,
+          "notes": "Not listed on product",
+          "ingredient_count": 1
+        },
+        "vitamin-b2": {
+          "notes": "",
+          "ingredient_count": 1,
+          "unweighted_total": 0.00014,
+          "product_total": 0.00014,
+          "weighting": 0
+        },
+        "glucose": {
+          "weighting": 0,
+          "unweighted_total": 0,
+          "product_total": 0,
+          "ingredient_count": 1,
+          "notes": "All zero values"
+        },
+        "proteins": {
+          "product_total": 12.5,
+          "unweighted_total": 13.3,
+          "weighting": 7,
+          "ingredient_count": 1
+        },
+        "energy": {
+          "notes": "Energy is derived",
+          "ingredient_count": 1,
+          "product_total": 1717.5,
+          "unweighted_total": 1550,
+          "weighting": 0
+        },
+        "alcohol": {
+          "weighting": 0,
+          "product_total": 0,
+          "unweighted_total": 0,
+          "ingredient_count": 1,
+          "notes": "All zero values"
+        },
+        "maltose": {
+          "product_total": 0,
+          "unweighted_total": 0,
+          "weighting": 0,
+          "notes": "All zero values",
+          "ingredient_count": 1
+        },
+        "fructose": {
+          "notes": "All zero values",
+          "ingredient_count": 1,
+          "product_total": 0,
+          "unweighted_total": 0,
+          "weighting": 0
+        },
+        "vitamin-b6": {
+          "weighting": 0,
+          "unweighted_total": 0.00012,
+          "product_total": 0.00012,
+          "ingredient_count": 1,
+          "notes": ""
+        },
+        "monounsaturated-fat": {
+          "ingredient_count": 1,
+          "notes": "Not listed on product",
+          "weighting": 0,
+          "unweighted_total": 2.08
+        },
+        "pantothenic-acid": {
+          "unweighted_total": 0.00131,
+          "product_total": 0.00131,
+          "weighting": 0,
+          "notes": "",
+          "ingredient_count": 1
+        },
+        "sugars": {
+          "ingredient_count": 1,
+          "weighting": 20,
+          "product_total": 0,
+          "unweighted_total": 0.97
+        },
+        "folates": {
+          "unweighted_total": 0.0000396,
+          "weighting": 0,
+          "notes": "Not listed on product",
+          "ingredient_count": 1
+        },
+        "phosphorus": {
+          "ingredient_count": 1,
+          "notes": "",
+          "weighting": 0,
+          "unweighted_total": 0.422,
+          "product_total": 0.325
+        },
+        "vitamin-b1": {
+          "product_total": 0.0005,
+          "unweighted_total": 0.00043,
+          "weighting": 0,
+          "notes": "",
+          "ingredient_count": 1
+        },
+        "vitamin-e": {
+          "notes": "",
+          "ingredient_count": 1,
+          "product_total": 0.00059,
+          "unweighted_total": 0.00059,
+          "weighting": 0
+        },
+        "manganese": {
+          "product_total": 0.00472,
+          "unweighted_total": 0.00472,
+          "weighting": 0,
+          "notes": "",
+          "ingredient_count": 1
+        },
+        "cholesterol": {
+          "weighting": 0,
+          "product_total": 0,
+          "unweighted_total": 0,
+          "ingredient_count": 1,
+          "notes": "All zero values"
+        },
+        "starch": {
+          "ingredient_count": 1,
+          "product_total": 56.9,
+          "unweighted_total": 56.9,
+          "weighting": 1
+        },
+        "iron": {
+          "ingredient_count": 1,
+          "weighting": 1,
+          "unweighted_total": 0.00405,
+          "product_total": 0.0025
+        },
+        "vitamin-d": {
+          "weighting": 0,
+          "product_total": 0,
+          "unweighted_total": 0,
+          "ingredient_count": 1,
+          "notes": "All zero values"
+        },
+        "potassium": {
+          "notes": "",
+          "ingredient_count": 1,
+          "unweighted_total": 0.377,
+          "product_total": 0.375,
+          "weighting": 0
+        },
+        "saturated-fat": {
+          "weighting": 50,
+          "product_total": 1.25,
+          "unweighted_total": 1.13,
+          "ingredient_count": 1
+        },
+        "water": {
+          "unweighted_total": 10.1,
+          "product_total": 10.1,
+          "weighting": 0,
+          "notes": "Added manually",
+          "ingredient_count": 1
+        },
+        "lactose": {
+          "ingredient_count": 1,
+          "notes": "All zero values",
+          "weighting": 0,
+          "unweighted_total": 0,
+          "product_total": 0
+        },
+        "sodium": {
+          "ingredient_count": 1,
+          "weighting": 10,
+          "unweighted_total": 0.00568,
+          "product_total": 0
+        },
+        "fat": {
+          "ingredient_count": 1,
+          "weighting": 5,
+          "product_total": 7.5,
+          "unweighted_total": 6.51
+        },
+        "polyols": {
+          "product_total": 0,
+          "unweighted_total": 0,
+          "weighting": 0,
+          "notes": "All zero values",
+          "ingredient_count": 1
+        },
+        "zinc": {
+          "weighting": 0,
+          "product_total": 0.00333,
+          "unweighted_total": 0.00333,
+          "ingredient_count": 1,
+          "notes": ""
+        },
+        "fiber": {
+          "unweighted_total": 10.2,
+          "product_total": 10,
+          "weighting": 5,
+          "ingredient_count": 1
+        },
+        "copper": {
+          "weighting": 0,
+          "unweighted_total": 0.0003,
+          "product_total": 0.0003,
+          "ingredient_count": 1,
+          "notes": ""
+        },
+        "sucrose": {
+          "weighting": 1,
+          "product_total": 0.97,
+          "unweighted_total": 0.97,
+          "ingredient_count": 1
+        },
+        "carbohydrates": {
+          "weighting": 2,
+          "product_total": 67.5,
+          "unweighted_total": 57.9,
+          "ingredient_count": 1
+        },
+        "vitamin-pp": {
+          "weighting": 0,
+          "unweighted_total": 0.00096,
+          "product_total": 0.00096,
+          "ingredient_count": 1,
+          "notes": "A component of B3?"
+        },
+        "vitamin-b12": {
+          "notes": "All zero values",
+          "ingredient_count": 1,
+          "unweighted_total": 0,
+          "product_total": 0,
+          "weighting": 0
+        },
+        "vitamin-c": {
+          "notes": "All zero values",
+          "ingredient_count": 1,
+          "unweighted_total": 0,
+          "product_total": 0,
+          "weighting": 0
+        },
+        "calcium": {
+          "ingredient_count": 1,
+          "weighting": 1,
+          "product_total": 0.05,
+          "unweighted_total": 0.0843
+        },
+        "magnesium": {
+          "weighting": 0,
+          "unweighted_total": 0.148,
+          "product_total": 0.1,
+          "ingredient_count": 1,
+          "notes": ""
+        },
+        "galactose": {
+          "weighting": 0,
+          "product_total": 0,
+          "unweighted_total": 0,
+          "ingredient_count": 1,
+          "notes": "All zero values"
+        },
+        "salt": {
+          "notes": "Sodium is used instead",
+          "ingredient_count": 1,
+          "product_total": 0,
+          "unweighted_total": 0.014,
+          "weighting": 0
+        }
+      },
+      "status": 0
+    },
+    "amino_acids_prev_tags": [],
+    "environmental_score_score": 65,
+    "sources_fields": {
+      "org-database-usda": {
+        "fdc_id": "662586",
+        "available_date": "2019-01-18T00:00:00Z",
+        "fdc_data_source": "LI",
+        "fdc_category": "Cereal",
+        "modified_date": "2019-01-18T00:00:00Z",
+        "publication_date": "2019-12-06T00:00:00Z"
+      }
+    },
+    "unique_scans_n": 44,
+    "ingredients_text_with_allergens": "whole grain rolled oats",
+    "ingredients_with_unspecified_percent_n": 1,
+    "debug_param_sorted_langs": ["en"],
+    "weighers_tags": [],
+    "ingredients_with_specified_percent_sum": 0,
+    "packagings_complete": 0,
+    "minerals_tags": [],
+    "link": "https://smartlabel.pepsico.info/030000010402-0001-en-US/index.html",
+    "additives_original_tags": [],
+    "countries_tags": ["en:united-states", "en:world"],
+    "nutrition": {
+      "input_sets": [
+        {
+          "nutrients": { "nova-group": { "unit": "", "value": 1, "value_string": "1" } },
+          "source": "packaging",
+          "unspecified_nutrients": [
+            "calcium",
+            "energy-kcal",
+            "iron",
+            "magnesium",
+            "phosphorus",
+            "potassium",
+            "vitamin-b1",
+            "vitamin-d"
+          ],
+          "per_unit": "g",
+          "preparation": "as_sold",
+          "per_quantity": 100,
+          "per": "100g",
+          "last_updated_t": 1771521200
+        },
+        {
+          "preparation": "as_sold",
+          "per_unit": "ml",
+          "nutrients": {
+            "sodium": { "value_string": "0", "value_computed": 0, "value": 0, "unit": "mg" },
+            "saturated-fat": { "value": 0.5, "value_string": "0.5", "unit": "g" },
+            "fiber": { "value": 4, "value_string": "4", "unit": "g" },
+            "fat": { "unit": "g", "value": 3, "value_string": "3" },
+            "calcium": { "value": 20, "value_string": "20", "unit": "mg" },
+            "carbohydrates-total": { "value": 27, "value_string": "27", "unit": "g" },
+            "energy-kj": { "unit": "kJ", "value_computed": 687 },
+            "carbohydrates": { "unit": "g", "value_string": "27", "value": 27 },
+            "magnesium": { "value": 40, "value_string": "40", "unit": "mg" },
+            "salt": { "unit": "mg", "value_computed": 0 },
+            "polyunsaturated-fat": { "unit": "g", "value_string": "1", "value": 1 },
+            "added-sugars": { "unit": "g", "value": 0, "value_string": "0" },
+            "monounsaturated-fat": { "unit": "g", "value": 1, "value_string": "1" },
+            "proteins": { "unit": "g", "value": 5, "value_string": "5" },
+            "soluble-fiber": { "value": 2, "value_string": "2", "unit": "g" },
+            "phosphorus": { "unit": "mg", "value_string": "130", "value": 130 },
+            "energy-kcal": {
+              "value": 150,
+              "value_computed": 163,
+              "value_string": "150",
+              "unit": "kcal"
+            },
+            "vitamin-b1": { "unit": "mg", "value": 0.2, "value_string": "0.2" },
+            "trans-fat": { "unit": "g", "value_string": "0", "value": 0 },
+            "sugars": { "value_string": "1", "value": 1, "unit": "g" },
+            "iron": { "unit": "mg", "value_string": "1.5", "value": 1.5 },
+            "vitamin-d": { "value": 0, "value_string": "0", "unit": "µg" },
+            "potassium": { "value_string": "150", "value": 150, "unit": "mg" },
+            "cholesterol": { "unit": "mg", "value_string": "0", "value": 0 }
+          },
+          "per_quantity": 40,
+          "per": "serving",
+          "source": "packaging",
+          "unspecified_nutrients": ["insoluble-fiber", "salt"]
+        },
+        {
+          "per": "100g",
+          "preparation": "as_sold",
+          "per_unit": "g",
+          "per_quantity": 100,
+          "source": "estimate",
+          "source_description": "Estimate from ingredients",
+          "nutrients": {
+            "maltose": { "unit": "g", "modifier": "~", "value": 0, "value_string": "0" },
+            "glucose": { "value": 0, "modifier": "~", "value_string": "0", "unit": "g" },
+            "vitamin-b2": {
+              "unit": "g",
+              "value_string": "0.000152124",
+              "modifier": "~",
+              "value": 0.000152124
+            },
+            "proteins": {
+              "unit": "g",
+              "value_string": "14.45178",
+              "value": 14.45178,
+              "modifier": "~"
+            },
+            "energy": {
+              "value_string": "1662.498",
+              "value": 1662.498,
+              "modifier": "~",
+              "unit": "kJ"
+            },
+            "iron": {
+              "value": 0.00440073,
+              "modifier": "~",
+              "value_string": "0.00440073",
+              "unit": "g"
+            },
+            "vitamin-d": { "modifier": "~", "value": 0, "value_string": "0", "unit": "g" },
+            "selenium": {
+              "unit": "g",
+              "value_string": "3.31413e-06",
+              "value": 0.00000331413,
+              "modifier": "~"
+            },
+            "manganese": {
+              "unit": "g",
+              "value_string": "0.005128752",
+              "modifier": "~",
+              "value": 0.005128752
+            },
+            "cholesterol": { "unit": "g", "value_string": "0", "value": 0, "modifier": "~" },
+            "fiber": {
+              "unit": "g",
+              "value_string": "11.08332",
+              "value": 11.08332,
+              "modifier": "~"
+            },
+            "beta-carotene": { "value_string": "0", "modifier": "~", "value": 0, "unit": "g" },
+            "lactose": { "value": 0, "modifier": "~", "value_string": "0", "unit": "g" },
+            "sodium": {
+              "value_string": "0.006171888",
+              "modifier": "~",
+              "value_computed": 0.00608496,
+              "value": 0.006171888,
+              "unit": "g"
+            },
+            "magnesium": {
+              "value": 0.1608168,
+              "modifier": "~",
+              "value_string": "0.1608168",
+              "unit": "g"
+            },
+            "vitamin-c": { "value_string": "0", "value": 0, "modifier": "~", "unit": "g" },
+            "vitamin-b9": {
+              "value_string": "4.302936e-05",
+              "modifier": "~",
+              "value": 0.00004302936,
+              "unit": "g"
+            },
+            "iodine": {
+              "unit": "g",
+              "value": 5.433e-7,
+              "modifier": "~",
+              "value_string": "5.433e-07"
+            },
+            "calcium": {
+              "modifier": "~",
+              "value": 0.09160038,
+              "value_string": "0.09160038",
+              "unit": "g"
+            },
+            "carbohydrates": {
+              "unit": "g",
+              "value_string": "62.91414",
+              "value": 62.91414,
+              "modifier": "~"
+            },
+            "vitamin-b12": { "value": 0, "modifier": "~", "value_string": "0", "unit": "g" },
+            "alcohol": { "modifier": "~", "value": 0, "value_string": "0", "unit": "% vol" },
+            "fructose": { "unit": "g", "modifier": "~", "value": 0, "value_string": "0" },
+            "added-sugars": { "value_string": "0", "modifier": "~", "value": 0, "unit": "g" },
+            "vitamin-b6": {
+              "value_string": "0.000130392",
+              "modifier": "~",
+              "value": 0.000130392,
+              "unit": "g"
+            },
+            "vitamin-a": { "unit": "g", "value": 0, "modifier": "~", "value_string": "0" },
+            "starch": {
+              "modifier": "~",
+              "value": 61.82754,
+              "value_string": "61.82754",
+              "unit": "g"
+            },
+            "potassium": {
+              "value_string": "0.4096482",
+              "modifier": "~",
+              "value": 0.4096482,
+              "unit": "g"
+            },
+            "vitamin-e": {
+              "modifier": "~",
+              "value": 0.000641094,
+              "value_string": "0.000641094",
+              "unit": "g"
+            },
+            "phosphorus": {
+              "modifier": "~",
+              "value": 0.4585452,
+              "value_string": "0.4585452",
+              "unit": "g"
+            },
+            "fruits-vegetables-nuts": {
+              "unit": "%",
+              "value": 0,
+              "modifier": "~",
+              "value_string": "0"
+            },
+            "energy-kcal": {
+              "value": 395.5224,
+              "value_computed": 395.294214,
+              "modifier": "~",
+              "value_string": "395.5224",
+              "unit": "kcal"
+            },
+            "vitamin-b1": {
+              "unit": "g",
+              "value_string": "0.000467238",
+              "value": 0.000467238,
+              "modifier": "~"
+            },
+            "pantothenic-acid": {
+              "unit": "g",
+              "value_string": "0.001423446",
+              "value": 0.001423446,
+              "modifier": "~"
+            },
+            "sugars": {
+              "unit": "g",
+              "value_string": "1.054002",
+              "value": 1.054002,
+              "modifier": "~"
+            },
+            "zinc": {
+              "value_string": "0.003618378",
+              "modifier": "~",
+              "value": 0.003618378,
+              "unit": "g"
+            },
+            "sucrose": {
+              "unit": "g",
+              "value": 1.054002,
+              "modifier": "~",
+              "value_string": "1.054002"
+            },
+            "copper": {
+              "unit": "g",
+              "value_string": "0.00032598",
+              "value": 0.00032598,
+              "modifier": "~"
+            },
+            "fat": { "unit": "g", "value": 7.073766, "modifier": "~", "value_string": "7.073766" },
+            "fruits-vegetables-legumes": {
+              "value_string": "0",
+              "modifier": "~",
+              "value": 0,
+              "unit": "%"
+            },
+            "polyols": { "modifier": "~", "value": 0, "value_string": "0", "unit": "g" },
+            "water": {
+              "unit": "g",
+              "value_string": "10.97466",
+              "modifier": "~",
+              "value": 10.97466
+            },
+            "phylloquinone": {
+              "unit": "g",
+              "value_string": "2.1732e-06",
+              "value": 0.0000021732,
+              "modifier": "~"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value_string": "1.227858",
+              "modifier": "~",
+              "value": 1.227858
+            },
+            "galactose": { "unit": "g", "value_string": "0", "modifier": "~", "value": 0 },
+            "salt": {
+              "unit": "g",
+              "value_string": "0.0152124",
+              "value_computed": 0.01542972,
+              "value": 0.0152124,
+              "modifier": "~"
+            },
+            "vitamin-pp": {
+              "unit": "g",
+              "modifier": "~",
+              "value": 0.001043136,
+              "value_string": "0.001043136"
+            },
+            "energy-kj": {
+              "modifier": "~",
+              "value_computed": 1665.616542,
+              "value": 1662.498,
+              "value_string": "1662.498",
+              "unit": "kJ"
+            }
+          }
+        }
+      ],
+      "aggregated_set": {
+        "preparation": "as_sold",
+        "nutrients": {
+          "zinc": {
+            "source_per": "100g",
+            "value": 0.003618378,
+            "modifier": "~",
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate"
+          },
+          "copper": {
+            "value": 0.00032598,
+            "modifier": "~",
+            "source_per": "100g",
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2
+          },
+          "sucrose": {
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2,
+            "value": 1.054002,
+            "modifier": "~",
+            "source_per": "100g"
+          },
+          "polyols": {
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2,
+            "value": 0,
+            "modifier": "~",
+            "source_per": "100g"
+          },
+          "fruits-vegetables-legumes": {
+            "source_per": "100g",
+            "modifier": "~",
+            "value": 0,
+            "source_index": 2,
+            "unit": "%",
+            "source": "estimate"
+          },
+          "fat": {
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1,
+            "value": 7.5,
+            "source_per": "serving"
+          },
+          "water": {
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "g",
+            "modifier": "~",
+            "value": 10.97466,
+            "source_per": "100g"
+          },
+          "phylloquinone": {
+            "source_per": "100g",
+            "modifier": "~",
+            "value": 0.0000021732,
+            "source_index": 2,
+            "unit": "g",
+            "source": "estimate"
+          },
+          "saturated-fat": {
+            "value": 1.25,
+            "source_per": "serving",
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1
+          },
+          "salt": {
+            "value": 0,
+            "modifier": "~",
+            "source_per": "serving",
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1
+          },
+          "galactose": {
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "g",
+            "modifier": "~",
+            "value": 0,
+            "source_per": "100g"
+          },
+          "nova-group": {
+            "value": 1,
+            "source_per": "100g",
+            "source": "packaging",
+            "unit": "",
+            "source_index": 0
+          },
+          "energy-kj": {
+            "source_per": "serving",
+            "value": 1717.5,
+            "modifier": "~",
+            "unit": "kJ",
+            "source_index": 1,
+            "source": "packaging"
+          },
+          "vitamin-pp": {
+            "modifier": "~",
+            "value": 0.001043136,
+            "source_per": "100g",
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "g"
+          },
+          "fructose": {
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate",
+            "source_per": "100g",
+            "value": 0,
+            "modifier": "~"
+          },
+          "vitamin-b6": {
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate",
+            "source_per": "100g",
+            "value": 0.000130392,
+            "modifier": "~"
+          },
+          "added-sugars": {
+            "source": "packaging",
+            "source_index": 1,
+            "unit": "g",
+            "value": 0,
+            "source_per": "serving"
+          },
+          "alcohol": {
+            "modifier": "~",
+            "value": 0,
+            "source_per": "100g",
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "% vol"
+          },
+          "soluble-fiber": {
+            "value": 5,
+            "source_per": "serving",
+            "source": "packaging",
+            "source_index": 1,
+            "unit": "g"
+          },
+          "vitamin-a": {
+            "source_per": "100g",
+            "value": 0,
+            "modifier": "~",
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate"
+          },
+          "potassium": {
+            "source_per": "serving",
+            "value": 0.375,
+            "source_index": 1,
+            "unit": "g",
+            "source": "packaging"
+          },
+          "starch": {
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate",
+            "source_per": "100g",
+            "value": 61.82754,
+            "modifier": "~"
+          },
+          "vitamin-e": {
+            "source_per": "100g",
+            "value": 0.000641094,
+            "modifier": "~",
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate"
+          },
+          "fruits-vegetables-nuts": {
+            "source_per": "100g",
+            "modifier": "~",
+            "value": 0,
+            "source_index": 2,
+            "unit": "%",
+            "source": "estimate"
+          },
+          "energy-kcal": {
+            "source_per": "serving",
+            "value_computed": 163,
+            "source_index": 1,
+            "source": "packaging",
+            "value": 375,
+            "unit": "kcal"
+          },
+          "vitamin-b1": {
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1,
+            "value": 0.0005,
+            "source_per": "serving"
+          },
+          "phosphorus": {
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1,
+            "value": 0.325,
+            "source_per": "serving"
+          },
+          "sugars": {
+            "source_per": "serving",
+            "value": 2.5,
+            "source_index": 1,
+            "unit": "g",
+            "source": "packaging"
+          },
+          "pantothenic-acid": {
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2,
+            "value": 0.001423446,
+            "modifier": "~",
+            "source_per": "100g"
+          },
+          "beta-carotene": {
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "g",
+            "modifier": "~",
+            "value": 0,
+            "source_per": "100g"
+          },
+          "fiber": {
+            "source_per": "serving",
+            "value": 10,
+            "unit": "g",
+            "source_index": 1,
+            "source": "packaging"
+          },
+          "lactose": {
+            "source_per": "100g",
+            "value": 0,
+            "modifier": "~",
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate"
+          },
+          "sodium": {
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1,
+            "value": 0,
+            "value_computed": 0,
+            "source_per": "serving"
+          },
+          "magnesium": {
+            "source_index": 1,
+            "unit": "g",
+            "source": "packaging",
+            "source_per": "serving",
+            "value": 0.1
+          },
+          "calcium": {
+            "source_per": "serving",
+            "value": 0.05,
+            "source_index": 1,
+            "unit": "g",
+            "source": "packaging"
+          },
+          "vitamin-c": {
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate",
+            "source_per": "100g",
+            "value": 0,
+            "modifier": "~"
+          },
+          "vitamin-b9": {
+            "unit": "g",
+            "source_index": 2,
+            "source": "estimate",
+            "source_per": "100g",
+            "value": 0.00004302936,
+            "modifier": "~"
+          },
+          "iodine": {
+            "source_per": "100g",
+            "modifier": "~",
+            "value": 5.433e-7,
+            "source_index": 2,
+            "unit": "g",
+            "source": "estimate"
+          },
+          "carbohydrates": {
+            "value": 67.5,
+            "source_per": "serving",
+            "source": "packaging",
+            "source_index": 1,
+            "unit": "g"
+          },
+          "vitamin-b12": {
+            "modifier": "~",
+            "value": 0,
+            "source_per": "100g",
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "g"
+          },
+          "carbohydrates-total": {
+            "value": 67.5,
+            "source_per": "serving",
+            "source": "packaging",
+            "source_index": 1,
+            "unit": "g"
+          },
+          "monounsaturated-fat": {
+            "source": "packaging",
+            "source_index": 1,
+            "unit": "g",
+            "value": 2.5,
+            "source_per": "serving"
+          },
+          "maltose": {
+            "value": 0,
+            "modifier": "~",
+            "source_per": "100g",
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2
+          },
+          "energy": {
+            "source_index": 1,
+            "unit": "kJ",
+            "source": "packaging",
+            "source_per": "serving",
+            "modifier": "~",
+            "value": 1717.5
+          },
+          "glucose": {
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2,
+            "value": 0,
+            "modifier": "~",
+            "source_per": "100g"
+          },
+          "vitamin-b2": {
+            "source": "estimate",
+            "unit": "g",
+            "source_index": 2,
+            "value": 0.000152124,
+            "modifier": "~",
+            "source_per": "100g"
+          },
+          "proteins": {
+            "source_per": "serving",
+            "value": 12.5,
+            "unit": "g",
+            "source_index": 1,
+            "source": "packaging"
+          },
+          "polyunsaturated-fat": {
+            "source_per": "serving",
+            "value": 2.5,
+            "unit": "g",
+            "source_index": 1,
+            "source": "packaging"
+          },
+          "vitamin-d": {
+            "source": "packaging",
+            "source_index": 1,
+            "unit": "g",
+            "value": 0,
+            "source_per": "serving"
+          },
+          "iron": {
+            "source_per": "serving",
+            "value": 0.00375,
+            "source_index": 1,
+            "unit": "g",
+            "source": "packaging"
+          },
+          "cholesterol": {
+            "source_index": 1,
+            "unit": "g",
+            "source": "packaging",
+            "source_per": "serving",
+            "value": 0
+          },
+          "selenium": {
+            "source_per": "100g",
+            "modifier": "~",
+            "value": 0.00000331413,
+            "source_index": 2,
+            "unit": "g",
+            "source": "estimate"
+          },
+          "manganese": {
+            "source": "estimate",
+            "source_index": 2,
+            "unit": "g",
+            "modifier": "~",
+            "value": 0.005128752,
+            "source_per": "100g"
+          },
+          "trans-fat": {
+            "source": "packaging",
+            "unit": "g",
+            "source_index": 1,
+            "value": 0,
+            "source_per": "serving"
+          }
+        },
+        "per": "100g"
+      }
+    },
+    "nutrition_data_per": "100g",
+    "ciqual_food_name_tags": ["unknown"],
+    "estimate_ingredients_percent_service": "recipe_estimator_cvxpy",
+    "ingredients_with_specified_percent_n": 0,
+    "last_edit_dates_tags": ["2026-08-10", "2026-08", "2026"],
+    "images": {
+      "uploaded": {
+        "1": {
+          "uploader": "babartareen",
+          "uploaded_t": "1469062987",
+          "sizes": {
+            "100": { "h": 100, "w": 56 },
+            "400": { "h": 400, "w": 225 },
+            "full": { "h": 2000, "w": 1125 }
+          }
+        },
+        "2": {
+          "sizes": {
+            "100": { "w": 56, "h": 100 },
+            "400": { "w": 225, "h": 400 },
+            "full": { "w": 1125, "h": 2000 }
+          },
+          "uploader": "babartareen",
+          "uploaded_t": "1469063009"
+        },
+        "3": {
+          "uploaded_t": "1469063060",
+          "uploader": "babartareen",
+          "sizes": {
+            "100": { "w": 56, "h": 100 },
+            "400": { "h": 400, "w": 225 },
+            "full": { "w": 1125, "h": 2000 }
+          }
+        },
+        "4": {
+          "sizes": {
+            "100": { "h": 100, "w": 56 },
+            "400": { "h": 400, "w": 225 },
+            "full": { "w": 1125, "h": 2000 }
+          },
+          "uploaded_t": "1469063079",
+          "uploader": "babartareen"
+        },
+        "5": {
+          "uploaded_t": "1469063205",
+          "uploader": "babartareen",
+          "sizes": {
+            "100": { "h": 56, "w": 100 },
+            "400": { "w": 400, "h": 225 },
+            "full": { "w": 2000, "h": 1125 }
+          }
+        },
+        "6": {
+          "uploader": "wolfgang8741",
+          "uploaded_t": "1490285890",
+          "sizes": {
+            "100": { "w": 100, "h": 75 },
+            "400": { "w": 400, "h": 300 },
+            "full": { "w": 2000, "h": 1500 }
+          }
+        },
+        "7": {
+          "uploaded_t": 1639686812,
+          "uploader": "kiliweb",
+          "sizes": {
+            "100": { "w": 48, "h": 100 },
+            "400": { "h": 400, "w": 193 },
+            "full": { "h": 1200, "w": 578 }
+          }
+        },
+        "8": {
+          "sizes": {
+            "100": { "h": 100, "w": 50 },
+            "400": { "w": 199, "h": 400 },
+            "full": { "w": 472, "h": 947 }
+          },
+          "uploaded_t": 1639686813,
+          "uploader": "kiliweb"
+        },
+        "9": {
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "w": 300, "h": 400 },
+            "full": { "h": 4000, "w": 3000 }
+          },
+          "uploaded_t": 1714173189,
+          "uploader": "sierrakomodo"
+        },
+        "10": {
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "w": 300, "h": 400 },
+            "full": { "w": 3000, "h": 4000 }
+          },
+          "uploader": "sierrakomodo",
+          "uploaded_t": 1714173192
+        },
+        "11": {
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "w": 300, "h": 400 },
+            "full": { "h": 4000, "w": 3000 }
+          },
+          "uploaded_t": 1714173196,
+          "uploader": "sierrakomodo"
+        },
+        "12": {
+          "uploaded_t": 1742836296,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "h": 100, "w": 43 },
+            "400": { "h": 400, "w": 173 },
+            "full": { "h": 1700, "w": 734 }
+          }
+        },
+        "13": {
+          "sizes": {
+            "100": { "w": 75, "h": 100 },
+            "400": { "w": 300, "h": 400 },
+            "full": { "h": 1698, "w": 1275 }
+          },
+          "uploader": "macrofactor",
+          "uploaded_t": 1743948496
+        },
+        "14": {
+          "uploaded_t": 1744032926,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "h": 100, "w": 100 },
+            "400": { "h": 400, "w": 400 },
+            "full": { "w": 1700, "h": 1700 }
+          }
+        },
+        "15": {
+          "sizes": {
+            "100": { "w": 100, "h": 100 },
+            "400": { "w": 400, "h": 400 },
+            "full": { "w": 1700, "h": 1700 }
+          },
+          "uploaded_t": 1744032936,
+          "uploader": "macrofactor"
+        },
+        "16": {
+          "uploaded_t": 1744559637,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "w": 80, "h": 100 },
+            "400": { "h": 400, "w": 320 },
+            "full": { "h": 1596, "w": 1275 }
+          }
+        },
+        "17": {
+          "uploaded_t": 1744559644,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "w": 65, "h": 100 },
+            "400": { "w": 259, "h": 400 },
+            "full": { "w": 966, "h": 1493 }
+          }
+        },
+        "18": {
+          "uploader": "macrofactor",
+          "uploaded_t": 1745086410,
+          "sizes": {
+            "100": { "w": 64, "h": 100 },
+            "400": { "h": 400, "w": 255 },
+            "full": { "w": 1083, "h": 1700 }
+          }
+        },
+        "19": {
+          "sizes": {
+            "100": { "h": 100, "w": 39 },
+            "400": { "h": 400, "w": 155 },
+            "full": { "w": 594, "h": 1530 }
+          },
+          "uploaded_t": 1745086415,
+          "uploader": "macrofactor"
+        },
+        "20": {
+          "uploaded_t": 1752984961,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "h": 400, "w": 300 },
+            "full": { "h": 1698, "w": 1275 }
+          }
+        },
+        "21": {
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "h": 400, "w": 300 },
+            "full": { "h": 1698, "w": 1275 }
+          },
+          "uploader": "macrofactor",
+          "uploaded_t": 1752984965
+        },
+        "22": {
+          "uploaded_t": 1754319371,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "w": 592, "h": 1280 }
+          }
+        },
+        "23": {
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "w": 592, "h": 1280 }
+          },
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1754319373
+        },
+        "24": {
+          "uploaded_t": 1754532859,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "w": 55, "h": 100 },
+            "400": { "h": 400, "w": 218 },
+            "full": { "w": 844, "h": 1548 }
+          }
+        },
+        "25": {
+          "uploaded_t": 1754532863,
+          "uploader": "macrofactor",
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "w": 301, "h": 400 },
+            "full": { "w": 1280, "h": 1700 }
+          }
+        },
+        "26": {
+          "uploaded_t": 1754670503,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "27": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1754670505,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "28": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1755357776,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "29": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1755357778,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "30": {
+          "uploader": "macrofactor",
+          "uploaded_t": 1757536449,
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "h": 400, "w": 300 },
+            "full": { "w": 1275, "h": 1698 }
+          }
+        },
+        "31": {
+          "sizes": {
+            "100": { "w": 75, "h": 100 },
+            "400": { "w": 300, "h": 400 },
+            "full": { "w": 1275, "h": 1698 }
+          },
+          "uploader": "macrofactor",
+          "uploaded_t": 1757536453
+        },
+        "32": {
+          "uploaded_t": 1758249054,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          }
+        },
+        "33": {
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          },
+          "uploaded_t": 1758249057,
+          "uploader": "municorn-calorie-counter-app"
+        },
+        "34": {
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          },
+          "uploaded_t": 1759253408,
+          "uploader": "municorn-calorie-counter-app"
+        },
+        "35": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1759253414,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "36": {
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "h": 400, "w": 301 },
+            "full": { "w": 1280, "h": 1700 }
+          },
+          "uploaded_t": 1759364207,
+          "uploader": "macrofactor"
+        },
+        "37": {
+          "sizes": {
+            "100": { "h": 100, "w": 75 },
+            "400": { "h": 400, "w": 301 },
+            "full": { "h": 1700, "w": 1280 }
+          },
+          "uploaded_t": 1759364211,
+          "uploader": "macrofactor"
+        },
+        "38": {
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "w": 592, "h": 1280 }
+          },
+          "uploaded_t": 1761063517,
+          "uploader": "municorn-calorie-counter-app"
+        },
+        "39": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1761063520,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "40": {
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          },
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1761063642
+        },
+        "41": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1761063646,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "42": {
+          "uploaded_t": 1761068520,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          }
+        },
+        "43": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1761068523,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          }
+        },
+        "44": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1762450624,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "w": 592, "h": 1280 }
+          }
+        },
+        "45": {
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "h": 1280, "w": 592 }
+          },
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1762450627
+        },
+        "46": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1762971960,
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "47": {
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          },
+          "uploaded_t": 1762971965,
+          "uploader": "municorn-calorie-counter-app"
+        },
+        "48": {
+          "uploaded_t": 1762972366,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "w": 185, "h": 400 },
+            "full": { "w": 592, "h": 1280 }
+          }
+        },
+        "49": {
+          "uploaded_t": 1762972369,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "50": {
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1763219891,
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "h": 1280, "w": 592 }
+          }
+        },
+        "51": {
+          "sizes": {
+            "100": { "h": 100, "w": 46 },
+            "400": { "h": 400, "w": 185 },
+            "full": { "w": 592, "h": 1280 }
+          },
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1763219895
+        },
+        "52": {
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "w": 184, "h": 400 },
+            "full": { "w": 590, "h": 1280 }
+          },
+          "uploader": "municorn-calorie-counter-app",
+          "uploaded_t": 1764651469
+        },
+        "53": {
+          "uploaded_t": 1764651472,
+          "uploader": "municorn-calorie-counter-app",
+          "sizes": {
+            "100": { "w": 46, "h": 100 },
+            "400": { "h": 400, "w": 184 },
+            "full": { "h": 1280, "w": 590 }
+          }
+        },
+        "54": {
+          "sizes": {
+            "100": { "h": 100, "w": 100 },
+            "400": { "h": 400, "w": 400 },
+            "full": { "h": 1200, "w": 1200 }
+          },
+          "uploader": "hiimdannyganz",
+          "uploaded_t": 1767131755
+        },
+        "55": {
+          "uploader": "hiimdannyganz",
+          "uploaded_t": 1767131767,
+          "sizes": {
+            "100": { "w": 100, "h": 100 },
+            "400": { "h": 400, "w": 400 },
+            "full": { "h": 600, "w": 600 }
+          }
+        },
+        "56": {
+          "uploaded_t": 1774347303,
+          "uploader": "qalzy",
+          "sizes": {
+            "100": { "w": 47, "h": 100 },
+            "400": { "w": 187, "h": 400 },
+            "full": { "w": 187, "h": 400 }
+          }
+        },
+        "57": {
+          "sizes": {
+            "100": { "w": 75, "h": 100 },
+            "400": { "h": 400, "w": 300 },
+            "full": { "w": 1275, "h": 1699 }
+          },
+          "uploader": "macrofactor",
+          "uploaded_t": 1780370397
+        },
+        "58": {
+          "sizes": {
+            "100": { "w": 75, "h": 100 },
+            "400": { "h": 400, "w": 300 },
+            "full": { "w": 1275, "h": 1699 }
+          },
+          "uploader": "macrofactor",
+          "uploaded_t": 1780370404
+        },
+        "59": {
+          "uploader": "zlima12",
+          "uploaded_t": 1786377585,
+          "sizes": {
+            "100": { "w": 38, "h": 100 },
+            "400": { "h": 400, "w": 153 },
+            "full": { "h": 2866, "w": 1095 }
+          }
+        }
+      },
+      "selected": {
+        "front": {
+          "en": {
+            "generation": {},
+            "rev": 268,
+            "imgid": 57,
+            "sizes": {
+              "100": { "w": 75, "h": 100 },
+              "200": { "w": 150, "h": 200 },
+              "400": { "h": 400, "w": 300 },
+              "full": { "w": 1275, "h": 1699 }
+            }
+          }
+        },
+        "ingredients": {
+          "en": {
+            "imgid": 59,
+            "rev": 274,
+            "generation": {
+              "y1": 2639,
+              "x1": -1,
+              "coordinates_image_size": "full",
+              "y2": 2865,
+              "x2": 1095
+            },
+            "sizes": {
+              "100": { "h": 21, "w": 100 },
+              "200": { "w": 200, "h": 41 },
+              "400": { "h": 83, "w": 400 },
+              "full": { "h": 226, "w": 1095 }
+            }
+          }
+        },
+        "nutrition": {
+          "en": {
+            "generation": {
+              "y2": 2746,
+              "x2": 1095,
+              "y1": -1,
+              "coordinates_image_size": "full",
+              "x1": -1
+            },
+            "rev": 273,
+            "imgid": 59,
+            "sizes": {
+              "100": { "w": 40, "h": 100 },
+              "200": { "h": 200, "w": 80 },
+              "400": { "h": 400, "w": 160 },
+              "full": { "w": 1095, "h": 2746 }
+            }
+          }
+        }
+      }
+    },
+    "ingredients_text_en_imported": "Whole grain rolled oats.",
+    "category_properties": {},
+    "nutrient_levels_tags": [
+      "en:fat-in-moderate-quantity",
+      "en:saturated-fat-in-low-quantity",
+      "en:sugars-in-low-quantity",
+      "en:salt-in-low-quantity"
+    ],
+    "ingredients_text": "whole grain rolled oats",
+    "main_countries_tags": [],
+    "popularity_tags": [
+      "bottom-25-percent-scans-2019",
+      "bottom-20-percent-scans-2019",
+      "top-85-percent-scans-2019",
+      "top-90-percent-scans-2019",
+      "top-500-us-scans-2019",
+      "top-1000-us-scans-2019",
+      "top-5000-us-scans-2019",
+      "top-10000-us-scans-2019",
+      "top-50000-us-scans-2019",
+      "top-100000-us-scans-2019",
+      "top-country-us-scans-2019",
+      "top-75-percent-scans-2020",
+      "top-80-percent-scans-2020",
+      "top-85-percent-scans-2020",
+      "top-90-percent-scans-2020",
+      "top-500-us-scans-2020",
+      "top-1000-us-scans-2020",
+      "top-5000-us-scans-2020",
+      "top-10000-us-scans-2020",
+      "top-50000-us-scans-2020",
+      "top-100000-us-scans-2020",
+      "top-country-us-scans-2020",
+      "top-1000-jp-scans-2020",
+      "top-5000-jp-scans-2020",
+      "top-10000-jp-scans-2020",
+      "top-50000-jp-scans-2020",
+      "top-100000-jp-scans-2020",
+      "top-50000-scans-2021",
+      "top-100000-scans-2021",
+      "at-least-5-scans-2021",
+      "at-least-10-scans-2021",
+      "top-75-percent-scans-2021",
+      "top-80-percent-scans-2021",
+      "top-85-percent-scans-2021",
+      "top-90-percent-scans-2021",
+      "top-50-us-scans-2021",
+      "top-100-us-scans-2021",
+      "top-500-us-scans-2021",
+      "top-1000-us-scans-2021",
+      "top-5000-us-scans-2021",
+      "top-10000-us-scans-2021",
+      "top-50000-us-scans-2021",
+      "top-100000-us-scans-2021",
+      "top-country-us-scans-2021",
+      "at-least-5-us-scans-2021",
+      "at-least-10-us-scans-2021",
+      "bottom-25-percent-scans-2022",
+      "bottom-20-percent-scans-2022",
+      "top-85-percent-scans-2022",
+      "top-90-percent-scans-2022",
+      "top-500-il-scans-2022",
+      "top-1000-il-scans-2022",
+      "top-5000-il-scans-2022",
+      "top-10000-il-scans-2022",
+      "top-50000-il-scans-2022",
+      "top-100000-il-scans-2022",
+      "top-country-il-scans-2022",
+      "top-50000-scans-2023",
+      "top-100000-scans-2023",
+      "at-least-5-scans-2023",
+      "at-least-10-scans-2023",
+      "top-75-percent-scans-2023",
+      "top-80-percent-scans-2023",
+      "top-85-percent-scans-2023",
+      "top-90-percent-scans-2023",
+      "top-50-us-scans-2023",
+      "top-100-us-scans-2023",
+      "top-500-us-scans-2023",
+      "top-1000-us-scans-2023",
+      "top-5000-us-scans-2023",
+      "top-10000-us-scans-2023",
+      "top-50000-us-scans-2023",
+      "top-100000-us-scans-2023",
+      "top-country-us-scans-2023",
+      "at-least-5-us-scans-2023",
+      "at-least-10-us-scans-2023",
+      "top-100-ve-scans-2023",
+      "top-500-ve-scans-2023",
+      "top-1000-ve-scans-2023",
+      "top-5000-ve-scans-2023",
+      "top-10000-ve-scans-2023",
+      "top-50000-ve-scans-2023",
+      "top-100000-ve-scans-2023",
+      "top-100000-gb-scans-2023",
+      "top-5000-scans-2024",
+      "top-10000-scans-2024",
+      "top-50000-scans-2024",
+      "top-100000-scans-2024",
+      "at-least-5-scans-2024",
+      "at-least-10-scans-2024",
+      "top-75-percent-scans-2024",
+      "top-80-percent-scans-2024",
+      "top-85-percent-scans-2024",
+      "top-90-percent-scans-2024",
+      "top-10-us-scans-2024",
+      "top-50-us-scans-2024",
+      "top-100-us-scans-2024",
+      "top-500-us-scans-2024",
+      "top-1000-us-scans-2024",
+      "top-5000-us-scans-2024",
+      "top-10000-us-scans-2024",
+      "top-50000-us-scans-2024",
+      "top-100000-us-scans-2024",
+      "top-country-us-scans-2024",
+      "at-least-5-us-scans-2024",
+      "at-least-10-us-scans-2024",
+      "top-5000-mx-scans-2024",
+      "top-10000-mx-scans-2024",
+      "top-50000-mx-scans-2024",
+      "top-100000-mx-scans-2024",
+      "top-50-cu-scans-2024",
+      "top-100-cu-scans-2024",
+      "top-500-cu-scans-2024",
+      "top-1000-cu-scans-2024",
+      "top-5000-cu-scans-2024",
+      "top-10000-cu-scans-2024",
+      "top-50000-cu-scans-2024",
+      "top-100000-cu-scans-2024",
+      "top-50-ug-scans-2024",
+      "top-100-ug-scans-2024",
+      "top-500-ug-scans-2024",
+      "top-1000-ug-scans-2024",
+      "top-5000-ug-scans-2024",
+      "top-10000-ug-scans-2024",
+      "top-50000-ug-scans-2024",
+      "top-100000-ug-scans-2024",
+      "top-100000-de-scans-2024",
+      "top-50000-scans-2025",
+      "top-100000-scans-2025",
+      "at-least-5-scans-2025",
+      "at-least-10-scans-2025",
+      "top-75-percent-scans-2025",
+      "top-80-percent-scans-2025",
+      "top-85-percent-scans-2025",
+      "top-90-percent-scans-2025",
+      "top-50-us-scans-2025",
+      "top-100-us-scans-2025",
+      "top-500-us-scans-2025",
+      "top-1000-us-scans-2025",
+      "top-5000-us-scans-2025",
+      "top-10000-us-scans-2025",
+      "top-50000-us-scans-2025",
+      "top-100000-us-scans-2025",
+      "top-country-us-scans-2025",
+      "at-least-5-us-scans-2025",
+      "at-least-10-us-scans-2025",
+      "top-500-jp-scans-2025",
+      "top-1000-jp-scans-2025",
+      "top-5000-jp-scans-2025",
+      "top-10000-jp-scans-2025",
+      "top-50000-jp-scans-2025",
+      "top-100000-jp-scans-2025",
+      "top-10000-scans-2026",
+      "top-50000-scans-2026",
+      "top-100000-scans-2026",
+      "at-least-5-scans-2026",
+      "at-least-10-scans-2026",
+      "top-75-percent-scans-2026",
+      "top-80-percent-scans-2026",
+      "top-85-percent-scans-2026",
+      "top-90-percent-scans-2026",
+      "top-100-us-scans-2026",
+      "top-500-us-scans-2026",
+      "top-1000-us-scans-2026",
+      "top-5000-us-scans-2026",
+      "top-10000-us-scans-2026",
+      "top-50000-us-scans-2026",
+      "top-100000-us-scans-2026",
+      "top-country-us-scans-2026",
+      "at-least-5-us-scans-2026",
+      "at-least-10-us-scans-2026",
+      "top-500-ky-scans-2026",
+      "top-1000-ky-scans-2026",
+      "top-5000-ky-scans-2026",
+      "top-10000-ky-scans-2026",
+      "top-50000-ky-scans-2026",
+      "top-100000-ky-scans-2026",
+      "top-10-tc-scans-2026",
+      "top-50-tc-scans-2026",
+      "top-100-tc-scans-2026",
+      "top-500-tc-scans-2026",
+      "top-1000-tc-scans-2026",
+      "top-5000-tc-scans-2026",
+      "top-10000-tc-scans-2026",
+      "top-50000-tc-scans-2026",
+      "top-100000-tc-scans-2026",
+      "top-5000-cl-scans-2026",
+      "top-10000-cl-scans-2026",
+      "top-50000-cl-scans-2026",
+      "top-100000-cl-scans-2026"
+    ],
+    "nutriments": {},
+    "serving_quantity": 40,
+    "nutrition_grades": "a",
+    "packaging_lc": "en",
+    "sources": [
+      {
+        "fields": [
+          "product_name_en",
+          "brand_owner",
+          "data_sources",
+          "nutrition_data_per",
+          "serving_size",
+          "ingredients_text_en",
+          "nutrients.calcium_unit",
+          "nutrients.calcium_value",
+          "nutrients.carbohydrates_value",
+          "nutrients.energy_value",
+          "nutrients.energy-kcal_value",
+          "nutrients.fat_value",
+          "nutrients.fiber_value",
+          "nutrients.iron_unit",
+          "nutrients.iron_value",
+          "nutrients.magnesium_unit",
+          "nutrients.magnesium_value",
+          "nutrients.monounsaturated-fat_value",
+          "nutrients.phosphorus_unit",
+          "nutrients.phosphorus_value",
+          "nutrients.polyunsaturated-fat_value",
+          "nutrients.potassium_unit",
+          "nutrients.potassium_value",
+          "nutrients.proteins_value",
+          "nutrients.salt_unit",
+          "nutrients.saturated-fat_value",
+          "nutrients.soluble-fiber_value",
+          "nutrients.sugars_value",
+          "nutrients.vitamin-a_unit",
+          "nutrients.vitamin-b1_unit",
+          "nutrients.vitamin-b1_value",
+          "nutrients.vitamin-c_unit"
+        ],
+        "id": "database-usda",
+        "images": [],
+        "name": "database-usda",
+        "manufacturer": null,
+        "url": null,
+        "import_t": 1587636172
+      },
+      {
+        "name": "label-non-gmo-project",
+        "manufacturer": 0,
+        "url": null,
+        "import_t": 1718832202,
+        "fields": ["product_name_en", "brands", "countries", "data_sources", "nutrition_data_per"],
+        "images": [],
+        "id": "org-label-non-gmo-project"
+      }
+    ],
+    "food_groups_tags": ["en:cereals-and-potatoes", "en:breakfast-cereals"],
+    "nutriscore_score_opposite": 8,
+    "interface_version_created": "20120622",
+    "emb_codes_tags": [],
+    "nutriscore_2023_tags": ["a"],
+    "vitamins_prev_tags": [],
+    "editors_tags": [
+      "aaronasachimp",
+      "babartareen",
+      "beckanhaf",
+      "benbenben",
+      "fgouget",
+      "foodless",
+      "hiimdannyganz",
+      "inf",
+      "jlnimsick",
+      "kiliweb",
+      "lladylynn",
+      "macrofactor",
+      "marye",
+      "municorn-calorie-counter-app",
+      "openfoodfacts-contributors",
+      "org-database-usda",
+      "org-label-non-gmo-project",
+      "packbot",
+      "qalzy",
+      "roboto-app",
+      "shopwiserdev",
+      "sierrakomodo",
+      "tyreepeak",
+      "unkv8r",
+      "wolfgang8741",
+      "yuka.sY2b0xO6T85zoF3NwEKvllZDc_3erQ7laQXfn3fV94u1FMD1UdF42IP1HKs",
+      "zlima12",
+      "zoneblockscommunity"
+    ],
+    "obsolete_since_date": "",
+    "states_tags": [
+      "en:to-be-completed",
+      "en:nutrition-facts-completed",
+      "en:ingredients-completed",
+      "en:expiration-date-to-be-completed",
+      "en:packaging-code-to-be-completed",
+      "en:characteristics-to-be-completed",
+      "en:origins-to-be-completed",
+      "en:categories-completed",
+      "en:brands-completed",
+      "en:packaging-completed",
+      "en:quantity-completed",
+      "en:product-name-completed",
+      "en:photos-to-be-validated",
+      "en:packaging-photo-to-be-selected",
+      "en:nutrition-photo-selected",
+      "en:ingredients-photo-selected",
+      "en:front-photo-selected",
+      "en:photos-uploaded"
+    ],
+    "ingredients_from_palm_oil_tags": [],
+    "serving_size_imported": "1/2 cup (40 g)",
+    "nutrition_score_debug": "",
+    "data_sources": "Databases, database-usda, App - yuka, Apps, App - InFood, App - macrofactor, Labels, label-non-gmo-project, App - smoothie-openfoodfacts, App - caloriecounterapp, App - qalzy",
+    "amino_acids_tags": [],
+    "known_ingredients_n": 1,
+    "packaging_text": "1 recycled paperboard canister\r\n1 transparent plastic lid\r\n1 transparent plastic wrapper",
+    "ingredients_from_or_that_may_be_from_palm_oil_n": 0,
+    "ingredients_text_en": "whole grain rolled oats",
+    "stores_tags": ["big-y", "fred-meyer", "walmart"],
+    "packaging_recycling_tags": [],
+    "informers_tags": [
+      "babartareen",
+      "aaronasachimp",
+      "zoneblockscommunity",
+      "org-database-usda",
+      "inf",
+      "macrofactor",
+      "sierrakomodo",
+      "org-label-non-gmo-project",
+      "lladylynn",
+      "marye",
+      "openfoodfacts-contributors",
+      "municorn-calorie-counter-app",
+      "unkv8r",
+      "fgouget",
+      "hiimdannyganz",
+      "qalzy",
+      "zlima12"
+    ],
+    "nutrition_score_warning_fruits_vegetables_nuts_estimate_from_ingredients": 1,
+    "last_image_dates_tags": ["2026-08-10", "2026-08", "2026"],
+    "expiration_date": "",
+    "compared_to_category": "en:rolled-oats",
+    "checkers_tags": [],
+    "entry_dates_tags": ["2016-07-21", "2016-07", "2016"],
+    "lc": "en",
+    "_keywords": [
+      "american",
+      "and",
+      "artificial",
+      "association",
+      "beverage",
+      "breakfast",
+      "cereal",
+      "certified",
+      "fashioned",
+      "fibre",
+      "flake",
+      "flavor",
+      "food",
+      "gmo",
+      "grain",
+      "heart",
+      "kosher",
+      "no",
+      "non",
+      "oat",
+      "of",
+      "old",
+      "orthodox",
+      "plant-based",
+      "potatoe",
+      "preservative",
+      "product",
+      "project",
+      "quaker",
+      "rolled",
+      "seed",
+      "source",
+      "their",
+      "union",
+      "whole"
+    ],
+    "fruits-vegetables-nuts_100g_estimate": 0,
+    "schema_version": 1004,
+    "data_sources_imported": "Databases, database-usda",
+    "pnns_groups_1": "Cereals and potatoes",
+    "states": "en:to-be-completed, en:nutrition-facts-completed, en:ingredients-completed, en:expiration-date-to-be-completed, en:packaging-code-to-be-completed, en:characteristics-to-be-completed, en:origins-to-be-completed, en:categories-completed, en:brands-completed, en:packaging-completed, en:quantity-completed, en:product-name-completed, en:photos-to-be-validated, en:packaging-photo-to-be-selected, en:nutrition-photo-selected, en:ingredients-photo-selected, en:front-photo-selected, en:photos-uploaded",
+    "serving_size": "1/2 cup dry (40 g)",
+    "data_quality_tags": [
+      "en:photo-and-data-to-be-checked-by-an-experienced-contributor",
+      "en:ingredients-en-photo-selected",
+      "en:ingredients-en-completed",
+      "en:ingredients-completed-at-least-for-one-language",
+      "en:nutrition-photo-selected",
+      "en:categories-completed",
+      "en:nutrition-completed",
+      "en:packaging-photo-to-be-selected",
+      "en:packagings-completed",
+      "en:front-photo-selected",
+      "en:product-name-completed",
+      "en:quantity-completed",
+      "en:brands-completed",
+      "en:expiration-date-to-be-completed",
+      "en:packaging-data-incomplete",
+      "en:all-but-one-ingredient-with-specified-percent",
+      "en:food-groups-1-known",
+      "en:food-groups-2-known",
+      "en:food-groups-3-unknown",
+      "en:nutrition-energy-value-in-kcal-does-not-match-value-computed-from-other-nutrients",
+      "en:nutrition-energy-value-in-kcal-may-not-match-value-computed-from-other-nutrients",
+      "en:environmental-score-origins-of-ingredients-origins-are-100-percent-unknown",
+      "en:environmental-score-packaging-unscored-shape",
+      "en:environmental-score-production-system-no-label"
+    ],
+    "obsolete": "",
+    "product_type": "food",
+    "photographers_tags": [
+      "babartareen",
+      "wolfgang8741",
+      "kiliweb",
+      "sierrakomodo",
+      "macrofactor",
+      "municorn-calorie-counter-app",
+      "hiimdannyganz",
+      "qalzy",
+      "zlima12"
+    ],
+    "added_countries_tags": [],
+    "ingredients": [
+      {
+        "ciqual_food_code": "9311",
+        "vegan": "yes",
+        "labels": "en:whole-grain",
+        "is_in_taxonomy": 1,
+        "quantity_estimate": 108.66,
+        "id": "en:oat-flakes",
+        "vegetarian": "yes",
+        "percent_estimate": 108.66,
+        "text": "rolled oats"
+      }
+    ],
+    "tags_sources": {
+      "stores": {
+        "packaging": { "last_updated_t": 1786378295, "tags": ["fred-meyer", "big-y", "walmart"] }
+      },
+      "countries": {
+        "packaging": { "last_updated_t": 1786378295, "tags": ["en:united-states", "en:world"] }
+      },
+      "origins": { "packaging": { "tags": [], "last_updated_t": 1786378295 } },
+      "labels": {
+        "packaging": {
+          "tags": [
+            "en:no-artificial-flavors",
+            "en:no-preservatives",
+            "en:source-of-fibre",
+            "en:non-gmo-project",
+            "en:orthodox-union-kosher",
+            "en:whole-grain",
+            "en:American Heart Association Certified"
+          ],
+          "last_updated_t": 1786378295
+        }
+      },
+      "categories": {
+        "packaging": {
+          "tags": ["en:cereal-grains", "en:rolled-oats"],
+          "last_updated_t": 1786378295
+        }
+      },
+      "emb_codes": { "packaging": { "last_updated_t": 1786378295, "tags": [] } },
+      "traces": {
+        "packaging": { "last_updated_t": 1786378295, "tags": [] },
+        "ingredients": { "tags": [], "last_updated_t": 1786378299 }
+      },
+      "allergens": {
+        "packaging": { "tags": [], "last_updated_t": 1786378295 },
+        "ingredients": { "last_updated_t": 1786378299, "tags": [] }
+      },
+      "manufacturing_places": { "packaging": { "last_updated_t": 1786378295, "tags": [] } },
+      "brands": { "packaging": { "last_updated_t": 1786378295, "tags": ["xx:quaker-oats"] } },
+      "purchase_places": {
+        "packaging": {
+          "last_updated_t": 1786378295,
+          "tags": ["redmond", "washington", "united-states", "connecticut", "plainville"]
+        }
+      }
+    },
+    "ingredients_original_tags": ["en:oat-flakes"],
+    "interface_version_modified": "20190830",
+    "serving_quantity_unit": "ml",
+    "nutriscore_score": -8,
+    "ingredients_lc": "en",
+    "origin_en": "",
+    "nova_group_debug": "",
+    "nucleotides_prev_tags": [],
+    "ingredients_without_ecobalyse_ids_n": 1,
+    "ingredients_that_may_be_from_palm_oil_n": 0,
+    "ingredients_n": 1,
+    "allergens_from_user": "(en) ",
+    "codes_tags": [
+      "code-13",
+      "conflict-with-upc-12",
+      "0030000010xxx",
+      "003000001xxxx",
+      "00300000xxxxx",
+      "0030000xxxxxx",
+      "003000xxxxxxx",
+      "00300xxxxxxxx",
+      "0030xxxxxxxxx",
+      "003xxxxxxxxxx",
+      "00xxxxxxxxxxx",
+      "0xxxxxxxxxxxx"
+    ],
+    "last_modified_t": 1786378299,
+    "environmental_score_tags": ["b"],
+    "nucleotides_tags": [],
+    "completeness": 0.7875,
+    "owner_fields": {},
+    "nutrition_grade_fr": "a",
+    "lc_imported": "en",
+    "last_modified_by": "zlima12",
+    "pnns_groups_2": "Breakfast cereals",
+    "unknown_nutrients_tags": [],
+    "ingredients_sweeteners_n": 0,
+    "packagings": [
+      {
+        "quantity_per_unit": "1.19 kg",
+        "shape": "en:canister",
+        "material": "en:recycled-paper",
+        "quantity_per_unit_value": 1.19,
+        "quantity_per_unit_unit": "kg",
+        "number_of_units": 1
+      },
+      {
+        "number_of_units": 1,
+        "quantity_per_unit_unit": "kg",
+        "material": "en:plastic",
+        "quantity_per_unit_value": 1.19,
+        "shape": "en:lid",
+        "quantity_per_unit": "1.19 kg"
+      },
+      {
+        "shape": "en:wrapper",
+        "quantity_per_unit_unit": "kg",
+        "material": "en:plastic",
+        "number_of_units": 1,
+        "quantity_per_unit": "1.19 kg",
+        "quantity_per_unit_value": 1.19
+      }
+    ],
+    "nova_groups": "1",
+    "traces_from_user": "(en) ",
+    "nutriscore_version": "2023"
+  },
+  "live": {
+    "code": "0030000010402",
+    "product": {
+      "additives_tags": [],
+      "allergens_tags": [],
+      "brands": "Quaker Oats",
+      "categories_tags": [
+        "en:plant-based-foods-and-beverages",
+        "en:plant-based-foods",
+        "en:breakfasts",
+        "en:cereals-and-potatoes",
+        "en:seeds",
+        "en:cereals-and-their-products",
+        "en:breakfast-cereals",
+        "en:cereal-grains",
+        "en:flakes",
+        "en:cereal-flakes",
+        "en:rolled-flakes",
+        "en:rolled-oats"
+      ],
+      "code": "0030000010402",
+      "completeness": 0.7875,
+      "countries_tags": ["en:united-states", "en:world"],
+      "data_quality_tags": [
+        "en:photo-and-data-to-be-checked-by-an-experienced-contributor",
+        "en:ingredients-en-photo-selected",
+        "en:ingredients-en-completed",
+        "en:ingredients-completed-at-least-for-one-language",
+        "en:nutrition-photo-selected",
+        "en:categories-completed",
+        "en:nutrition-completed",
+        "en:packaging-photo-to-be-selected",
+        "en:packagings-completed",
+        "en:front-photo-selected",
+        "en:product-name-completed",
+        "en:quantity-completed",
+        "en:brands-completed",
+        "en:expiration-date-to-be-completed",
+        "en:packaging-data-incomplete",
+        "en:all-but-one-ingredient-with-specified-percent",
+        "en:food-groups-1-known",
+        "en:food-groups-2-known",
+        "en:food-groups-3-unknown",
+        "en:nutrition-energy-value-in-kcal-does-not-match-value-computed-from-other-nutrients",
+        "en:nutrition-energy-value-in-kcal-may-not-match-value-computed-from-other-nutrients",
+        "en:environmental-score-origins-of-ingredients-origins-are-100-percent-unknown",
+        "en:environmental-score-packaging-unscored-shape",
+        "en:environmental-score-production-system-no-label"
+      ],
+      "ecoscore_grade": "b",
+      "image_url": "https://images.openfoodfacts.org/images/products/003/000/001/0402/front_en.268.400.jpg",
+      "ingredients": [
+        {
+          "ciqual_food_code": "9311",
+          "id": "en:oat-flakes",
+          "is_in_taxonomy": 1,
+          "labels": "en:whole-grain",
+          "percent_estimate": 108.66,
+          "quantity_estimate": 108.66,
+          "text": "rolled oats",
+          "vegan": "yes",
+          "vegetarian": "yes"
+        }
+      ],
+      "ingredients_analysis_tags": ["en:palm-oil-free", "en:vegan", "en:vegetarian"],
+      "ingredients_text": "whole grain rolled oats",
+      "labels_tags": [
+        "en:kosher",
+        "en:no-artificial-flavors",
+        "en:no-gmos",
+        "en:no-preservatives",
+        "en:source-of-fibre",
+        "en:non-gmo-project",
+        "en:orthodox-union-kosher",
+        "en:whole-grain",
+        "en:American Heart Association Certified"
+      ],
+      "last_modified_t": 1786378299,
+      "nova_group": 1,
+      "nutriments": {
+        "added-sugars": 0,
+        "added-sugars_100g": 0,
+        "added-sugars_serving": 0,
+        "added-sugars_unit": "g",
+        "added-sugars_value": 0,
+        "calcium": 0.05,
+        "calcium_100g": 0.05,
+        "calcium_serving": 0.02,
+        "calcium_unit": "g",
+        "calcium_value": 0.05,
+        "carbohydrates": 67.5,
+        "carbohydrates-total": 67.5,
+        "carbohydrates-total_100g": 67.5,
+        "carbohydrates-total_serving": 27,
+        "carbohydrates-total_unit": "g",
+        "carbohydrates-total_value": 67.5,
+        "carbohydrates_100g": 67.5,
+        "carbohydrates_serving": 27,
+        "carbohydrates_unit": "g",
+        "carbohydrates_value": 67.5,
+        "cholesterol": 0,
+        "cholesterol_100g": 0,
+        "cholesterol_serving": 0,
+        "cholesterol_unit": "g",
+        "cholesterol_value": 0,
+        "energy": 1717.5,
+        "energy-kcal": 375,
+        "energy-kcal_100g": 375,
+        "energy-kcal_serving": 150,
+        "energy-kcal_unit": "kcal",
+        "energy-kcal_value": 375,
+        "energy-kj": 1717.5,
+        "energy-kj_100g": 1717.5,
+        "energy-kj_modifier": "~",
+        "energy-kj_serving": 687,
+        "energy-kj_unit": "kJ",
+        "energy-kj_value": 1717.5,
+        "energy_100g": 1717.5,
+        "energy_modifier": "~",
+        "energy_serving": 687,
+        "energy_unit": "kJ",
+        "energy_value": 1717.5,
+        "fat": 7.5,
+        "fat_100g": 7.5,
+        "fat_serving": 3,
+        "fat_unit": "g",
+        "fat_value": 7.5,
+        "fiber": 10,
+        "fiber_100g": 10,
+        "fiber_serving": 4,
+        "fiber_unit": "g",
+        "fiber_value": 10,
+        "fruits-vegetables-legumes-estimate-from-ingredients_100g": 0,
+        "fruits-vegetables-nuts-estimate-from-ingredients_100g": 0,
+        "iron": 0.00375,
+        "iron_100g": 0.00375,
+        "iron_serving": 0.0015,
+        "iron_unit": "g",
+        "iron_value": 0.00375,
+        "magnesium": 0.1,
+        "magnesium_100g": 0.1,
+        "magnesium_serving": 0.04,
+        "magnesium_unit": "g",
+        "magnesium_value": 0.1,
+        "monounsaturated-fat": 2.5,
+        "monounsaturated-fat_100g": 2.5,
+        "monounsaturated-fat_serving": 1,
+        "monounsaturated-fat_unit": "g",
+        "monounsaturated-fat_value": 2.5,
+        "nova-group": 1,
+        "nova-group_100g": 1,
+        "nova-group_serving": 1,
+        "nova-group_unit": "",
+        "nova-group_value": 1,
+        "phosphorus": 0.325,
+        "phosphorus_100g": 0.325,
+        "phosphorus_serving": 0.13,
+        "phosphorus_unit": "g",
+        "phosphorus_value": 0.325,
+        "polyunsaturated-fat": 2.5,
+        "polyunsaturated-fat_100g": 2.5,
+        "polyunsaturated-fat_serving": 1,
+        "polyunsaturated-fat_unit": "g",
+        "polyunsaturated-fat_value": 2.5,
+        "potassium": 0.375,
+        "potassium_100g": 0.375,
+        "potassium_serving": 0.15,
+        "potassium_unit": "g",
+        "potassium_value": 0.375,
+        "proteins": 12.5,
+        "proteins_100g": 12.5,
+        "proteins_serving": 5,
+        "proteins_unit": "g",
+        "proteins_value": 12.5,
+        "salt": 0,
+        "salt_100g": 0,
+        "salt_modifier": "~",
+        "salt_serving": 0,
+        "salt_unit": "g",
+        "salt_value": 0,
+        "saturated-fat": 1.25,
+        "saturated-fat_100g": 1.25,
+        "saturated-fat_serving": 0.5,
+        "saturated-fat_unit": "g",
+        "saturated-fat_value": 1.25,
+        "sodium": 0,
+        "sodium_100g": 0,
+        "sodium_serving": 0,
+        "sodium_unit": "g",
+        "sodium_value": 0,
+        "soluble-fiber": 5,
+        "soluble-fiber_100g": 5,
+        "soluble-fiber_serving": 2,
+        "soluble-fiber_unit": "g",
+        "soluble-fiber_value": 5,
+        "sugars": 2.5,
+        "sugars_100g": 2.5,
+        "sugars_serving": 1,
+        "sugars_unit": "g",
+        "sugars_value": 2.5,
+        "trans-fat": 0,
+        "trans-fat_100g": 0,
+        "trans-fat_serving": 0,
+        "trans-fat_unit": "g",
+        "trans-fat_value": 0,
+        "vitamin-b1": 0.0005,
+        "vitamin-b1_100g": 0.0005,
+        "vitamin-b1_serving": 0.0002,
+        "vitamin-b1_unit": "g",
+        "vitamin-b1_value": 0.0005,
+        "vitamin-d": 0,
+        "vitamin-d_100g": 0,
+        "vitamin-d_serving": 0,
+        "vitamin-d_unit": "g",
+        "vitamin-d_value": 0
+      },
+      "nutriments_estimated": {
+        "alcohol_100g": 0,
+        "beta-carotene_100g": 0,
+        "copper_100g": 0.00032598,
+        "fructose_100g": 0,
+        "galactose_100g": 0,
+        "glucose_100g": 0,
+        "iodine_100g": 5.433e-7,
+        "lactose_100g": 0,
+        "maltose_100g": 0,
+        "manganese_100g": 0.005128752,
+        "pantothenic-acid_100g": 0.001423446,
+        "phylloquinone_100g": 0.0000021732,
+        "polyols_100g": 0,
+        "selenium_100g": 0.00000331413,
+        "starch_100g": 61.82754,
+        "sucrose_100g": 1.054002,
+        "vitamin-a_100g": 0,
+        "vitamin-b12_100g": 0,
+        "vitamin-b2_100g": 0.000152124,
+        "vitamin-b6_100g": 0.000130392,
+        "vitamin-b9_100g": 0.00004302936,
+        "vitamin-c_100g": 0,
+        "vitamin-e_100g": 0.000641094,
+        "vitamin-pp_100g": 0.001043136,
+        "water_100g": 10.97466,
+        "zinc_100g": 0.003618378
+      },
+      "nutriscore_grade": "a",
+      "nutrition_data": "on",
+      "nutrition_data_prepared_per": "100g",
+      "origins_tags": [],
+      "packaging_tags": ["en:paper", "en:box"],
+      "product_name": "Old Fashioned Oats",
+      "product_quantity": 1190.67997125,
+      "product_quantity_unit": "g",
+      "quantity": "42 oz",
+      "serving_quantity": 40,
+      "serving_quantity_unit": "ml",
+      "serving_size": "1/2 cup dry (40 g)",
+      "traces_tags": []
+    },
+    "status": 1,
+    "status_verbose": "product found"
+  }
+}
