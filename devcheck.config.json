@@ -12,7 +12,7 @@
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": []
+    "allowlist": ["tsc-alias"]
   },
   "lint": {},
   "packaging": {
