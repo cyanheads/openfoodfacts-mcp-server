@@ -1,0 +1,438 @@
+{
+  "code": "3033710065783",
+  "errors": [],
+  "product": {
+    "nutrition": {
+      "input_sets": [
+        {
+          "nutrients": {
+            "carbohydrates": {
+              "unit": "g",
+              "value": 9.8,
+              "value_string": "9.8"
+            },
+            "energy-kcal": {
+              "unit": "kcal",
+              "value": 74,
+              "value_computed": 74.3,
+              "value_string": "74"
+            },
+            "energy-kj": {
+              "unit": "kJ",
+              "value": 313,
+              "value_computed": 312.8,
+              "value_string": "313"
+            },
+            "fat": {
+              "unit": "g",
+              "value": 2.1,
+              "value_string": "2.1"
+            },
+            "fiber": {
+              "unit": "g",
+              "value": 0.7,
+              "value_string": "0.7"
+            },
+            "proteins": {
+              "unit": "g",
+              "value": 3.7,
+              "value_string": "3.7"
+            },
+            "salt": {
+              "unit": "g",
+              "value": 0.12,
+              "value_string": "0.12"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value": 1.3,
+              "value_string": "1.3"
+            },
+            "sodium": {
+              "unit": "g",
+              "value_computed": 0.048
+            },
+            "sugars": {
+              "unit": "g",
+              "value": 9.4,
+              "value_string": "9.4"
+            }
+          },
+          "per": "100ml",
+          "per_quantity": 100,
+          "per_unit": "ml",
+          "preparation": "prepared",
+          "source": "manufacturer"
+        },
+        {
+          "nutrients": {
+            "carbohydrates": {
+              "unit": "g",
+              "value": 20.5,
+              "value_string": "20.5"
+            },
+            "energy-kcal": {
+              "unit": "kcal",
+              "value": 156,
+              "value_computed": 156,
+              "value_string": "156"
+            },
+            "energy-kj": {
+              "unit": "kJ",
+              "value": 657,
+              "value_computed": 656.8,
+              "value_string": "657"
+            },
+            "fat": {
+              "unit": "g",
+              "value": 4.4,
+              "value_string": "4.4"
+            },
+            "fiber": {
+              "unit": "g",
+              "value": 1.4,
+              "value_string": "1.4"
+            },
+            "proteins": {
+              "unit": "g",
+              "value": 7.9,
+              "value_string": "7.9"
+            },
+            "salt": {
+              "unit": "g",
+              "value": 0.25,
+              "value_string": "0.25"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value": 2.7,
+              "value_string": "2.7"
+            },
+            "sodium": {
+              "unit": "g",
+              "value_computed": 0.1
+            },
+            "sugars": {
+              "unit": "g",
+              "value": 19.8,
+              "value_string": "19.8"
+            }
+          },
+          "per": "serving",
+          "per_quantity": 200,
+          "per_unit": "g",
+          "preparation": "prepared",
+          "source": "manufacturer"
+        },
+        {
+          "last_updated_t": 1773362416,
+          "nutrients": {
+            "carbohydrates": {
+              "unit": "g",
+              "value": 9.8,
+              "value_string": "9.8"
+            },
+            "energy-kcal": {
+              "unit": "kcal",
+              "value": 74,
+              "value_computed": 74.3,
+              "value_string": "74"
+            },
+            "energy-kj": {
+              "unit": "kJ",
+              "value": 312,
+              "value_computed": 312.8,
+              "value_string": "312"
+            },
+            "fat": {
+              "unit": "g",
+              "value": 2.1,
+              "value_string": "2.1"
+            },
+            "fiber": {
+              "unit": "g",
+              "value": 0.7,
+              "value_string": "0.7"
+            },
+            "magnesium": {
+              "unit": "g",
+              "value": 0.167,
+              "value_string": "0.167"
+            },
+            "proteins": {
+              "unit": "g",
+              "value": 3.7,
+              "value_string": "3.7"
+            },
+            "salt": {
+              "unit": "g",
+              "value": 0.12,
+              "value_computed": 0.12,
+              "value_string": "0.12"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value": 1.2,
+              "value_string": "1.2"
+            },
+            "sodium": {
+              "unit": "g",
+              "value": 0.048,
+              "value_computed": 0.048,
+              "value_string": "0.048"
+            },
+            "sugars": {
+              "unit": "g",
+              "value": 9.4,
+              "value_string": "9.4"
+            }
+          },
+          "per": "100g",
+          "per_quantity": 100,
+          "per_unit": "g",
+          "preparation": "prepared",
+          "source": "packaging"
+        },
+        {
+          "nutrients": {
+            "carbohydrates": {
+              "unit": "g",
+              "value": 70.4,
+              "value_string": "70.4"
+            },
+            "energy-kcal": {
+              "unit": "kcal",
+              "value": 399,
+              "value_computed": 398.1,
+              "value_string": "399"
+            },
+            "energy-kj": {
+              "unit": "kJ",
+              "value": 1670,
+              "value_computed": 1677.5,
+              "value_string": "1670"
+            },
+            "fat": {
+              "unit": "g",
+              "value": 7.9,
+              "value_string": "7.9"
+            },
+            "fiber": {
+              "unit": "g",
+              "value": 9.1,
+              "value_string": "9.1"
+            },
+            "proteins": {
+              "unit": "g",
+              "value": 6.8,
+              "value_string": "6.8"
+            },
+            "salt": {
+              "unit": "g",
+              "value": 0.12,
+              "value_string": "0.12"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value": 4.2,
+              "value_string": "4.2"
+            },
+            "sodium": {
+              "unit": "g",
+              "value_computed": 0.048
+            },
+            "sugars": {
+              "unit": "g",
+              "value": 65.8,
+              "value_string": "65.8"
+            }
+          },
+          "per": "100g",
+          "per_quantity": 100,
+          "per_unit": "g",
+          "preparation": "as_sold",
+          "source": "manufacturer"
+        },
+        {
+          "last_updated_t": 1773362416,
+          "nutrients": {
+            "alcohol": {
+              "unit": "% vol",
+              "value": 0,
+              "value_string": "0"
+            },
+            "carbohydrates": {
+              "unit": "g",
+              "value": 70.4,
+              "value_string": "70.4"
+            },
+            "cocoa": {
+              "unit": "%",
+              "value": 32,
+              "value_string": "32"
+            },
+            "energy-kcal": {
+              "unit": "kcal",
+              "value": 399,
+              "value_computed": 398.1,
+              "value_string": "399"
+            },
+            "energy-kj": {
+              "unit": "kJ",
+              "value": 1670,
+              "value_computed": 1677.5,
+              "value_string": "1670"
+            },
+            "fat": {
+              "unit": "g",
+              "value": 7.9,
+              "value_string": "7.9"
+            },
+            "fiber": {
+              "unit": "g",
+              "value": 9.1,
+              "value_string": "9.1"
+            },
+            "magnesium": {
+              "unit": "g",
+              "value": 0.001,
+              "value_string": "0.001"
+            },
+            "nova-group": {
+              "unit": "",
+              "value": 4,
+              "value_string": "4"
+            },
+            "proteins": {
+              "unit": "g",
+              "value": 6.8,
+              "value_string": "6.8"
+            },
+            "salt": {
+              "unit": "g",
+              "value": 0.11,
+              "value_computed": 0.0005,
+              "value_string": "0.11"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value": 4.2,
+              "value_string": "4.2"
+            },
+            "sodium": {
+              "unit": "g",
+              "value": 0.0002,
+              "value_computed": 0.044,
+              "value_string": "0.0002"
+            },
+            "sugars": {
+              "unit": "g",
+              "value": 65.8,
+              "value_string": "65.8"
+            }
+          },
+          "per": "100g",
+          "per_quantity": 100,
+          "per_unit": "g",
+          "preparation": "as_sold",
+          "source": "packaging"
+        },
+        {
+          "nutrients": {
+            "carbohydrates": {
+              "unit": "g",
+              "value": 20.5,
+              "value_string": "20.5"
+            },
+            "energy-kcal": {
+              "unit": "kcal",
+              "value": 156,
+              "value_computed": 156,
+              "value_string": "156"
+            },
+            "energy-kj": {
+              "unit": "kJ",
+              "value": 657,
+              "value_computed": 656.8,
+              "value_string": "657"
+            },
+            "fat": {
+              "unit": "g",
+              "value": 4.4,
+              "value_string": "4.4"
+            },
+            "fiber": {
+              "unit": "g",
+              "value": 1.4,
+              "value_string": "1.4"
+            },
+            "proteins": {
+              "unit": "g",
+              "value": 7.9,
+              "value_string": "7.9"
+            },
+            "salt": {
+              "unit": "g",
+              "value": 0.25,
+              "value_string": "0.25"
+            },
+            "saturated-fat": {
+              "unit": "g",
+              "value": 2.7,
+              "value_string": "2.7"
+            },
+            "sodium": {
+              "unit": "g",
+              "value_computed": 0.1
+            },
+            "sugars": {
+              "unit": "g",
+              "value": 19.8,
+              "value_string": "19.8"
+            }
+          },
+          "per": "serving",
+          "per_quantity": 200,
+          "per_unit": "g",
+          "preparation": "as_sold",
+          "source": "packaging"
+        },
+        {
+          "nutrients": {
+            "added-sugars": {
+              "modifier": "~",
+              "unit": "g",
+              "value": 49.11,
+              "value_string": "49.11"
+            },
+            "fruits-vegetables-legumes": {
+              "modifier": "~",
+              "unit": "%",
+              "value": 0,
+              "value_string": "0"
+            },
+            "fruits-vegetables-nuts": {
+              "modifier": "~",
+              "unit": "%",
+              "value": 0,
+              "value_string": "0"
+            }
+          },
+          "per": "100g",
+          "per_quantity": 100,
+          "per_unit": "g",
+          "preparation": "as_sold",
+          "source": "estimate",
+          "source_description": "Estimate from ingredients"
+        }
+      ]
+    }
+  },
+  "result": {
+    "id": "product_found",
+    "lc_name": "Product found",
+    "name": "Product found"
+  },
+  "status": "success",
+  "warnings": []
+}
