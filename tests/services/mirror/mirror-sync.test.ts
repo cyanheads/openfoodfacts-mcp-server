@@ -2172,6 +2172,38 @@ describe('the as-of a reload cites', () => {
     await expectReloaded();
   });
 
+  it('cites no time newer than the rows a 0.4.2 build stamped while the reload it stopped resumes under a changed export', async () => {
+    await reloadDue();
+    await interruptedIngest('refresh', 'P02500');
+    const handle = await probe.raw();
+    // As 0.4.2 left it: the first page at the export's version, under the delta's as-of.
+    handle
+      .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
+      .run(encodeCheckpoint({ generation: 1, asOfSeconds: D }));
+    await truncate(`${path}.export.jsonl.gz`, 100);
+    const listed = products(1_000, T + 5_000, 'NEW');
+    host.exportBody = jsonl(listed);
+    host.etag = '"e3"';
+    handle.exec('CREATE TABLE swept (generation INTEGER, checkpoint TEXT)');
+    handle.exec(
+      'CREATE TRIGGER swept_ad AFTER DELETE ON products BEGIN INSERT INTO swept SELECT old.generation, checkpoint FROM mirror_sync_state; END',
+    );
+
+    const report = await sync('refresh');
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 3 });
+    // The 2,000 rows of the abandoned export's first page serve until the sweep removes them.
+    const abandoned = handle
+      .prepare<{ checkpoint: string }>('SELECT checkpoint FROM swept WHERE generation = 2')
+      .all();
+    expect(abandoned).toHaveLength(2_000);
+    expect([...new Set(abandoned.map((row) => row.checkpoint))].map(decodeCheckpoint)).toEqual([
+      { generation: 2, asOfSeconds: T0 + 1_999 },
+    ]);
+    expect(await checkpoint()).toEqual({ generation: 3, asOfSeconds: T + 5_999 });
+    expect(await codes()).toEqual(listed.map((line) => line.code));
+  });
+
   it('lowers the as-of before it sweeps when it resumes a reload a 0.4.2 build stopped after its last ingest page', async () => {
     const handle = await probe.raw();
     handle

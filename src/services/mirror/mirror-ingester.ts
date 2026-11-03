@@ -180,14 +180,19 @@ export async function* exportLoad(
   if (ctx.checkpoint === undefined && begun !== undefined) {
     yield { records: [], cursor: JSON.stringify(cursor), checkpoint: begun };
   }
-  const moveAsOf = asOfMoves(begun);
+  let moveAsOf = asOfMoves(begun);
   /**
    * A resumed cursor lowers the as-of over the rows it already stamped before anything else, for a
    * run stopped by a release that kept citing the as-of it began with: the next ingest page can be
-   * minutes of skipped lines away, and a resumed sweep has none.
+   * minutes of skipped lines away, and a resumed sweep has none. The run then begins from the
+   * lowered as-of, as one whose checkpoint a stopped run already lowered does: those rows serve
+   * until the load rewrites or sweeps them, under an export that can change before it does.
    */
-  const resumed = moveAsOf([], cursor);
-  if (resumed.ahead) yield resumed.ahead;
+  const resumed = moveAsOf([], cursor).ahead;
+  if (resumed !== undefined) {
+    yield resumed;
+    moveAsOf = asOfMoves(resumed.checkpoint);
+  }
 
   while (cursor.phase !== 'done') {
     if (cursor.phase === 'download') {
@@ -606,7 +611,7 @@ interface AsOfMove {
   /** The checkpoint raising the as-of, committed with the rows' own page, after them. */
   after?: { checkpoint: string };
   /** A records-empty page lowering the as-of, committed before the rows it covers. */
-  ahead?: SyncPage;
+  ahead?: SyncPage & { checkpoint: string };
 }
 
 /**
