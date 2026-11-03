@@ -606,7 +606,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'ISO 8601 time of the newest Open Food Facts change the local copy reflects. Present only when source is "off_mirror".',
+        'ISO 8601 time up to which the local copy reflects every product contributed or edited on Open Food Facts. Present only when source is "off_mirror".',
       ),
     products: z
       .array(

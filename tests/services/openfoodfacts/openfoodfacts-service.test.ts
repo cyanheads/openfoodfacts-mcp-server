@@ -6274,6 +6274,60 @@ describe('OpenFoodFactsService', () => {
         expect(global.fetch).not.toHaveBeenCalled();
       });
 
+      it.each<[string, number, string]>([
+        // AS_OF is 1_793_514_332: the first sync moves the as-of past it, the second below it.
+        ['a delta raising the as-of cites the as-of read before it', 1_793_600_000, AS_OF],
+        [
+          'a reload lowering the as-of ahead of the rows it rewrites cites the lowered one',
+          1_793_400_000,
+          new Date(1_793_400_000 * 1000).toISOString(),
+        ],
+      ])(
+        'off_get_product, when a sync commits between its as-of read and its product read: %s',
+        async (_label, asOfSeconds, cited) => {
+          await writeMirror([mirrorFixture(OATS).line]);
+          forbidFetch();
+          const handle = await getMirrorStore()?.raw();
+          if (!handle) throw new Error('Expected a serving store');
+          // A second connection, as the sync process holds; it commits just before the product read.
+          const writer = openMirrorStore(storePath());
+          const writerHandle = await writer.raw();
+          const prepare = handle.prepare.bind(handle);
+          let synced = false;
+          const spy = vi.spyOn(handle, 'prepare').mockImplementation((sql: string) => {
+            if (!synced && sql.startsWith('SELECT code, doc FROM products')) {
+              synced = true;
+              writerHandle
+                .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
+                .run(encodeCheckpoint({ generation: 2, asOfSeconds }));
+              writerHandle
+                .prepare("UPDATE products SET doc = json_set(doc, '$.product_name', 'Synced oats')")
+                .run();
+            }
+            return prepare(sql);
+          });
+
+          try {
+            const result = await runToolContract(offGetProductTool, { barcode: OATS });
+
+            expect(synced).toBe(true);
+            expect(result.structuredContent).toMatchObject({
+              product: { product_name: 'Synced oats' },
+              source: 'off_mirror',
+              mirror_as_of: cited,
+            });
+            const text = JSON.stringify(result.content);
+            expect(text).toContain(
+              `**Source:** off_mirror (this server's local copy of the Open Food Facts export, as of ${cited})`,
+            );
+            expect(text).toContain(`current as of ${cited}, not the live database`);
+          } finally {
+            spy.mockRestore();
+            await writer.close();
+          }
+        },
+      );
+
       it('off_compare_products answers mirrored rows as it does live, reading only the barcode the mirror lacks', async () => {
         const fixtures = [OATS, NESQUIK, BOTH].map(mirrorFixture);
 

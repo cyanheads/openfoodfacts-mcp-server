@@ -4,9 +4,11 @@
  * an interrupted ingest resuming with no line skipped or applied twice, malformed and oversize
  * lines skipped and counted once across a resume, delta order and idempotence, the non-2xx stop, a
  * delta re-applied after a failure part way through it, the full reloads (age, record version,
- * gap) with their sweep and the checkpoint they move back, the age and gap reloads an unchanged
- * export ETag skips, a refresh at a path naming no file refused before it opens anything, and a
- * run whose lease another run reclaimed writing nothing over that run's completed state.
+ * gap) with their sweep and the checkpoint they move back, a load that stamps no product refused
+ * before its sweep, the as-of a reload cites while it rewrites rows (interrupted and resumed
+ * included), the age and gap reloads an unchanged export ETag skips, a refresh at a path naming no
+ * file refused before it opens anything, and a run whose lease another run reclaimed writing
+ * nothing over that run's completed state.
  * @module tests/services/mirror/mirror-sync.test
  */
 
@@ -36,6 +38,7 @@ import {
 } from '@/services/mirror/mirror-ingester.js';
 import {
   decodeCheckpoint,
+  encodeCheckpoint,
   isMirrorReady,
   mirrorAsOf,
   openMirrorStore,
@@ -355,6 +358,14 @@ async function codes(): Promise<string[]> {
 async function doc(code: string): Promise<Record<string, unknown> | undefined> {
   const [found] = await probe.getByIds([code]);
   return found ? JSON.parse(String(found.doc)) : undefined;
+}
+
+/** How many product rows carry `generation`. */
+async function stampedCount(generation: number): Promise<number | undefined> {
+  const handle = await probe.raw();
+  return handle
+    .prepare<{ n: number }>('SELECT COUNT(*) AS n FROM products WHERE generation = ?')
+    .get(generation)?.n;
 }
 
 async function checkpoint() {
@@ -727,6 +738,25 @@ describe('mirror:init', () => {
     expect(await probe.readState()).toEqual(before);
     await sync('init');
     expect(await codes()).toHaveLength(4_500);
+  });
+
+  it('refuses a first load whose export stamps no product, leaving the store never loaded', async () => {
+    host.exportBody = gzipSync(['{', '', '{"name":"no code"}'].join('\n'));
+
+    await expect(sync('init')).rejects.toMatchObject({
+      message: expect.stringContaining('built no product'),
+      data: { reason: 'export_no_products' },
+    });
+
+    const state = await probe.readState();
+    expect(state.status).toBe('error');
+    expect(state.completedAt).toBeUndefined();
+    expect(state.checkpoint).toBeUndefined();
+    expect(parseExportCursor(state.cursor)).toMatchObject({ phase: 'download', generation: 1 });
+    expect(readMirrorLoad(await probe.raw())).toBeUndefined();
+    expect(await codes()).toEqual([]);
+    expect(await isMirrorReady(probe)).toBe(false);
+    expect(existsSync(`${path}.export.jsonl.gz`)).toBe(false);
   });
 
   it('stops on an export answered without a strong ETag or a Content-Length, downloading nothing', async () => {
@@ -1466,6 +1496,256 @@ describe('mirror refresh', () => {
     expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 2, etag: '"e1"' });
   });
 
+  describe('a reload whose export stamps no product', () => {
+    const download = () => `${path}.export.jsonl.gz`;
+    let before: {
+      asOf: string | undefined;
+      checkpoint: string | undefined;
+      codes: string[];
+      load: ReturnType<typeof readMirrorLoad>;
+    };
+
+    /** A delta past the export moves the checkpoint, then the last load is aged under a new ETag. */
+    beforeEach(async () => {
+      host.addDelta(exportMax - 50, exportMax + 1_000, [
+        { code: 'P00007', name: 'edited', t: exportMax + 900 },
+      ]);
+      await sync('refresh');
+      const handle = await probe.raw();
+      handle.prepare('UPDATE mirror_load SET loaded_at = ?').run('2000-01-01T00:00:00.000Z');
+      host.etag = '"e2"';
+      host.requests = [];
+      before = {
+        asOf: await mirrorAsOf(probe),
+        checkpoint: (await probe.readState()).checkpoint,
+        codes: await codes(),
+        load: readMirrorLoad(handle),
+      };
+      expect(before.codes).toHaveLength(100);
+      expect(decodeCheckpoint(before.checkpoint as string)).toEqual({
+        generation: 1,
+        asOfSeconds: exportMax + 1_000,
+      });
+    });
+
+    /** The store as the reload found it: rows, last full load, checkpoint, and readiness. */
+    async function expectUnchanged(): Promise<void> {
+      expect(await codes()).toEqual(before.codes);
+      expect(readMirrorLoad(await probe.raw())).toEqual(before.load);
+      expect((await probe.readState()).checkpoint).toBe(before.checkpoint);
+      expect(await mirrorAsOf(probe)).toBe(before.asOf);
+      expect(await isMirrorReady(probe)).toBe(true);
+      expect(await doc('P00007')).toMatchObject({ product_name: 'edited' });
+    }
+
+    /** One line past 16 MiB, built on demand. */
+    const oversize = () => JSON.stringify({ code: 'HUGE', name: 'x'.repeat(16 * 1024 * 1024) });
+
+    it.each<[string, () => FakeHost['exportBody']]>([
+      ['an empty gzip', () => gzipSync('')],
+      ['blank lines only', () => gzipSync('\n\r\n\n')],
+      ['every line malformed', () => gzipSync(['{', '{"code":', 'not json'].join('\n'))],
+      ['every line past 16 MiB', () => gzipSync([oversize(), oversize()].join('\n'))],
+      [
+        'JSON lines without a usable code',
+        () =>
+          gzipSync(['{}', '[]', '1', '"P00001"', '{"name":"no code"}', '{"code":7}'].join('\n')),
+      ],
+    ])(
+      'is refused before its sweep for %s, leaving the store as it was and deleting the download',
+      async (_label, body) => {
+        host.exportBody = body();
+
+        await expect(sync('refresh')).rejects.toMatchObject({
+          message: expect.stringContaining('built no product'),
+          data: { reason: 'export_no_products' },
+        });
+
+        await expectUnchanged();
+        expect(existsSync(download())).toBe(false);
+        const state = await probe.readState();
+        expect(state.status).toBe('error');
+        expect(parseExportCursor(state.cursor)).toMatchObject({
+          phase: 'download',
+          generation: 2,
+          etag: '"e2"',
+        });
+      },
+    );
+
+    it('downloads a refused export again on the next refresh, refused again while unchanged and loaded once it lists products', async () => {
+      host.exportBody = gzipSync('{\n{');
+      await expect(sync('refresh')).rejects.toMatchObject({
+        data: { reason: 'export_no_products' },
+      });
+      host.requests = [];
+
+      await expect(sync('refresh')).rejects.toMatchObject({
+        data: { reason: 'export_no_products' },
+      });
+
+      expect(host.calls()).toEqual([
+        'GET /data/openfoodfacts-products.jsonl.gz',
+        'GET /s3/openfoodfacts-products.jsonl.gz',
+      ]);
+      expect(host.requests.at(-1)?.headers.range).toBeUndefined();
+      await expectUnchanged();
+
+      const listed = products(50, 1_793_100_000, 'NEW');
+      host.exportBody = jsonl(listed);
+      host.etag = '"e3"';
+      const report = await sync('refresh');
+
+      expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 3 });
+      expect(await codes()).toEqual(listed.map((line) => line.code));
+      expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 3, etag: '"e3"' });
+      expect(await checkpoint()).toEqual({ generation: 3, asOfSeconds: 1_793_100_049 });
+    });
+
+    it('is refused on resuming a sweep a 0.4.2 build persisted for a load that stamped no product', async () => {
+      // A 0.4.2 build persisted the sweep cursor with the last ingest page, then was stopped.
+      (await probe.raw()).prepare("UPDATE mirror_sync_state SET status = 'error', cursor = ?").run(
+        JSON.stringify({
+          v: 1,
+          generation: 2,
+          phase: 'sweep',
+          line: 2,
+          maxModifiedT: 0,
+          rowid: 0,
+          skipped: 2,
+          etag: '"e2"',
+          totalBytes: 40,
+        }),
+      );
+
+      await expect(sync('refresh')).rejects.toMatchObject({
+        data: { reason: 'export_no_products' },
+      });
+
+      expect(host.requests).toEqual([]);
+      await expectUnchanged();
+      expect(parseExportCursor((await probe.readState()).cursor)).toMatchObject({
+        phase: 'download',
+        generation: 2,
+      });
+    });
+
+    it('completes a resumed reload whose earlier run stamped its products, from a cursor as 0.4.2 wrote it', async () => {
+      const listed = products(2_000, 1_793_100_000, 'NEW');
+      host.exportBody = gzipSync(
+        [...listed.map((line) => JSON.stringify(line)), ...Array<string>(50).fill('{')].join('\n'),
+      );
+      const controller = new AbortController();
+      // The first line skipped after the full first page stops the run, as a SIGTERM would.
+      const stopOnSkip: MirrorLogger = {
+        warning: () => controller.abort(new Error('interrupted')),
+      };
+      await expect(sync('refresh', fakeBuilder(), controller.signal, stopOnSkip)).rejects.toThrow(
+        'interrupted',
+      );
+      const written = parseExportCursor((await probe.readState()).cursor);
+      expect(written).toMatchObject({ phase: 'ingest', generation: 2, line: 2_000, skipped: 0 });
+      expect((await codes()).filter((code) => code.startsWith('NEW'))).toHaveLength(2_000);
+      // Every field the published 0.4.2 build serialized, and nothing else.
+      (await probe.raw()).prepare('UPDATE mirror_sync_state SET cursor = ?').run(
+        JSON.stringify({
+          v: 1,
+          generation: 2,
+          phase: 'ingest',
+          line: 2_000,
+          maxModifiedT: 1_793_101_999,
+          rowid: 0,
+          skipped: 0,
+          etag: '"e2"',
+          totalBytes: written?.totalBytes,
+        }),
+      );
+
+      const built: string[] = [];
+      const report = await sync(
+        'refresh',
+        fakeBuilder(1, (code) => built.push(code)),
+      );
+
+      expect(built).toEqual([]);
+      expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2, skippedLines: 50 });
+      expect(await codes()).toEqual(listed.map((line) => line.code));
+      expect(readMirrorLoad(await probe.raw())).toMatchObject({
+        generation: 2,
+        etag: '"e2"',
+        skippedLines: 50,
+      });
+      expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: 1_793_101_999 });
+    });
+
+    it('completes a reload whose export stamps one product, sweeping every other row', async () => {
+      host.exportBody = gzipSync(
+        ['{', JSON.stringify({ code: 'ONLY', name: 'only', t: 1_793_100_000 }), ''].join('\n'),
+      );
+
+      const report = await sync('refresh');
+
+      expect(report.fullLoad).toMatchObject({ reason: 'age', generation: 2, skippedLines: 1 });
+      expect(report.fullLoad?.result.tombstonesApplied).toBe(100);
+      expect(await codes()).toEqual(['ONLY']);
+      expect(await isMirrorReady(probe)).toBe(true);
+      expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: 1_793_100_000 });
+    });
+
+    it('completes a reload whose one stamped product sits past the first 50,000-rowid window', async () => {
+      const handle = await probe.raw();
+      // A row at rowid 60,000 puts the next insert, the one product stamped, in the second window.
+      handle
+        .prepare(
+          "INSERT INTO products (rowid, code, generation, record_version, tag_ids, doc) VALUES (60000, 'FILLER', 1, 1, '[]', '{}')",
+        )
+        .run();
+      host.exportBody = gzipSync(
+        ['{', JSON.stringify({ code: 'ONLY', name: 'only', t: 1_793_100_000 }), ''].join('\n'),
+      );
+
+      const report = await sync('refresh');
+
+      expect(report.fullLoad).toMatchObject({ reason: 'age', generation: 2, skippedLines: 1 });
+      expect(report.fullLoad?.result.tombstonesApplied).toBe(101);
+      expect(await codes()).toEqual(['ONLY']);
+      expect(
+        handle.prepare<{ id: number }>("SELECT rowid AS id FROM products WHERE code = 'ONLY'").get()
+          ?.id,
+      ).toBeGreaterThan(50_000);
+      expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: 1_793_100_000 });
+    });
+
+    it.each<[string, string, (res: ServerResponse) => void]>([
+      [
+        'a zero-length body',
+        'export_unresumable',
+        (res) => res.writeHead(200, { etag: '"e2"', 'content-length': 0 }).end(),
+      ],
+      [
+        'a gzip cut short',
+        'export_corrupt',
+        (res) => {
+          const cut = jsonl(products(100)).subarray(0, 30);
+          res.writeHead(200, { etag: '"e2"', 'content-length': cut.length }).end(cut);
+        },
+      ],
+    ])(
+      'stops on %s as %s, as before, leaving the store as it was',
+      async (_label, reason, answer) => {
+        host.answerExport = (res, _from, req) => {
+          if (req.method !== 'GET') return false;
+          answer(res);
+          return true;
+        };
+
+        await expect(sync('refresh')).rejects.toMatchObject({ data: { reason } });
+
+        await expectUnchanged();
+      },
+    );
+  });
+
   describe('a run and its sync lease', () => {
     const download = () => `${path}.export.jsonl.gz`;
     const reloadedMax = 1_793_100_000 + 2_999;
@@ -1593,5 +1873,342 @@ describe('mirror refresh', () => {
       expect(error).toMatchObject({ data: { reason: 'mirror_lock_lost' } });
       await expectNothingToReload();
     });
+  });
+});
+
+describe('the as-of a reload cites', () => {
+  const T0 = 1_793_000_000;
+  /** The export's newest change: line i changed at T0 + i, over ingest pages of 2,000, 2,000, and 500. */
+  const T = T0 + 4_499;
+  /** The end of the delta applied after the export, which edits P00010, a product of the first page. */
+  const D = T + 1_000;
+  const LISTED = products(4_500, T0).map((line) => line.code as string);
+  let delta: string;
+
+  beforeEach(async () => {
+    host.exportBody = jsonl(products(4_500, T0));
+    delta = host.addDelta(T - 50, D, [{ code: 'P00010', name: 'edited', t: T + 900 }]);
+    await sync('init');
+    expect(await checkpoint()).toEqual({ generation: 1, asOfSeconds: D });
+    expect(await doc('P00010')).toMatchObject({ product_name: 'edited' });
+    host.requests = [];
+  });
+
+  /** Makes the next refresh reload the export: the last load 30 days old, the export's ETag changed. */
+  async function reloadDue(
+    body: FakeHost['exportBody'] = jsonl(products(4_500, T0)),
+  ): Promise<void> {
+    (await probe.raw())
+      .prepare('UPDATE mirror_load SET loaded_at = ?')
+      .run('2000-01-01T00:00:00.000Z');
+    host.exportBody = body;
+    host.etag = '"e2"';
+  }
+
+  interface RowWrite {
+    checkpoint: string;
+    completedAt: string | null;
+    generation: number;
+    t: number | null;
+  }
+
+  /**
+   * Records, at every product row a sync inserts or updates, the sync state as the sync's own
+   * connection has committed it then: what a reader of that row would be told.
+   */
+  async function recordRowWrites(): Promise<() => RowWrite[]> {
+    const handle = await probe.raw();
+    handle.exec(
+      'CREATE TABLE row_writes (seq INTEGER PRIMARY KEY, generation INTEGER, t INTEGER, checkpoint TEXT, completed_at TEXT)',
+    );
+    for (const event of ['INSERT', 'UPDATE']) {
+      handle.exec(`CREATE TRIGGER row_writes_${event.toLowerCase()} AFTER ${event} ON products BEGIN
+        INSERT INTO row_writes(generation, t, checkpoint, completed_at)
+          SELECT new.generation, new.last_modified_t, checkpoint, completed_at FROM mirror_sync_state;
+      END`);
+    }
+    return () =>
+      handle
+        .prepare<RowWrite>(
+          'SELECT generation, t, checkpoint, completed_at AS completedAt FROM row_writes ORDER BY seq',
+        )
+        .all();
+  }
+
+  /** The reload's 4,500 row writes under `generation`, in its three ingest pages. */
+  function loadPages(writes: RowWrite[], generation: number): RowWrite[][] {
+    const rows = writes.filter((write) => write.generation === generation).slice(0, 4_500);
+    expect(rows).toHaveLength(4_500);
+    return [rows.slice(0, 2_000), rows.slice(2_000, 4_000), rows.slice(4_000)];
+  }
+
+  /** Each page's distinct checkpoints, decoded, as its rows met them. */
+  const asOfByPage = (pages: RowWrite[][]) =>
+    pages.map((page) => [...new Set(page.map((write) => write.checkpoint))].map(decodeCheckpoint));
+
+  /** The end of an uninterrupted reload of the export: every product restamped, the delta re-applied. */
+  async function expectReloaded(): Promise<void> {
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: D });
+    expect(await codes()).toEqual(LISTED);
+    expect(await doc('P00010')).toMatchObject({ product_name: 'edited' });
+    expect(await doc('P04499')).toMatchObject({ product_name: 'P4499' });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 2, etag: '"e2"' });
+    expect(await stampedCount(2)).toBe(4_500);
+  }
+
+  it('keeps the store ready, as the last completed load left it, through every row a reload writes', async () => {
+    await reloadDue();
+    const writes = await recordRowWrites();
+    const { completedAt } = await probe.readState();
+    expect(completedAt).toBeDefined();
+
+    await sync('refresh');
+
+    const rows = loadPages(writes(), 2).flat();
+    expect([...new Set(rows.map((write) => write.completedAt))]).toEqual([completedAt]);
+  });
+
+  it.each<[string, number, { generation: number; asOfSeconds: number }[][], number]>([
+    [
+      'an export older than the last delta lowers it to the newest change stamped, and raises it as later pages land',
+      T0,
+      [
+        [{ generation: 2, asOfSeconds: T0 + 1_999 }],
+        [{ generation: 2, asOfSeconds: T0 + 1_999 }],
+        [{ generation: 2, asOfSeconds: T0 + 3_999 }],
+      ],
+      D,
+    ],
+    [
+      'an export straddling the last delta lowers it for the older page, then raises it back no further than that delta',
+      T0 + 3_000,
+      [
+        [{ generation: 2, asOfSeconds: T0 + 4_999 }],
+        [{ generation: 2, asOfSeconds: T0 + 4_999 }],
+        [{ generation: 2, asOfSeconds: D }],
+      ],
+      T0 + 7_499,
+    ],
+    [
+      'an export newer than the last delta leaves it where the delta left it',
+      T + 2_000,
+      [
+        [{ generation: 1, asOfSeconds: D }],
+        [{ generation: 1, asOfSeconds: D }],
+        [{ generation: 1, asOfSeconds: D }],
+      ],
+      T + 6_499,
+    ],
+  ])('%s', async (_label, start, expected, finalAsOf) => {
+    await reloadDue(jsonl(products(4_500, start)));
+    const writes = await recordRowWrites();
+
+    await sync('refresh');
+
+    const pages = loadPages(writes(), 2);
+    expect(asOfByPage(pages)).toEqual(expected);
+    // No row is written under an as-of past the newest change the reload has stamped with it.
+    let newest = 0;
+    for (const [i, page] of pages.entries()) {
+      for (const write of page) newest = Math.max(newest, write.t ?? 0);
+      for (const cited of asOfByPage(pages)[i] ?? []) {
+        expect(cited.asOfSeconds).toBeLessThanOrEqual(newest);
+      }
+    }
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: finalAsOf });
+  });
+
+  it('cites no time newer than the export once the first page of an older one commits, the product it rewrote included', async () => {
+    await reloadDue();
+    // A second connection, as the serving process holds, read while the second page is built.
+    const watcher = openMirrorStore(path);
+    const watcherHandle = await watcher.raw();
+    const seen: { asOf: string | undefined; product: unknown }[] = [];
+    const builder = fakeBuilder(1, (code) => {
+      if (code !== 'P02500') return;
+      const state = watcherHandle
+        .prepare<{ checkpoint: string }>('SELECT checkpoint FROM mirror_sync_state')
+        .get();
+      const row = watcherHandle
+        .prepare<{ doc: string }>("SELECT doc FROM products WHERE code = 'P00010'")
+        .get();
+      seen.push({
+        asOf:
+          state && new Date(decodeCheckpoint(state.checkpoint).asOfSeconds * 1000).toISOString(),
+        product: row && JSON.parse(row.doc).product_name,
+      });
+    });
+
+    const report = await sync('refresh', builder);
+    await watcher.close();
+
+    expect(seen).toEqual([{ asOf: new Date((T0 + 1_999) * 1000).toISOString(), product: 'P10' }]);
+    expect(report.deltasApplied).toEqual([delta]);
+    expect(await mirrorAsOf(probe)).toBe(new Date(D * 1000).toISOString());
+    await expectReloaded();
+  });
+
+  it('ends a reload stopped after its as-of was lowered, as SIGTERM stops it, where an uninterrupted one ends', async () => {
+    await reloadDue();
+    await interruptedIngest('refresh', 'P04100');
+
+    const state = await probe.readState();
+    expect(state.status).toBe('error');
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: T0 + 3_999 });
+    expect(parseExportCursor(state.cursor)).toMatchObject({
+      phase: 'ingest',
+      generation: 2,
+      line: 4_000,
+    });
+    expect(await isMirrorReady(probe)).toBe(true);
+    expect(await doc('P00010')).toMatchObject({ product_name: 'P10' });
+
+    const report = await sync('refresh');
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2 });
+    expect(report.deltasApplied).toEqual([delta]);
+    await expectReloaded();
+  });
+
+  it('ends a reload whose first page failed after the as-of lowered ahead of it committed where an uninterrupted one ends', async () => {
+    await reloadDue();
+    const handle = await probe.raw();
+    handle.exec(
+      "CREATE TRIGGER trip BEFORE UPDATE ON products WHEN new.code = 'P00100' AND new.generation = 2 BEGIN SELECT RAISE(ABORT, 'interrupted'); END",
+    );
+
+    await expect(sync('refresh')).rejects.toThrow('interrupted');
+
+    const state = await probe.readState();
+    expect(state.status).toBe('error');
+    // Lowered for the page that failed: still no newer than any row the export holds.
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: T0 + 1_999 });
+    expect(parseExportCursor(state.cursor)).toMatchObject({
+      phase: 'ingest',
+      generation: 2,
+      line: 0,
+    });
+    expect(await stampedCount(2)).toBe(0);
+    expect(await isMirrorReady(probe)).toBe(true);
+
+    handle.exec('DROP TRIGGER trip');
+    const report = await sync('refresh');
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2 });
+    expect(report.deltasApplied).toEqual([delta]);
+    await expectReloaded();
+  });
+
+  it('cites no time newer than the rows an abandoned export stamped while the reload resumes under a changed export', async () => {
+    await reloadDue();
+    await interruptedIngest('refresh', 'P02500');
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: T0 + 1_999 });
+    // A download cut short on disk sends the resume back to the host, which now serves a new export.
+    await truncate(`${path}.export.jsonl.gz`, 100);
+    const listed = products(1_000, T + 5_000, 'NEW');
+    host.exportBody = jsonl(listed);
+    host.etag = '"e3"';
+    const writes = await recordRowWrites();
+
+    const report = await sync('refresh');
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 3 });
+    const stamped = writes().filter((write) => write.generation === 3);
+    expect(stamped).toHaveLength(1_000);
+    expect([...new Set(stamped.map((write) => write.checkpoint))].map(decodeCheckpoint)).toEqual([
+      { generation: 2, asOfSeconds: T0 + 1_999 },
+    ]);
+    expect(await checkpoint()).toEqual({ generation: 3, asOfSeconds: T + 5_999 });
+    expect(await codes()).toEqual(listed.map((line) => line.code));
+  });
+
+  it('lowers the as-of under the new generation, ahead of its rows, when the changed export a reload resumes under is older', async () => {
+    await reloadDue();
+    await interruptedIngest('refresh', 'P02500');
+    expect(await checkpoint()).toEqual({ generation: 2, asOfSeconds: T0 + 1_999 });
+    await truncate(`${path}.export.jsonl.gz`, 100);
+    const listed = products(1_000, T0 - 10_000, 'OLD');
+    host.exportBody = jsonl(listed);
+    host.etag = '"e3"';
+    const writes = await recordRowWrites();
+
+    const report = await sync('refresh');
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 3 });
+    const stamped = writes().filter((write) => write.generation === 3);
+    expect(stamped).toHaveLength(1_000);
+    expect([...new Set(stamped.map((write) => write.checkpoint))].map(decodeCheckpoint)).toEqual([
+      { generation: 3, asOfSeconds: T0 - 9_001 },
+    ]);
+    expect(await codes()).toEqual(listed.map((line) => line.code));
+  });
+
+  it('lowers the as-of before it reads on when it resumes an ingest a 0.4.2 build stopped', async () => {
+    await reloadDue();
+    await interruptedIngest('refresh', 'P02500');
+    // As 0.4.2 left it: the first page at the export's version, under the delta's as-of.
+    (await probe.raw())
+      .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
+      .run(encodeCheckpoint({ generation: 1, asOfSeconds: D }));
+    expect(await doc('P00010')).toMatchObject({ product_name: 'P10' });
+    const watcher = openMirrorStore(path);
+    const watcherHandle = await watcher.raw();
+    const seen: (string | undefined)[] = [];
+    const builder = fakeBuilder(1, (code) => {
+      if (code !== 'P02000') return;
+      seen.push(
+        watcherHandle
+          .prepare<{ checkpoint: string }>('SELECT checkpoint FROM mirror_sync_state')
+          .get()?.checkpoint,
+      );
+    });
+
+    await sync('refresh', builder);
+    await watcher.close();
+
+    expect(seen.map((value) => value && decodeCheckpoint(value))).toEqual([
+      { generation: 2, asOfSeconds: T0 + 1_999 },
+    ]);
+    await expectReloaded();
+  });
+
+  it('lowers the as-of before it sweeps when it resumes a reload a 0.4.2 build stopped after its last ingest page', async () => {
+    const handle = await probe.raw();
+    handle
+      .prepare(
+        "INSERT INTO products (code, generation, record_version, tag_ids, doc) VALUES ('GONE', 1, 1, '[]', '{}')",
+      )
+      .run();
+    await reloadDue();
+    const stop = new AbortController();
+    const atSweep: MirrorLogger = {
+      info: (message) => {
+        if (message.startsWith('Ingested the export')) stop.abort(new Error('interrupted'));
+      },
+    };
+    await expect(sync('refresh', fakeBuilder(), stop.signal, atSweep)).rejects.toThrow(
+      'interrupted',
+    );
+    expect(parseExportCursor((await probe.readState()).cursor)).toMatchObject({
+      phase: 'sweep',
+      generation: 2,
+      maxModifiedT: T,
+    });
+    // As 0.4.2 left it: every row at the export's version, under the delta's as-of.
+    handle
+      .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
+      .run(encodeCheckpoint({ generation: 1, asOfSeconds: D }));
+    handle.exec('CREATE TABLE swept (checkpoint TEXT)');
+    handle.exec(
+      'CREATE TRIGGER swept_ad AFTER DELETE ON products BEGIN INSERT INTO swept SELECT checkpoint FROM mirror_sync_state; END',
+    );
+
+    await sync('refresh');
+
+    const swept = handle.prepare<{ checkpoint: string }>('SELECT checkpoint FROM swept').all();
+    expect(swept.map((row) => decodeCheckpoint(row.checkpoint))).toEqual([
+      { generation: 2, asOfSeconds: T },
+    ]);
+    await expectReloaded();
   });
 });

@@ -2913,7 +2913,7 @@ describe('off_get_product', () => {
       );
       expect(source.description).toContain('reads the same source');
       expect(mirror_as_of.description).toBe(
-        'ISO 8601 time of the newest Open Food Facts change the local copy reflects. Present only when source is "off_mirror".',
+        'ISO 8601 time up to which the local copy reflects every product contributed or edited on Open Food Facts. Present only when source is "off_mirror".',
       );
       expect(offGetProductTool.enrichment?.mirror_snapshot?.description).toBe(
         'Present only when source is "off_mirror". States that the product comes from the local copy as of mirror_as_of, so an edit made to it since then is not reflected.',

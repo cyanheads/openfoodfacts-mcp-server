@@ -1,8 +1,8 @@
 /**
  * @fileoverview Entry of the scheduled refresh's child process: one `refresh` sync against the store
  * at `OFF_MIRROR_PATH`, logged as JSON lines on stdout for the parent to relay. SIGTERM stops it at
- * the next page boundary with the lock released and the checkpoint where the last applied delta
- * left it. Exits 0 on success and 1 otherwise.
+ * the next page boundary with the lock released and the checkpoint as its last committed page left
+ * it. Exits 0 on success and 1 otherwise.
  * @module services/mirror/mirror-job
  */
 

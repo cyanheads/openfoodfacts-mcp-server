@@ -1,11 +1,13 @@
 /**
  * @fileoverview The mirror's two `sync` generators. `exportLoad` is a full load: it downloads the
  * export beside the store (resuming with `Range` + `If-Range`), ingests it from a line cursor,
- * sweeps the rows the load did not stamp, builds any sort index the store lacks, and only then sets
- * the checkpoint. `deltaPass` applies the daily deltas ending past the checkpoint, oldest first.
- * Both run one upstream request at a time and stop on any non-2xx. A feed line that is not valid
- * JSON or runs past 16 MiB is skipped, counted, and logged by line number, never by content:
- * fetching the feed again would bring the same line back.
+ * holding the checkpoint's as-of no later than the rows it rewrites, sweeps the rows the load did
+ * not stamp, builds any sort index the store lacks, and only then sets the checkpoint to the
+ * export's own as-of. `deltaPass` applies the daily deltas ending past the checkpoint, oldest
+ * first. Both run one upstream request at a time and stop on any non-2xx; a full load also stops on
+ * an export it cannot resume or decompress, and before its sweep when the export built no product.
+ * A feed line that is not valid JSON or runs past 16 MiB is skipped, counted, and logged by line
+ * number, never by content: fetching the feed again would bring the same line back.
  * @module services/mirror/mirror-ingester
  */
 
@@ -147,8 +149,14 @@ export interface ExportLoadOptions extends IngestOptions {
 /**
  * Full load. Every page carries the cursor, so an interrupt anywhere resumes with no line skipped
  * or applied twice: the download from its byte offset, the ingest from its line count (and the
- * count of lines it skipped through it), the sweep from its rowid. The checkpoint changes once, on
- * the last page, after the sweep and the sort index builds.
+ * count of lines it skipped through it), the sweep from its rowid. While it ingests over a store
+ * that already cites an as-of, that as-of is the older of the one the run began with and the newest
+ * `last_modified_t` among the rows the load has stamped (see {@link asOfMoves}). The export's own
+ * as-of is set on the last page, after the sweep and the sort index builds.
+ *
+ * @throws McpError `ServiceUnavailable` `export_no_products` before the sweep when the load, across
+ *   every run it took, stamped no product: the store is left as it was, the download deleted, and
+ *   the cursor sent back to the download.
  */
 export async function* exportLoad(
   ctx: SyncContext,
@@ -164,13 +172,22 @@ export async function* exportLoad(
     rowid: 0,
     skipped: 0,
   };
+  const begun = ctx.checkpoint ?? options.previousCheckpoint;
   /**
    * The runner clears the checkpoint when a load starts over a completed store; restoring it keeps
    * mirrorAsOf() truthful while the old data keeps serving.
    */
-  if (ctx.checkpoint === undefined && options.previousCheckpoint !== undefined) {
-    yield { records: [], cursor: JSON.stringify(cursor), checkpoint: options.previousCheckpoint };
+  if (ctx.checkpoint === undefined && begun !== undefined) {
+    yield { records: [], cursor: JSON.stringify(cursor), checkpoint: begun };
   }
+  const moveAsOf = asOfMoves(begun);
+  /**
+   * A resumed cursor lowers the as-of over the rows it already stamped before anything else, for a
+   * run stopped by a release that kept citing the as-of it began with: the next ingest page can be
+   * minutes of skipped lines away, and a resumed sweep has none.
+   */
+  const resumed = moveAsOf([], cursor);
+  if (resumed.ahead) yield resumed.ahead;
 
   while (cursor.phase !== 'done') {
     if (cursor.phase === 'download') {
@@ -263,6 +280,8 @@ export async function* exportLoad(
           const record = buildLine(builder, bytes, onSkip);
           if (record !== null) pending.push(record);
           if (pending.length < PAGE_SIZE) continue;
+          const move = moveAsOf(pending, cursor);
+          if (move.ahead) yield move.ahead;
           cursor = {
             ...cursor,
             line,
@@ -271,7 +290,7 @@ export async function* exportLoad(
           };
           const records = toRows(pending, cursor.generation, options);
           pending = [];
-          yield { records, cursor: JSON.stringify(cursor) };
+          yield { records, cursor: JSON.stringify(cursor), ...move.after };
           pages += 1;
           maintain(handle, pages, log, { phase: 'ingest', line });
         }
@@ -293,6 +312,8 @@ export async function* exportLoad(
       } finally {
         lines.destroy();
       }
+      const move = moveAsOf(pending, cursor);
+      if (move.ahead) yield move.ahead;
       cursor = {
         ...cursor,
         phase: 'sweep',
@@ -304,6 +325,7 @@ export async function* exportLoad(
       yield {
         records: toRows(pending, cursor.generation, options),
         cursor: JSON.stringify(cursor),
+        ...move.after,
       };
       await rm(downloadPath, { force: true });
       log.info?.('Ingested the export; sweeping rows it no longer lists.', {
@@ -313,10 +335,33 @@ export async function* exportLoad(
       continue;
     }
 
-    // Sweep: tombstone every row an earlier load stamped and this one did not.
     const lastRowid =
       handle.prepare<{ last: number | null }>('SELECT MAX(rowid) AS last FROM products').get()
         ?.last ?? 0;
+    /**
+     * A sweep after a load that stamped no product would delete every row. The store, not the
+     * cursor, says whether one was stamped, so a load stamped in an earlier run, or under a cursor
+     * an earlier build wrote with no such count, is never refused. Checked on every entry to the
+     * sweep, a resumed one included, one rowid window per statement as the sweep reads; a load
+     * that stamped anything ends it at its first stamped row.
+     */
+    const stampedIn = handle.prepare<{ found: number }>(
+      'SELECT 1 AS found FROM products WHERE rowid > ? AND rowid <= ? AND generation = ? LIMIT 1',
+    );
+    let stamped = false;
+    for (let from = 0; !stamped && from < lastRowid; from += SWEEP_WINDOW) {
+      stamped = stampedIn.get(from, from + SWEEP_WINDOW, cursor.generation) != null;
+    }
+    if (!stamped) {
+      await rm(downloadPath, { force: true });
+      yield { records: [], cursor: JSON.stringify({ ...cursor, phase: 'download' }) };
+      throw serviceUnavailable(
+        `The export built no product from its ${cursor.line} lines (${cursor.skipped} skipped as malformed or past 16 MiB), so the load stopped before its sweep would empty the store; the store is unchanged, the download was deleted, and the next run downloads the export again.`,
+        { reason: 'export_no_products' },
+      );
+    }
+
+    // Sweep: tombstone every row an earlier load stamped and this one did not.
     const stale = handle.prepare<{ code: string }>(
       'SELECT code FROM products WHERE rowid > ? AND rowid <= ? AND generation < ?',
     );
@@ -554,6 +599,44 @@ function maxModified(current: number, records: readonly MirrorRecord[]): number 
     if (record.lastModifiedT !== null && record.lastModifiedT > max) max = record.lastModifiedT;
   }
   return max;
+}
+
+/** How the checkpoint moves with one ingest page: a page of its own ahead of the rows, or on theirs. */
+interface AsOfMove {
+  /** The checkpoint raising the as-of, committed with the rows' own page, after them. */
+  after?: { checkpoint: string };
+  /** A records-empty page lowering the as-of, committed before the rows it covers. */
+  ahead?: SyncPage;
+}
+
+/**
+ * The as-of a full load cites while it ingests over a store whose checkpoint was `begun`: the older
+ * of `begun`'s as-of and the newest `last_modified_t` the load will have stamped once a page lands,
+ * encoded under the load's generation, whose higher prefix lets the runner accept it below `begun`.
+ * A row rewritten to an export older than the deltas behind `begun` so never serves under a time
+ * newer than itself. The runner commits a page's rows before its checkpoint, so a drop goes in a
+ * page of its own ahead of the rows it covers and a rise rides the rows' own page. The returned
+ * function takes each page's records and the cursor before that page advances it, or no records and
+ * the cursor a run resumes from. A load with no `begun` (a first one, which serves nothing), and no
+ * records over a cursor that has stamped none, move nothing.
+ */
+function asOfMoves(
+  begun: string | undefined,
+): (records: readonly MirrorRecord[], cursor: ExportCursor) => AsOfMove {
+  if (begun === undefined) return () => ({});
+  const begunAt = decodeCheckpoint(begun).asOfSeconds;
+  let cited = begunAt;
+  return (records, cursor) => {
+    if (records.length === 0 && cursor.maxModifiedT === 0) return {};
+    const asOfSeconds = Math.min(begunAt, maxModified(cursor.maxModifiedT, records));
+    if (asOfSeconds === cited) return {};
+    const checkpoint = encodeCheckpoint({ generation: cursor.generation, asOfSeconds });
+    const lowered = asOfSeconds < cited;
+    cited = asOfSeconds;
+    return lowered
+      ? { ahead: { records: [], cursor: JSON.stringify(cursor), checkpoint } }
+      : { after: { checkpoint } };
+  };
 }
 
 const bunRuntime = (globalThis as { Bun?: { gc(force: boolean): void } }).Bun;

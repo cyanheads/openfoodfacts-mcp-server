@@ -427,8 +427,9 @@ export type StoredAsSoldRead = AsSoldSelection | { status: 'unread'; error: McpE
 
 /**
  * Where a read was answered: the live Open Food Facts API, or the local export mirror, whose data
- * reflects every change up to `mirrorAsOf` (ISO 8601: the end of the last applied delta, or the
- * newest change in the export the last full load read).
+ * reflects every product contributed or edited up to `mirrorAsOf` (ISO 8601: the end of the last
+ * applied delta, or the newest change in the export the last full load read; while a full load
+ * runs, no later than the newest change among the rows it has written).
  */
 export type ReadSource = { source: 'off_api' } | { source: 'off_mirror'; mirrorAsOf: string };
 
@@ -1192,9 +1193,10 @@ export class OpenFoodFactsService {
   /**
    * Runs `read` against the mirror when one is configured and ready, and resolves `undefined` —
    * read live — when none is configured, the store is not ready, `read` finds nothing, or the store
-   * throws. A throw is logged without the stored document. The as-of time is read before the data,
-   * so a refresh committing in between leaves the data no older than the time it cites. The
-   * caller's cancellation is rethrown whatever the read did, never served or read live.
+   * throws. A throw is logged without the stored document. The as-of time is read before and after
+   * the data and the older one cited, so neither a delta raising it nor a full load lowering it
+   * ahead of the rows it rewrites leaves the data older than the time it cites. The caller's
+   * cancellation is rethrown whatever the read did, never served or read live.
    */
   private async readMirror<T>(
     operation: string,
@@ -1203,13 +1205,20 @@ export class OpenFoodFactsService {
   ): Promise<{ value: T; mirrorAsOf: string } | undefined> {
     const store = getMirrorStore();
     if (store === undefined) return;
+    const readAsOf = async () => {
+      const asOf = await mirrorAsOf(store);
+      if (asOf === undefined) throw new Error('The mirror is ready but records no as-of time.');
+      return asOf;
+    };
     let served: { value: T; mirrorAsOf: string } | undefined;
     try {
       if (await isMirrorReady(store)) {
-        const asOf = await mirrorAsOf(store);
-        if (asOf === undefined) throw new Error('The mirror is ready but records no as-of time.');
+        const before = await readAsOf();
         const value = await read(store);
-        if (value !== undefined) served = { value, mirrorAsOf: asOf };
+        if (value !== undefined) {
+          const after = await readAsOf();
+          served = { value, mirrorAsOf: Date.parse(after) < Date.parse(before) ? after : before };
+        }
       }
     } catch (error) {
       ctx.signal.throwIfAborted();

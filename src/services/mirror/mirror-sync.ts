@@ -104,7 +104,8 @@ export interface MirrorSyncReport {
  *   when one reclaims it mid-run, and `mirror_not_initialized` for a refresh before any full load,
  *   at a path naming no file included.
  * @throws McpError `ServiceUnavailable` for an upstream failure (`upstream_status` on any non-2xx),
- *   with the checkpoint unchanged.
+ *   with the checkpoint unchanged, and for a full load that stamped no product across every run it
+ *   took (`export_no_products`), stopped before its sweep with the store unchanged.
  */
 export async function runMirrorSync(options: MirrorSyncOptions): Promise<MirrorSyncReport> {
   /**

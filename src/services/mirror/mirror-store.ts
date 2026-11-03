@@ -23,10 +23,13 @@
  * its sweep and before it completes, one sorted pass each, and any run on a loaded store first
  * builds one it lacks. Maintained through the ingest instead, they slow it and come out larger.
  *
- * The sync checkpoint is `<generation:6>:<as-of epoch seconds:12>`. Its as-of half is the time of
- * the newest change the data reflects: the end of the last applied delta, or the newest
- * `last_modified_t` in the export a full load read. The generation prefix keeps the value
- * lexicographically monotonic across a full reload, whose as-of can be older than the deltas it
+ * The sync checkpoint is `<generation:6>:<as-of epoch seconds:12>`. Its as-of half is a time up to
+ * which the data reflects every product contributed or edited: the end of the last applied delta,
+ * or the newest `last_modified_t` in the export a full load read. While a full load runs over a
+ * loaded store it is the older of the as-of the run began with and the newest `last_modified_t`
+ * among the rows the load has stamped, so a row rewritten to an export older than the deltas it
+ * replaces never serves under a newer time. The generation prefix keeps the value
+ * lexicographically monotonic across a full reload, whose as-of can drop below the deltas it
  * replaces.
  * @module services/mirror/mirror-store
  */
@@ -221,9 +224,11 @@ export function hasProducts(handle: SqliteHandle): boolean {
 }
 
 /**
- * ISO time of the newest change the mirrored data reflects — the end of the last applied delta, or
- * the newest `last_modified_t` of the export the last full load read. `undefined` before any load
- * completes.
+ * ISO time up to which the mirrored data reflects every product contributed or edited — the end of
+ * the last applied delta, or the newest `last_modified_t` of the export the last full load read;
+ * while a full load runs, no later than the newest `last_modified_t` among the rows it has stamped.
+ * `undefined` before any load completes, and while a reload starts, between the runner clearing the
+ * checkpoint and the load's first page restoring it.
  */
 export async function mirrorAsOf(store: MirrorStore): Promise<string | undefined> {
   const { checkpoint } = await store.readState();
@@ -233,7 +238,7 @@ export async function mirrorAsOf(store: MirrorStore): Promise<string | undefined
 
 /** A decoded sync checkpoint. */
 export interface MirrorCheckpoint {
-  /** Epoch seconds of the newest change the data reflects. */
+  /** Epoch seconds up to which the data reflects every product contributed or edited. */
   asOfSeconds: number;
   /** Full-load generation the data descends from. */
   generation: number;
