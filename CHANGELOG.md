@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-11-02
+
+Fixes the local mirror citing a `mirror_as_of` newer than rows a full reload had already rewritten to an older export, and refuses a full load that stamped no product instead of sweeping the whole store.
+
 ## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-11-01
 
 Adds an optional local mirror of the Open Food Facts export that serves barcode reads and tag-only searches, reads a record's stored as-sold figures when a product read returns only prepared ones, and names why a taxonomy lookup failed, with the wait in whole seconds.
