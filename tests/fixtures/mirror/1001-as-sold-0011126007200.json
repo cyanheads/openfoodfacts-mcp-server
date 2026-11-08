@@ -2,8 +2,8 @@
   "schema": "1001",
   "shape": "as_sold",
   "code": "0011126007200",
-  "capturedAt": "2026-11-01T13:06:52.813Z",
-  "request": "/api/v2/product/0011126007200.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:00:31.096Z",
+  "request": "/api/v2/product/0011126007200.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0011126007200",
@@ -1658,6 +1658,12 @@
       "ingredients_text": "Enriched bleached flour (bleached wheat flour, niacin, iron, thiamine mononitrate, riboflavin, folic acid), yellow corn flour, dextrose, sugar, partially hydrogenated vegetable shortening (contains soybean and cottonseed oil with emulsifier (mono - and diglycerides), relecithinated soy flour, leavening (baking soda, monocalcium phosphate, sodium aluminum phosphate), contains 2% or less of the following: whey, salt, soy flour, nonfat milk, artificial flavor, cellulose gum, citric acid, color (blue 2 lake, red 40 lake).",
       "last_modified_t": 1745449415,
       "nova_group": 4,
+      "nutrient_levels": {
+        "fat": "moderate",
+        "salt": "high",
+        "saturated-fat": "moderate",
+        "sugars": "high"
+      },
       "nutriments": {
         "calcium": 0.333,
         "calcium_100g": 0.333,

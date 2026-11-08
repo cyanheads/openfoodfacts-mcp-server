@@ -41,6 +41,7 @@ import type { MirrorStore, SqliteHandle, SyncState } from '@cyanheads/mcp-ts-cor
 import { sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import { getServerConfig } from '@/config/server-config.js';
 import { type MirrorLockHolder, readMirrorLock } from './mirror-lock.js';
+import { GREEN_SCORE_RECORD_VERSION } from './record-builder.js';
 
 /** Schema version the store's migrations reach. */
 const STORE_SCHEMA_VERSION = 2;
@@ -294,6 +295,17 @@ export function readMirrorLoad(handle: SqliteHandle): MirrorLoad | undefined {
     ...(row.etag !== null && { etag: row.etag }),
     skippedLines: row.skipped_lines,
   };
+}
+
+/**
+ * Whether the store serves a search filtering on Green-Score: its last completed full load was
+ * built at `GREEN_SCORE_RECORD_VERSION` or later. Until such a load completes some rows lack their
+ * Green-Score tag (every row of an older load, and the rows a reload part-way through has not
+ * rewritten yet), so a search on it would miss products.
+ */
+export async function indexesGreenScore(store: MirrorStore): Promise<boolean> {
+  const load = readMirrorLoad(await store.raw());
+  return load !== undefined && load.recordVersion >= GREEN_SCORE_RECORD_VERSION;
 }
 
 /** What `mirror:status` and `mirror:verify` print. */

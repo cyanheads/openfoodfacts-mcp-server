@@ -6,15 +6,17 @@
  * A tag search reads its matches as a stream of codes in code order: the rarest include's postings,
  * merged with each filter whose postings cost less to read whole than to seek (SQLite reads every
  * merged list once, in order, combining them with `INTERSECT` and `EXCEPT`), and a `product_tags`
- * primary-key seek per streamed code into each other filter. It counts the stream, or, with at most
- * one include, that include's postings (every product, with none) less the union of the
- * exclusions' postings within them, whichever reads less. Its page is cut whichever of two ways
- * costs less for that page: a walk of the sort key's index in search order (from the end, for a
- * page nearer the end), seeking every filter's postings for each product it passes until it
- * reaches the page; or the stream, its codes' sort keys taken from `SORT_KEYS_INDEX` and ordered in
- * a temporary B-tree. A walk costs what precedes the page, the stream what it reads and what
- * matches. Only the page's own documents are read. On a store still missing an index, the cuts
- * that do without it serve the same pages, slower.
+ * primary-key seek per streamed code into each other filter. An include may be an any-of list of
+ * tags: driving, its tags' postings are merged with `UNION`; otherwise it is sought, up to one seek
+ * per tag, and never merged. An exclusion list is one exclusion per tag. It counts the stream, or,
+ * with at most one include, of one tag, that include's postings (every product, with none) less
+ * the union of the exclusions' postings within them, whichever reads less. Its page is cut
+ * whichever of two ways costs less for that page: a walk of the sort key's index in search order
+ * (from the end, for a page nearer the end), seeking every filter's postings for each product it
+ * passes until it reaches the page; or the stream, its codes' sort keys taken from
+ * `SORT_KEYS_INDEX` and ordered in a temporary B-tree. A walk costs what precedes the page, the
+ * stream what it reads and what matches. Only the page's own documents are read. On a store still
+ * missing an index, the cuts that do without it serve the same pages, slower.
  * @module services/mirror/mirror-queries
  */
 
@@ -38,10 +40,14 @@ export type MirrorDoc = MirrorRecord['doc'];
 /** A tag facet the store indexes, named as `MIRROR_TAG_FACETS` names it. */
 export type MirrorTagFacet = (typeof MIRROR_TAG_FACETS)[number];
 
-/** One tag filter. `value` is canonical, as the taxonomy service's `canonicalizeTag` returns it. */
+/**
+ * One tag filter. `value` is canonical, as the taxonomy service's `canonicalizeTag` returns it; a
+ * list matches a product carrying any of its values (a repeated value counts once), and an empty
+ * list is no filter.
+ */
 export interface MirrorTagFilter {
   facet: MirrorTagFacet;
-  value: string;
+  value: string | readonly string[];
 }
 
 /** A sort key of the search tool, each a `products` column. */
@@ -95,41 +101,54 @@ export interface MirrorTagPage {
 }
 
 /**
+ * A product row as a barcode lookup reads it: its doc, and the `MIRROR_RECORD_VERSION` the row was
+ * built with, which a reload in progress leaves older on the rows it has not yet rewritten.
+ */
+export interface StoredProduct {
+  doc: MirrorDoc;
+  recordVersion: number;
+}
+
+/**
  * Looks barcodes up as Product Opener does, by the code `normalizeCodeZeroes` makes of each, so
  * `030000010402` finds the product stored as `0030000010402`. The map holds an entry for each input
  * barcode the store has, keyed by the barcode as given; a barcode it lacks has none. Inputs that
- * normalize to one code, a duplicate included, share one parsed document.
+ * normalize to one code, a duplicate included, share one parsed row.
  */
 export async function getByCodes(
   store: MirrorReader,
   codes: readonly string[],
-): Promise<Map<string, MirrorDoc>> {
+): Promise<Map<string, StoredProduct>> {
   const handle = await store.raw();
   const keys = new Map(codes.map((code) => [code, normalizeCodeZeroes(code)]));
   const stored = new Map(
     handle
-      .prepare<{ code: string; doc: string }>(
-        'SELECT code, doc FROM products WHERE code IN (SELECT value FROM json_each(?))',
+      .prepare<{ code: string; doc: string; record_version: number }>(
+        'SELECT code, doc, record_version FROM products WHERE code IN (SELECT value FROM json_each(?))',
       )
       .all(JSON.stringify([...new Set(keys.values())]))
-      .map((row): [string, MirrorDoc] => [row.code, JSON.parse(row.doc)]),
+      .map((row): [string, StoredProduct] => [
+        row.code,
+        { doc: JSON.parse(row.doc), recordVersion: row.record_version },
+      ]),
   );
-  const found = new Map<string, MirrorDoc>();
+  const found = new Map<string, StoredProduct>();
   for (const [code, key] of keys) {
-    const doc = stored.get(key);
-    if (doc !== undefined) found.set(code, doc);
+    const product = stored.get(key);
+    if (product !== undefined) found.set(code, product);
   }
   return found;
 }
 
 /**
- * Serves one page of a tag-only search: products matching every `include` filter and no `exclude`
- * filter, ordered by `sortBy` descending, products lacking it last as a live search places them,
- * `code` ascending breaking ties.
+ * Serves one page of a tag-only search: products matching every `include` filter (a list: any of
+ * its values) and no `exclude` filter (a list: none of its values), ordered by `sortBy` descending,
+ * products lacking it last as a live search places them, `code` ascending breaking ties.
  * `total` is exact and every page is servable; a page past the last returns no products and the
- * same total. An included tag no stored product carries matches nothing, so the search answers a
- * total of 0 without reading a posting; an excluded one excludes nothing and is dropped. With no
- * include at all, every stored product is a candidate.
+ * same total. An include none of whose values a stored product carries matches nothing, so the
+ * search answers a total of 0 without reading a posting; a value no stored product carries is
+ * otherwise dropped, from a list or as an exclusion. A list repeated, in any order, is read once.
+ * With no include at all, every stored product is a candidate.
  *
  * Count, page, and documents are read in one transaction, so they describe one state of the store
  * while a refresh writes to it.
@@ -141,21 +160,32 @@ export async function searchByTags(
   const handle = await store.raw();
   const column = SORT_KEY_COLUMNS[search.sortBy ?? 'popularity_key'];
   const offset = (search.page - 1) * search.pageSize;
-  const includeKeys = new Set(search.include.map(storedKey));
-  const excludeKeys = new Set(search.exclude.map(storedKey));
+  const includeLists = [
+    ...new Map(
+      search.include
+        .map(storedKeys)
+        .filter((keys) => keys.length > 0)
+        .map((keys) => [JSON.stringify(keys), keys]),
+    ).values(),
+  ];
+  // Excluding a list excludes each of its values.
+  const excludeKeys = new Set(search.exclude.flatMap(storedKeys));
 
   return handle.transaction(() => {
-    const ids = tagIds(handle, [...includeKeys, ...excludeKeys]);
-    const included: number[] = [];
-    for (const key of includeKeys) {
-      const id = ids.get(key);
-      if (id === undefined) return { total: 0, docs: [] };
-      included.push(id);
+    const idOf = tagIds(handle, [...includeLists.flat(), ...excludeKeys]);
+    const included: number[][] = [];
+    for (const keys of includeLists) {
+      const ids = keys.flatMap((key) => idOf.get(key) ?? []);
+      if (ids.length === 0) return { total: 0, docs: [] };
+      included.push(ids);
     }
-    const withPostings = (id: number): PostingList => ({ id, postings: postingCount(handle, id) });
+    const withPostings = (ids: readonly number[]): PostingList => ({
+      ids,
+      postings: ids.reduce((sum, id) => sum + postingCount(handle, id), 0),
+    });
     const excluded = [...excludeKeys].flatMap((key) => {
-      const id = ids.get(key);
-      return id === undefined ? [] : [withPostings(id)];
+      const id = idOf.get(key);
+      return id === undefined ? [] : [withPostings([id])];
     });
 
     // Rarest include first: it drives the stream, and a walk checks it first.
@@ -181,8 +211,8 @@ export async function searchByTags(
             from: plan.from,
             ...checks(
               'w.code',
-              ranked.map(({ id }) => id),
-              excluded.map(({ id }) => id),
+              ranked.map(({ ids }) => ids),
+              excluded.flatMap(({ ids }) => ids),
             ),
           };
 
@@ -221,9 +251,12 @@ interface MatchSource {
   params: SqlValue[];
 }
 
-/** A stored tag a filter names, with the products carrying it. */
+/**
+ * The stored tags a filter names (any of them, for a list) and their postings summed: the products
+ * carrying the tag, for one, and at most that many for several, as a product can carry two.
+ */
 interface PostingList {
-  id: number;
+  ids: readonly number[];
   postings: number;
 }
 
@@ -237,11 +270,14 @@ interface MatchStream extends MatchSource {
 }
 
 /**
- * The codes in any of `base`'s posting lists (at least one), in every `include`'s, and in no
- * `exclude`'s. A filter whose postings cost no more to read whole than seeking every base posting
- * in them is merged: SQLite reads each merged list once, in code order, and combines them as it
- * goes, `UNION` across the base, then `INTERSECT` and `EXCEPT`. Every other filter is sought, one
- * posting seek per code the merge yields.
+ * The codes in any tag of `base`'s posting lists (at least one), in a tag of every `include`'s, and
+ * in no `exclude`'s. A filter of one tag whose postings cost no more to read whole than seeking
+ * every base posting in them is merged: SQLite reads each merged list once, in code order, and
+ * combines them as it goes, `UNION` across the base's tags, then `INTERSECT` and `EXCEPT`. Every
+ * other filter is sought: for each code the merge yields, a posting seek into each tag it names
+ * until one holds the code. A list of several tags beside the base is never merged: read as one
+ * term, its postings arrive in code order only tag by tag, and SQLite sorts them in a temporary
+ * B-tree before it can merge them.
  */
 function matchStream(
   base: readonly PostingList[],
@@ -249,36 +285,37 @@ function matchStream(
   exclude: readonly PostingList[],
 ): MatchStream {
   const reach = postingsOf(base);
-  const merged = ({ postings }: PostingList) => postings <= reach * POSTINGS_PER_SEEK;
+  const merged = ({ ids, postings }: PostingList) =>
+    ids.length === 1 && postings <= reach * POSTINGS_PER_SEEK;
   const mergedIn = include.filter(merged);
   const mergedOut = exclude.filter(merged);
   const read = [...base, ...mergedIn, ...mergedOut];
   const sought = checks(
     'd.code',
-    include.filter((list) => !merged(list)).map(({ id }) => id),
-    exclude.filter((list) => !merged(list)).map(({ id }) => id),
+    include.filter((list) => !merged(list)).map(({ ids }) => ids),
+    exclude.filter((list) => !merged(list)).flatMap(({ ids }) => ids),
   );
   const cost = postingsOf(read) / POSTINGS_PER_SEEK + (sought.clauses.length > 0 ? reach : 0);
-  const only = read.length === 1 ? read[0] : undefined;
+  const only = read.length === 1 && read[0]?.ids.length === 1 ? read[0] : undefined;
   if (only !== undefined) {
     return {
       from: 'product_tags d',
       clauses: ['d.tag_id = ?', ...sought.clauses],
-      params: [only.id, ...sought.params],
+      params: [...only.ids, ...sought.params],
       cost,
       ...(sought.clauses.length === 0 && { count: only.postings }),
     };
   }
   const postings = 'SELECT code FROM product_tags WHERE tag_id = ?';
   const compound = [
-    base.map(() => postings).join(' UNION '),
+    base.flatMap(({ ids }) => ids.map(() => postings)).join(' UNION '),
     ...mergedIn.map(() => `INTERSECT ${postings}`),
     ...mergedOut.map(() => `EXCEPT ${postings}`),
   ].join(' ');
   return {
     from: `(${compound}) AS d`,
     clauses: sought.clauses,
-    params: [...read.map(({ id }) => id), ...sought.params],
+    params: [...read.flatMap(({ ids }) => ids), ...sought.params],
     cost,
   };
 }
@@ -289,9 +326,11 @@ function postingsOf(lists: readonly PostingList[]): number {
 }
 
 /**
- * Every match, exact: what `matches` yields, or, with at most one include, that include's postings
- * (every product, with none) less the union of the exclusions' postings within them, whichever
- * reads less. The subtraction reads an include's postings only where it merges them.
+ * Every match, exact: what `matches` yields, or, with at most one include, of one tag, that
+ * include's postings (every product, with none) less the union of the exclusions' postings within
+ * them, whichever reads less. The subtraction reads an include's postings only where it merges
+ * them. A list's summed postings count twice a product carrying two of its tags, so a list is
+ * counted from the stream.
  */
 function countMatches(
   handle: SqliteHandle,
@@ -299,7 +338,8 @@ function countMatches(
   excluded: readonly PostingList[],
   matches: MatchStream | undefined,
 ): number {
-  if (ranked.length <= 1 && excluded.length > 0) {
+  const exactPostings = ranked.length === 0 || (ranked.length === 1 && ranked[0]?.ids.length === 1);
+  if (exactPostings && excluded.length > 0) {
     const removed = matchStream(excluded, ranked, []);
     if (matches === undefined || removed.cost <= matches.cost) {
       return (ranked[0]?.postings ?? productCount(handle)) - streamCount(handle, removed);
@@ -325,22 +365,28 @@ function productCount(handle: SqliteHandle): number {
   return countOf(handle, 'SELECT COUNT(*) AS n FROM products', []);
 }
 
-/** A posting seek per filter on the product `code` names. */
+/**
+ * Posting seeks on the product `code` names: per include, into each of its tags (`IN` for a list,
+ * which any of them satisfies), and per excluded tag.
+ */
 function checks(
   code: string,
-  included: readonly number[],
+  included: readonly (readonly number[])[],
   excluded: readonly number[],
 ): Omit<MatchSource, 'from'> {
+  const tagIn = (ids: readonly number[]) =>
+    ids.length === 1 ? '= ?' : `IN (${ids.map(() => '?').join(', ')})`;
   return {
     clauses: [
       ...included.map(
-        () => `EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id = ? AND i.code = ${code})`,
+        (ids) =>
+          `EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id ${tagIn(ids)} AND i.code = ${code})`,
       ),
       ...excluded.map(
         () => `NOT EXISTS (SELECT 1 FROM product_tags x WHERE x.tag_id = ? AND x.code = ${code})`,
       ),
     ],
-    params: [...included, ...excluded],
+    params: [...included.flat(), ...excluded],
   };
 }
 
@@ -412,9 +458,10 @@ function whereOf(clauses: readonly string[]): string {
   return clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
 }
 
-/** A filter's `tags.key`. */
-function storedKey({ facet, value }: MirrorTagFilter): string {
-  return mirrorTagKey(facet, toStoredTag(facet, value));
+/** A filter's `tags.key`s, one per distinct value, sorted; none for an empty list. */
+function storedKeys({ facet, value }: MirrorTagFilter): string[] {
+  const values = typeof value === 'string' ? [value] : value;
+  return [...new Set(values.map((v) => mirrorTagKey(facet, toStoredTag(facet, v))))].sort();
 }
 
 /**

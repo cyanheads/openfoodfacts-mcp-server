@@ -2,8 +2,8 @@
   "schema": "1002",
   "shape": "as_sold",
   "code": "0006423460193",
-  "capturedAt": "2026-11-01T13:07:44.815Z",
-  "request": "/api/v2/product/0006423460193.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:00:42.526Z",
+  "request": "/api/v2/product/0006423460193.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0006423460193",
@@ -1297,6 +1297,7 @@
         "en:environmental-score-production-system-no-label"
       ],
       "ecoscore_grade": "unknown",
+      "generic_name": "",
       "ingredients": [
         {
           "ciqual_proxy_food_code": "31016",
@@ -1569,6 +1570,12 @@
       "labels_tags": [],
       "last_modified_t": 1764919024,
       "nova_group": 4,
+      "nutrient_levels": {
+        "fat": "high",
+        "salt": "low",
+        "saturated-fat": "high",
+        "sugars": "high"
+      },
       "nutriments": {
         "calcium": 0.098,
         "calcium_100g": 0.098,

@@ -2,8 +2,8 @@
   "schema": "le1000",
   "shape": "per_100ml",
   "code": "0008295661012",
-  "capturedAt": "2026-11-01T13:06:00.805Z",
-  "request": "/api/v2/product/0008295661012.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:02:06.528Z",
+  "request": "/api/v2/product/0008295661012.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0008295661012",
@@ -1157,6 +1157,12 @@
       "labels_tags": ["en:no-gmos", "en:non-gmo-project"],
       "last_modified_t": 1718833836,
       "nova_group": 2,
+      "nutrient_levels": {
+        "fat": "low",
+        "salt": "low",
+        "saturated-fat": "low",
+        "sugars": "high"
+      },
       "nutriments": {
         "calcium": 0,
         "calcium_100g": 0,

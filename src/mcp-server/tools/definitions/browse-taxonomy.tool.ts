@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import { getTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
 import { mdInline, mdInlineCode } from '@/utils/markdown.js';
 
 /**
@@ -16,7 +16,7 @@ const TAXONOMY_LIMIT_CAP = 200;
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
   description:
-    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it returns only a small reference list for each facet except NOVA groups and Nutri-Score grades, which are complete. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:no-gluten", "en:crustaceans"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural ("kombucha" resolves to "en:kombuchas"), so use the returned id rather than constructing one.',
+    'Resolve a human term to the canonical Open Food Facts tag ID that off_search_products filters on. Covers categories, labels/certifications, allergens, additives, countries, ingredients, NOVA groups, and Nutri-Score grades. Pass a search term to resolve against the Open Food Facts vocabulary, which holds tens of thousands of tags; omitting it returns only a small reference list for each facet except NOVA groups and Nutri-Score grades, which are complete, and ingredients, which has no reference list and returns nothing. Most tag IDs use the "en:" prefix (e.g. "en:organic", "en:no-gluten", "en:crustaceans"); NOVA groups return bare digits "1"-"4" and Nutri-Score grades bare letters "a"-"e". Pass the id through to off_search_products exactly as returned. Category tags are frequently plural ("kombucha" resolves to "en:kombuchas") and ingredient tags singular ("oat" resolves to "en:oat", "oats" to nothing), so use the returned id rather than constructing one.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -31,17 +31,18 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
         'allergens',
         'additives',
         'countries',
+        'ingredients',
         'nova_groups',
         'nutrition_grades',
       ])
       .describe(
-        '"categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "nova_groups" and "nutrition_grades" are closed vocabularies returned complete; the other five are resolved against the Open Food Facts taxonomy.',
+        '"categories" covers food categories (en:cheeses, en:breakfast-cereals). "labels" covers certifications (en:organic, en:fair-trade). "allergens" covers declared allergens (en:milk, en:gluten). "additives" covers E-numbers (en:e322). "countries" covers country-of-sale tags (en:france). "ingredients" covers the ingredients Open Food Facts parses from ingredient lists (en:inulin, en:oat); it has no reference list, so pass a search term. "nova_groups" and "nutrition_grades" are closed vocabularies returned complete; the other six are resolved against the Open Food Facts taxonomy.',
       ),
     search: z
       .string()
       .optional()
       .describe(
-        'Term to resolve. Matched case-insensitively as a substring of the tag ID, the display name, or a common synonym of either ("shellfish" resolves to en:crustaceans, "gluten free" to en:no-gluten). A single word works best ("hummus", not "hummus dip"). Omit only to see a small reference list — Open Food Facts cannot list the full vocabulary without a term, so an unfiltered call is not a view of the full facet.',
+        'Term to resolve. Matched case-insensitively as a substring of the tag ID, the display name, or a common synonym of either ("shellfish" resolves to en:crustaceans, "gluten free" to en:no-gluten); the tag the term itself names leads the list even when neither its ID nor its name contains the term as typed ("plant based milk alternatives" → en:plant-based-milk-alternatives). A single word works best ("hummus", not "hummus dip"). Omit only to see a small reference list (none for ingredients) — Open Food Facts cannot list the full vocabulary without a term, so an unfiltered call is not a view of the full facet.',
       ),
     // `.int()` would advertise a `maximum` of 2^53 - 1 for a value the handler clamps to the cap.
     limit: z
@@ -56,7 +57,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .min(1)
       .default(20)
       .describe(
-        `Maximum entries to return (default 20). One call returns at most ${TAXONOMY_LIMIT_CAP}: a larger value returns the first ${TAXONOMY_LIMIT_CAP} and, when more matched, says how many did. There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag spelling the term itself (e.g. "lentil" → en:lentils) is listed first among the live matches, so it is not the one a small limit cuts.`,
+        `Maximum entries to return (default 20). One call returns at most ${TAXONOMY_LIMIT_CAP}: a larger value returns the first ${TAXONOMY_LIMIT_CAP} and, when more matched, says how many did. There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag the term itself names (e.g. "lentil" → en:lentils, "US" → en:united-states) is listed first, so it is not the one a small limit cuts.`,
       ),
   }),
 
@@ -89,7 +90,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .string()
       .optional()
       .describe(
-        `Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, that the live vocabulary went unchecked and why (unreachable or no usable answer, Open Food Facts rate-limiting this server, or this server's own taxonomy budget spent, with the wait in seconds when one is known), that nothing matched and why, or that the limit cut matches, naming how many matched and the next call: a larger limit while one would list more, otherwise a narrower term, which is the only route past the first ${TAXONOMY_LIMIT_CAP} (a limit above ${TAXONOMY_LIMIT_CAP} is named too).`,
+        `Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, or that ingredients, which has none, needs a search term, that the live vocabulary went unchecked and why (unreachable or no usable answer, Open Food Facts rate-limiting this server, or this server's own taxonomy budget spent, with the wait in seconds when one is known), that nothing matched and why, or that the limit cut matches, naming how many matched and the next call: a larger limit while one would list more, otherwise a narrower term, which is the only route past the first ${TAXONOMY_LIMIT_CAP} (a limit above ${TAXONOMY_LIMIT_CAP} is named too).`,
       ),
     truncated: z.boolean().optional().describe('True when more tags exist beyond the limit.'),
     shown: z.number().optional().describe('Number of tags returned.'),
@@ -109,7 +110,7 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     const svc = getTaxonomyService();
     const limit = Math.min(input.limit, TAXONOMY_LIMIT_CAP);
     // The service trims and treats a blank term as absent, so the raw input goes through as given.
-    const result = await svc.search(input.facet as Facet, input.search, limit, ctx);
+    const result = await svc.search(input.facet, input.search, limit, ctx);
 
     ctx.log.info('Taxonomy browsed', {
       facet: input.facet,

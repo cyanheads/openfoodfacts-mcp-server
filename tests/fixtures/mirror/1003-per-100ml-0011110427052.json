@@ -2,8 +2,8 @@
   "schema": "1003",
   "shape": "per_100ml",
   "code": "0011110427052",
-  "capturedAt": "2026-11-01T13:11:39.498Z",
-  "request": "/api/v2/product/0011110427052.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:01:04.444Z",
+  "request": "/api/v2/product/0011110427052.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0011110427052",
@@ -1329,6 +1329,12 @@
       "ingredients_text": "CULTURED MILK, SALT, TAPIOCA STARCH, GUAR GUM, SODIUM CITRATE, LOCUST BEAN GUM, CARRAGEENAN, VITAMIN A PALMITATE, AND VITAMIN D3.",
       "last_modified_t": 1775998836,
       "nova_group": 4,
+      "nutrient_levels": {
+        "fat": "low",
+        "salt": "moderate",
+        "saturated-fat": "low",
+        "sugars": "moderate"
+      },
       "nutriments": {
         "added-sugars": 0,
         "added-sugars_100g": 0,

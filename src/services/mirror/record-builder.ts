@@ -33,7 +33,26 @@ import {
 import { BARCODE_PATTERN } from '@/services/openfoodfacts/types.js';
 
 /** Bumped whenever the projection or tag set changes; the store re-ingests every row stamped with an older version. */
-export const MIRROR_RECORD_VERSION = 1;
+export const MIRROR_RECORD_VERSION = 2;
+
+/**
+ * The record version that added each doc field a version-1 row lacks: 2 added `generic_name` and
+ * `nutrient_levels`. A `Map`, since the fields it is asked about come from a read's request.
+ */
+const FIELD_SINCE: ReadonlyMap<string, number> = new Map([
+  ['generic_name', 2],
+  ['nutrient_levels', 2],
+]);
+
+/**
+ * Which of `fields` a row stamped `recordVersion` lacks, in the order given: each one a later
+ * version added. A row would answer a read of them with the fields missing, so that read tries
+ * them live until a reload rewrites the row. A field no version added beyond the first, or one the
+ * doc never holds, is never listed.
+ */
+export function fieldsNewerThan(recordVersion: number, fields: Iterable<string>): string[] {
+  return [...fields].filter((field) => (FIELD_SINCE.get(field) ?? 1) > recordVersion);
+}
 
 export interface MirrorRecord {
   /** Barcode normalized as Product Opener's normalize_code_zeroes does. The primary key. */
@@ -43,7 +62,8 @@ export interface MirrorRecord {
    * What GET /api/v2/product/{code}?fields=<every field the service requests> returns under `product`,
    * covering the union of the product-read, compare, and v2-search `fields` lists the service sends.
    * Plus `_input_sets` (the record's nutrition.input_sets, upgraded for pre-1003 records) only when the
-   * projected `nutriments` hold `_prepared` figures and no as-sold one. JSON-serializable.
+   * projected `nutriments` hold `_prepared` figures and no as-sold one. JSON-serializable. A field
+   * added after version 1 is in `FIELD_SINCE` with the version that added it.
    */
   doc: Record<string, unknown>;
   lastModifiedT: number | null;
@@ -54,10 +74,13 @@ export interface MirrorRecord {
 }
 
 /**
- * The facets the store indexes: every tag filter the search tool's tag-only path accepts at HEAD
- * 0c50ace, and nothing else. Each names the stored `<facet>_tags` field it reads, so `traces`
- * (filtered through the allergen vocabulary) is its own facet, and NOVA and Nutri-Score are the
- * `nova_groups` and `nutrition_grades` tag fields the tag path filters on.
+ * The facets the store indexes: every tag filter the search tool's tag-only path accepts, and
+ * nothing else. Each names the stored `<facet>_tags` field it reads, so `traces` (filtered through
+ * the allergen vocabulary) is its own facet, and NOVA, Nutri-Score, and Green-Score are the
+ * `nova_groups`, `nutrition_grades`, and `environmental_score` tag fields the tag path filters on.
+ * Green-Score reads `environmental_score_tags`, the field `/api/v2/search` filters on, not the
+ * `ecoscore_tags` copy an older record may hold alone; rows carry it from
+ * `GREEN_SCORE_RECORD_VERSION`.
  */
 export const MIRROR_TAG_FACETS = [
   'categories',
@@ -69,8 +92,16 @@ export const MIRROR_TAG_FACETS = [
   'additives',
   'nutrition_grades',
   'nova_groups',
+  'environmental_score',
   'countries',
 ] as const;
+
+/**
+ * The record version from which rows carry the `environmental_score` facet. A row built earlier
+ * has no Green-Score tag, and only a full load rewrites every row, so a store serves a Green-Score
+ * search only once a full load built at this version or later has completed.
+ */
+export const GREEN_SCORE_RECORD_VERSION = 2;
 
 const TAG_FACETS: ReadonlySet<string> = new Set(MIRROR_TAG_FACETS);
 
@@ -999,6 +1030,7 @@ export function buildMirrorRecord(p: unknown): MirrorRecord | null {
   };
   set('code', code);
   set('product_name', languageField(p, 'product_name', lc));
+  set('generic_name', languageField(p, 'generic_name', lc));
   set('brands', v2Brands(p, from));
   set('quantity', p.quantity);
   set('ingredients_text', languageField(p, 'ingredients_text', lc));
@@ -1017,6 +1049,8 @@ export function buildMirrorRecord(p: unknown): MirrorRecord | null {
   set('nutriscore_grade', p.nutriscore_grade);
   set('nova_group', p.nova_group);
   set('ecoscore_grade', v2EcoscoreGrade(p, from));
+  // Stored as computed: the v2 read copies it through every schema downgrade unchanged.
+  set('nutrient_levels', p.nutrient_levels);
   set('nutriments', nutriments);
   set('serving_size', downgraded && servingSize === '' ? undefined : servingSize);
   if (!downgraded) {

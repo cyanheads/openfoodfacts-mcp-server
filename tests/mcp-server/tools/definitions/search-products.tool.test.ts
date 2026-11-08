@@ -19,7 +19,11 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', async (importOrigin
 
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
 import { TagIds } from '@/services/mirror/mirror-ingester.js';
-import { encodeCheckpoint, openMirrorStore } from '@/services/mirror/mirror-store.js';
+import {
+  encodeCheckpoint,
+  openMirrorStore,
+  writeMirrorLoad,
+} from '@/services/mirror/mirror-store.js';
 import { buildMirrorRecord } from '@/services/mirror/record-builder.js';
 import {
   BudgetExhaustedError,
@@ -43,6 +47,8 @@ const mockSearchProducts = vi.fn();
 const mockSuggestTaxonomy = vi.fn();
 /** Whether the local mirror is ready. False by default, the answer with `OFF_MIRROR_PATH` unset. */
 const mockMirrorReady = vi.fn();
+/** Whether the ready mirror's last full load indexed Green-Score. False by default. */
+const mockMirrorIndexesGreenScore = vi.fn();
 
 /** Create the contract-bearing context wired by the production handler factory. */
 function createToolContext() {
@@ -123,8 +129,11 @@ describe('off_search_products', () => {
     mockSuggestTaxonomy.mockResolvedValue([]);
     mockMirrorReady.mockReset();
     mockMirrorReady.mockResolvedValue(false);
+    mockMirrorIndexesGreenScore.mockReset();
+    mockMirrorIndexesGreenScore.mockResolvedValue(false);
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
       mirrorReady: mockMirrorReady,
+      mirrorIndexesGreenScore: mockMirrorIndexesGreenScore,
       searchProducts: mockSearchProducts,
       suggestTaxonomy: mockSuggestTaxonomy,
     } as never);
@@ -209,7 +218,7 @@ describe('off_search_products', () => {
 
   it('renders the prose enrichment fields as labelled sentences, not code spans', () => {
     const trailer = offSearchProductsTool.enrichmentTrailer;
-    const sentence = 'page_size 80 is above the 50 results one call returns.';
+    const sentence = 'page_size 150 is above the 100 results one call returns.';
 
     expect(trailer?.page_size_capped?.render?.(sentence)).toBe(`**Page size:** ${sentence}`);
     expect(trailer?.exclusion_coverage?.render?.(sentence)).toBe(`**Exclusions:** ${sentence}`);
@@ -3254,6 +3263,7 @@ describe('off_search_products', () => {
       // page * page_size at exactly 10,000 is served, and the next page is not; page_size 3
       // reaches 9,999 at page 3,333, so the bound is on the product, never a rounded page count.
       const BOUNDARIES = [
+        { pageSize: 100, lastServed: 100 },
         { pageSize: 50, lastServed: 200 },
         { pageSize: 1, lastServed: 10_000 },
         { pageSize: 3, lastServed: 3_333 },
@@ -3307,12 +3317,12 @@ describe('off_search_products', () => {
 
       it('refuses past the window on both surfaces, naming the window, the page, and the reachable page', async () => {
         mockMirrorReady.mockResolvedValue(true);
-        const expected = windowRefusal(201, 50, 'page_size 80 served at 50');
+        const expected = windowRefusal(101, 100, 'page_size 150 served at 100');
 
         const result = await runToolContract(offSearchProductsTool, {
           categories_tag: 'en:spreads',
-          page: 201,
-          page_size: 80,
+          page: 101,
+          page_size: 150,
         });
 
         expect(result.isError).toBe(true);
@@ -3376,17 +3386,17 @@ describe('off_search_products', () => {
 
       it('keeps the text-window refusal as it was', async () => {
         // Characterization: the mirror's window leaves the text path's refusal untouched.
-        expect(await refusal({ query: 'spread', page: 201, page_size: 80 })).toEqual({
+        expect(await refusal({ query: 'spread', page: 101, page_size: 150 })).toEqual({
           message:
-            'The text backend serves only the first 10000 results, and page 201 at page_size 80 served at 50 asks for result 10050.',
+            'The text backend serves only the first 10000 results, and page 101 at page_size 150 served at 100 asks for result 10100.',
           data: {
             reason: 'page_out_of_range',
-            page: 201,
-            page_size: 50,
-            max_page: 200,
+            page: 101,
+            page_size: 100,
+            max_page: 100,
             result_window: 10_000,
             recovery: {
-              hint: 'Request page 200 or lower at page_size 50, or add filters so the products you need rank inside the first 10000 results.',
+              hint: 'Request page 100 or lower at page_size 100, or add filters so the products you need rank inside the first 10000 results.',
             },
             retryable: false,
           },
@@ -3414,22 +3424,22 @@ describe('off_search_products', () => {
     it('names the next page past 10 when a capped page_size reaches it', async () => {
       mockMirrorReady.mockResolvedValue(true);
       mockMirrorPage({
-        count: 600,
+        count: 1200,
         page: 10,
-        page_count: 50,
-        page_size: 50,
+        page_count: 100,
+        page_size: 100,
         products: [{ code: '1234567890001' }],
       });
 
       const result = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:spreads',
         page: 10,
-        page_size: 80,
+        page_size: 150,
       });
 
       expect(result.structuredContent).toMatchObject({ last_page: 12, truncated: true });
       expect((result.structuredContent as Record<string, unknown>).page_size_capped).toBe(
-        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 11 for results 501–550.',
+        'page_size 150 is above the 100 results one call returns; this page was served at page_size 100. Pages are counted at that size: request page 11 for results 1001–1100.',
       );
     });
 
@@ -3624,7 +3634,7 @@ describe('off_search_products', () => {
         (e) => e.reason === 'page_out_of_range',
       );
       expect(pageBound?.when).toContain(
-        'asks for a page past 10 and would read the live database — this server keeps no ready local copy of the export, or a tag value is one it cannot confirm',
+        'asks for a page past 10 and would read the live database — this server keeps no ready local copy of the export, a tag value is one it cannot confirm, or the search carries ecoscore_grade before a full reload of that copy has indexed Green-Score',
       );
       expect(pageBound?.when).toContain(
         'or one the local copy serves beyond its 10000-result window',
@@ -3970,24 +3980,30 @@ describe('off_search_products', () => {
     });
   });
 
-  // ── #57: an over-cap page_size is served at 50 ────────────────────────────
+  // ── #57, #86: an over-cap page_size is served at 100 ──────────────────────
 
-  describe('page_size above the per-call cap (#57)', () => {
-    /** One page of a counted tag search, filled to `page_count` placeholder rows. */
-    function mockTagPage(count: number, page: number, pageCount: number): void {
+  describe('page_size above the per-call cap (#57, #86)', () => {
+    /** One page of a counted search at the served 100, filled to `page_count` placeholder rows. */
+    function mockTagPage(
+      count: number,
+      page: number,
+      pageCount: number,
+      extra: Record<string, unknown> = {},
+    ): void {
       mockSearch({
         count,
         page,
         page_count: pageCount,
-        page_size: 50,
+        page_size: 100,
         products: Array.from({ length: pageCount }, (_, i) => ({
-          code: String(1_000_000_000_000 + (page - 1) * 50 + i),
+          code: String(1_000_000_000_000 + (page - 1) * 100 + i),
         })),
+        ...extra,
       });
     }
 
-    it.each([10_001, 1e21])('serves page_size %d at 50 with its notice', async (size) => {
-      mockTagPage(163, 1, 50);
+    it.each([10_001, 1e21])('serves page_size %d at 100 with its notice', async (size) => {
+      mockTagPage(163, 1, 100);
 
       const result = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
@@ -3996,28 +4012,28 @@ describe('off_search_products', () => {
 
       expect(result.isError).toBeFalsy();
       expect(mockSearchProducts).toHaveBeenCalledWith(
-        expect.objectContaining({ page: 1, page_size: 50 }),
+        expect.objectContaining({ page: 1, page_size: 100 }),
         expect.anything(),
       );
       const structured = result.structuredContent as Record<string, unknown>;
-      expect(structured).toMatchObject({ page_size: 50, last_page: 4 });
+      expect(structured).toMatchObject({ page_size: 100, last_page: 2 });
       expect(structured.page_size_capped).toBe(
-        `page_size ${size} is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 2 for results 51–100.`,
+        `page_size ${size} is above the 100 results one call returns; this page was served at page_size 100. Pages are counted at that size: request page 2 for results 101–163.`,
       );
     });
 
     it('rejects a text page past the window at the served size for a huge page_size', async () => {
       const result = await runToolContract(offSearchProductsTool, {
         query: 'chocolate',
-        page: 201,
+        page: 101,
         page_size: 1_000_000,
       });
 
       expect(result.structuredContent).toMatchObject({
-        error: { data: { reason: 'page_out_of_range', page_size: 50, max_page: 200 } },
+        error: { data: { reason: 'page_out_of_range', page_size: 100, max_page: 100 } },
       });
       expect(contractHint(result)).toBe(
-        'Request page 200 or lower at page_size 50, or add filters so the products you need rank inside the first 10000 results.',
+        'Request page 100 or lower at page_size 100, or add filters so the products you need rank inside the first 10000 results.',
       );
       expect(mockSearchProducts).not.toHaveBeenCalled();
     });
@@ -4060,30 +4076,30 @@ describe('off_search_products', () => {
       expect(error.message.match(/whole number/g)).toHaveLength(1);
     });
 
-    it('sends page_size 50 for page_size 51 and discloses it on both surfaces', async () => {
-      mockTagPage(163, 1, 50);
+    it('sends page_size 100 for page_size 101 and discloses it on both surfaces', async () => {
+      mockTagPage(163, 1, 100);
 
       const result = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
-        page_size: 51,
+        page_size: 101,
       });
 
       expect(mockSearchProducts).toHaveBeenCalledWith(
-        expect.objectContaining({ page: 1, page_size: 50 }),
+        expect.objectContaining({ page: 1, page_size: 100 }),
         expect.anything(),
       );
       const structured = result.structuredContent as Record<string, unknown>;
-      expect(structured).toMatchObject({ page_size: 50, last_page: 4, cap: 50, shown: 50 });
+      expect(structured).toMatchObject({ page_size: 100, last_page: 2, cap: 100, shown: 100 });
       expect(structured.page_size_capped).toBe(
-        'page_size 51 is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 2 for results 51–100.',
+        'page_size 101 is above the 100 results one call returns; this page was served at page_size 100. Pages are counted at that size: request page 2 for results 101–163.',
       );
       const text = contractText(result);
-      expect(text).toContain('page_size 51 is above the 50 results one call returns');
-      expect(text).toContain('(page 1 of 4, 50 per page, showing 50)');
+      expect(text).toContain('page_size 101 is above the 100 results one call returns');
+      expect(text).toContain('(page 1 of 2, 100 per page, showing 100)');
     });
 
     it.each([20, 50])('echoes page_size %i without a page_size_capped disclosure', async (size) => {
-      mockTagPage(163, 1, Math.min(size, 50));
+      mockTagPage(163, 1, size);
 
       const result = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
@@ -4094,100 +4110,173 @@ describe('off_search_products', () => {
       expect(structured.page_size).toBe(size);
       expect(structured).not.toHaveProperty('page_size_capped');
       expect(structured.cap).toBe(size);
-      expect(contractText(result)).not.toMatch(/above the 50 results/);
+      expect(contractText(result)).not.toMatch(/results one call returns/);
     });
 
-    it('pages an over-cap page_size contiguously at 50, ending on a short page', async () => {
-      // 90 matches at page_size 80: page 1 is results 1–50 and page 2 is results 51–90. The last
-      // page is short, so a rule keyed on the size asked for (80) and one keyed on the size served
-      // (50) disagree about it.
-      mockTagPage(90, 1, 50);
+    it.each<[string, boolean, Record<string, unknown>, Record<string, unknown>]>([
+      ['the live tag path', false, { categories_tag: 'en:spreads' }, {}],
+      [
+        "this server's local copy of the export",
+        true,
+        { categories_tag: 'en:spreads' },
+        { tags_confirmed: true },
+      ],
+      ['the text path', false, { query: 'spread' }, {}],
+    ])(
+      'sends page_size 100 on %s with no page_size_capped disclosure',
+      async (_label, ready, search, confirmed) => {
+        mockMirrorReady.mockResolvedValue(ready);
+        mockTagPage(
+          163,
+          1,
+          100,
+          ready ? { source: 'off_mirror', mirrorAsOf: '2026-10-31T23:59:59.000Z' } : {},
+        );
+
+        const result = await runToolContract(offSearchProductsTool, { ...search, page_size: 100 });
+
+        expect(mockSearchProducts).toHaveBeenCalledWith(
+          { ...search, page: 1, page_size: 100, ...confirmed },
+          expect.anything(),
+        );
+        const structured = result.structuredContent as Record<string, unknown>;
+        expect(structured).toMatchObject({ page_size: 100, last_page: 2, cap: 100, shown: 100 });
+        expect(structured).not.toHaveProperty('page_size_capped');
+        const text = contractText(result);
+        expect(text).toContain('(page 1 of 2, 100 per page, showing 100)');
+        expect(text).not.toMatch(/results one call returns/);
+      },
+    );
+
+    it('pages an over-cap page_size contiguously at 100, ending on a short page', async () => {
+      // 140 matches at page_size 150: page 1 is results 1–100 and page 2 is results 101–140. A
+      // rule keyed on the size asked for (150) would put every match on page 1; one keyed on the
+      // size served (100) leaves a short page 2.
+      mockTagPage(140, 1, 100);
       const first = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
         page: 1,
-        page_size: 80,
+        page_size: 150,
       });
-      mockTagPage(90, 2, 40);
+      mockTagPage(140, 2, 40);
       const second = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
         page: 2,
-        page_size: 80,
+        page_size: 150,
       });
 
       expect(
         mockSearchProducts.mock.calls.map(([params]) => [params.page, params.page_size]),
       ).toEqual([
-        [1, 50],
-        [2, 50],
+        [1, 100],
+        [2, 100],
       ]);
-      expect(first.structuredContent).toMatchObject({ last_page: 2, truncated: true, cap: 50 });
+      expect(first.structuredContent).toMatchObject({ last_page: 2, truncated: true, cap: 100 });
       expect(
         String((first.structuredContent as Record<string, unknown>).page_size_capped),
-      ).toContain('request page 2 for results 51–90');
+      ).toContain('request page 2 for results 101–140');
       const secondOut = second.structuredContent as Record<string, unknown>;
-      expect(secondOut).toMatchObject({ page: 2, last_page: 2, page_size: 50, page_count: 40 });
+      expect(secondOut).toMatchObject({ page: 2, last_page: 2, page_size: 100, page_count: 40 });
       expect(secondOut).not.toHaveProperty('truncated');
       expect(secondOut.page_size_capped).toBe(
-        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50.',
+        'page_size 150 is above the 100 results one call returns; this page was served at page_size 100.',
       );
     });
 
-    it('rejects a text page past the window at the served size, hinting page_size 50', async () => {
+    it('rejects a text page past the window at the served size, hinting page_size 100', async () => {
       const result = await runToolContract(offSearchProductsTool, {
         query: 'chocolate',
-        page: 201,
-        page_size: 80,
+        page: 101,
+        page_size: 150,
       });
 
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({
-        error: { data: { reason: 'page_out_of_range', page: 201, page_size: 50, max_page: 200 } },
+        error: { data: { reason: 'page_out_of_range', page: 101, page_size: 100, max_page: 100 } },
       });
       expect(contractHint(result)).toBe(
-        'Request page 200 or lower at page_size 50, or add filters so the products you need rank inside the first 10000 results.',
+        'Request page 100 or lower at page_size 100, or add filters so the products you need rank inside the first 10000 results.',
       );
       expect(mockSearchProducts).not.toHaveBeenCalled();
     });
 
-    it('sends page 200 of a text search at page_size 50 for page_size 80', async () => {
+    it('sends text page 100 at page_size 100 and refuses page 101 with max_page 100', async () => {
       mockSearch({
         count: 12_000,
-        page: 200,
-        page_count: 50,
-        page_size: 50,
+        page: 100,
+        page_count: 100,
+        page_size: 100,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const inside = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 100,
+        page_size: 100,
+      });
+      const past = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 101,
+        page_size: 100,
+      });
+
+      expect(inside.isError).toBeFalsy();
+      expect(mockSearchProducts).toHaveBeenCalledOnce();
+      expect(mockSearchProducts).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 100, page_size: 100 }),
+        expect.anything(),
+      );
+      expect(inside.structuredContent).toMatchObject({ last_page: 100, truncated: true });
+      expect(past.structuredContent).toMatchObject({
+        error: { data: { reason: 'page_out_of_range', page: 101, page_size: 100, max_page: 100 } },
+      });
+    });
+
+    it('sends page 100 of a text search at page_size 100 for page_size 150', async () => {
+      mockSearch({
+        count: 12_000,
+        page: 100,
+        page_count: 100,
+        page_size: 100,
         products: [{ code: '1234567890001' }],
       });
 
       const result = await runToolContract(offSearchProductsTool, {
         query: 'chocolate',
-        page: 200,
-        page_size: 80,
+        page: 100,
+        page_size: 150,
       });
 
       expect(mockSearchProducts).toHaveBeenCalledWith(
-        expect.objectContaining({ page: 200, page_size: 50 }),
+        expect.objectContaining({ page: 100, page_size: 100 }),
         expect.anything(),
       );
       const structured = result.structuredContent as Record<string, unknown>;
-      expect(structured).toMatchObject({ last_page: 200, cap: 50, truncated: true });
-      // Page 201 is past the window, so the disclosure names no next page.
+      expect(structured).toMatchObject({ last_page: 100, cap: 100, truncated: true });
+      // Page 101 is past the window, so the disclosure names no next page.
       expect(structured.page_size_capped).toBe(
-        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50.',
+        'page_size 150 is above the 100 results one call returns; this page was served at page_size 100.',
       );
     });
 
-    it('names the tag-path reach at the served size when the page is past 10', async () => {
-      const result = await runToolContract(offSearchProductsTool, {
-        categories_tag: 'en:pizzas',
-        page: 11,
-        page_size: 80,
-      });
+    it.each([100, 150])(
+      'names the tag-path reach at page_size 100 for page_size %i past page 10',
+      async (size) => {
+        const result = await runToolContract(offSearchProductsTool, {
+          categories_tag: 'en:pizzas',
+          page: 11,
+          page_size: size,
+        });
 
-      expect(result.structuredContent).toMatchObject({
-        error: { data: { reason: 'page_out_of_range', page_size: 50, max_page: 10 } },
-      });
-      expect(contractHint(result)).toContain('at page_size 50 that reaches the first 500 matches');
-    });
+        expect(result.structuredContent).toMatchObject({
+          error: { data: { reason: 'page_out_of_range', page_size: 100, max_page: 10 } },
+        });
+        expect(contractHint(result)).toBe(
+          'Request page 10 or lower — at page_size 100 that reaches the first 1000 matches — or narrow the filters or change sort_by to bring the products you need forward.',
+        );
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      },
+    );
 
     it('still rejects predicate lists past their bounds, since dropping entries changes the query', async () => {
       const over = {
@@ -4213,18 +4302,18 @@ describe('off_search_products', () => {
     });
 
     it('names no next page on a capped page cut by the tag page bound, as its description says', async () => {
-      mockTagPage(501, 10, 50);
+      mockTagPage(1001, 10, 100);
 
       const result = await runToolContract(offSearchProductsTool, {
         categories_tag: 'en:hummus',
         page: 10,
-        page_size: 80,
+        page_size: 150,
       });
 
       const structured = result.structuredContent as Record<string, unknown>;
       expect(structured).toMatchObject({ truncated: true, last_page: 10 });
       expect(structured.page_size_capped).toBe(
-        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50.',
+        'page_size 150 is above the 100 results one call returns; this page was served at page_size 100.',
       );
       const { page_size_capped } = offSearchProductsTool.enrichment as unknown as Record<
         string,
@@ -4236,9 +4325,14 @@ describe('off_search_products', () => {
     });
 
     it('says what happens above the cap in the page_size description', () => {
-      expect(inputDescription('page_size')).toMatch(/served at 50/);
+      expect(inputDescription('page_size')).toMatch(/served at 100/);
       expect(inputDescription('page_size')).not.toContain('10000');
-      expect(inputDescription('page')).toMatch(/page 2 at page_size 80 is results 51–100/);
+      expect(inputDescription('page')).toContain(
+        'which is at most 100, so repeating one larger page_size pages contiguously (page 2 at page_size 200 is results 101–200)',
+      );
+      expect(inputDescription('page')).toContain(
+        'at page_size 100 it reaches the first 1000 matches',
+      );
     });
   });
 
@@ -4763,6 +4857,762 @@ describe('off_search_products', () => {
       expect(row.ecoscore_grade.description).toContain(term);
     }
   });
+
+  // ── #85: any-of grade filters and the Green-Score filter ─────────────────
+
+  describe('grade filters (#85)', () => {
+    const AS_OF = '2026-10-31T23:59:59.000Z';
+    const TAG_ONLY_EMPTY_NOTICE =
+      'No products found for category="en:breakfast-cereals", nutriscore="b", nova="3". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.';
+    const TEXT_EMPTY_NOTICE =
+      'No products found for query="muesli", nutriscore="b", nova="3". Every word of query must match — in a product name, generic name, category, label, or brand — so one word no product carries empties the result; drop or change words the product may not carry. The text index may not hold recently contributed products, so an empty result here does not settle whether a matching product has been contributed: re-run the same tag filters without query to read the live database or this server\'s local copy of the export, or call off_get_product when the barcode is known.';
+    const INDEX_NOTE =
+      'These results come from the text-search index, a snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them.';
+    const SNAPSHOT_LEAD = `${INDEX_NOTE} The same tag filters without query read the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).`;
+    /** The grade sentence of a text search's snapshot note, after its "The … filter was" subject. */
+    const GRADES_MATCHED =
+      'matched against the grades this index holds, which each row shows; off_get_product returns the current record, whose grades can differ.';
+    const EMPTY = { count: 0, page: 1, page_count: 0, page_size: 20, products: [] };
+
+    /** One run through the contract runner: what the service was handed and both surfaces. */
+    async function run(input: Record<string, unknown>) {
+      mockSearchProducts.mockClear();
+      const result = await runToolContract(offSearchProductsTool, input);
+      return {
+        params: mockSearchProducts.mock.calls[0]?.[0],
+        structured: result.structuredContent as Record<string, unknown>,
+        text: contractText(result),
+        isError: result.isError,
+      };
+    }
+
+    describe('a single grade, as before', () => {
+      it('sends a tag-only search to the live database with each grade as given and echoes each', async () => {
+        mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+        const { params, structured, text } = await run({
+          categories_tag: 'en:breakfast-cereals',
+          nutrition_grade: 'b',
+          nova_group: '3',
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(params).toEqual({
+          page: 1,
+          page_size: 20,
+          categories_tag: 'en:breakfast-cereals',
+          nutrition_grade: 'b',
+          nova_group: '3',
+        });
+        expect(structured).toEqual({
+          total: 0,
+          total_is_lower_bound: false,
+          page: 1,
+          page_size: 20,
+          page_count: 0,
+          source: 'off_api',
+          products: [],
+          notice: TAG_ONLY_EMPTY_NOTICE,
+        });
+        expect(text).toBe(
+          `**No products found** (total: 0)\n\nTry broadening the search terms or checking tag IDs via off_browse_taxonomy.\n\n**Source:** off_api (Open Food Facts)\n\n\n> ${TAG_ONLY_EMPTY_NOTICE}`,
+        );
+      });
+
+      it('flags a tag-only grade search confirmed for a ready mirror and serves it from there', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockSearch({
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+          count: 2,
+          page: 1,
+          page_count: 1,
+          page_size: 20,
+          products: [{ code: '1234567890001', nutriscore_grade: 'b', nova_group: 3 }],
+        });
+
+        const { params, structured } = await run({
+          nutrition_grade: 'b',
+          nova_group: '3',
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(params).toEqual({
+          page: 1,
+          page_size: 20,
+          nutrition_grade: 'b',
+          nova_group: '3',
+          tags_confirmed: true,
+        });
+        expect(structured).toMatchObject({
+          total: 2,
+          source: 'off_mirror',
+          mirror_as_of: AS_OF,
+          products: [{ barcode: '1234567890001', nutriscore_grade: 'b', nova_group: 3 }],
+        });
+        expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+      });
+
+      it('sends a text search with each grade as given and echoes each among the text-path causes', async () => {
+        mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+        const { params, structured } = await run({
+          query: 'muesli',
+          nutrition_grade: 'b',
+          nova_group: '3',
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(params).toEqual({
+          page: 1,
+          page_size: 20,
+          query: 'muesli',
+          nutrition_grade: 'b',
+          nova_group: '3',
+        });
+        expect(structured.notice).toBe(TEXT_EMPTY_NOTICE);
+        expect(structured.text_index_snapshot).toBe(
+          `${SNAPSHOT_LEAD} The nutrition_grade and nova_group filters were ${GRADES_MATCHED}`,
+        );
+      });
+    });
+
+    describe('several grades, any of them', () => {
+      it.each([
+        ['read live', false, {}],
+        ['served from a ready mirror', true, {}],
+        ['on the text path', false, { query: 'muesli' }],
+      ])(
+        'sends a one-element or repeated array as the scalar and answers alike, %s',
+        async (_label, ready, extra) => {
+          mockMirrorReady.mockResolvedValue(ready);
+          mockMirrorIndexesGreenScore.mockResolvedValue(true);
+          mockSearch(ready ? { ...EMPTY, source: 'off_mirror', mirrorAsOf: AS_OF } : EMPTY);
+
+          const runs = [];
+          for (const grades of [
+            { nutrition_grade: 'b', nova_group: '3', ecoscore_grade: 'a-plus' },
+            { nutrition_grade: ['b'], nova_group: ['3'], ecoscore_grade: ['a-plus'] },
+            {
+              nutrition_grade: ['b', 'b'],
+              nova_group: ['3', '3'],
+              ecoscore_grade: ['a-plus', 'a-plus'],
+            },
+          ]) {
+            runs.push(await run({ ...extra, ...grades, page: 1, page_size: 20 }));
+          }
+          const [scalar, ...arrays] = runs;
+
+          expect(scalar?.params).toMatchObject({
+            nutrition_grade: 'b',
+            nova_group: '3',
+            ecoscore_grade: 'a-plus',
+          });
+          for (const array of arrays) expect(array).toEqual(scalar);
+        },
+      );
+
+      it.each([
+        ['read live', false, {}],
+        ['served from a ready mirror that indexes Green-Score', true, { tags_confirmed: true }],
+      ])(
+        'hands several grades to the service as arrays in caller order, each once, %s',
+        async (_label, ready, confirmed) => {
+          mockMirrorReady.mockResolvedValue(ready);
+          mockMirrorIndexesGreenScore.mockResolvedValue(true);
+          mockSearch(EMPTY);
+
+          const { params } = await run({
+            nutrition_grade: ['b', 'a', 'b'],
+            nova_group: ['2', '1'],
+            ecoscore_grade: ['a-plus', 'a'],
+            page: 1,
+            page_size: 20,
+          });
+
+          expect(params).toEqual({
+            page: 1,
+            page_size: 20,
+            nutrition_grade: ['b', 'a'],
+            nova_group: ['2', '1'],
+            ecoscore_grade: ['a-plus', 'a'],
+            ...confirmed,
+          });
+        },
+      );
+
+      it.each([
+        { nutrition_grade: [] },
+        { nova_group: [] },
+        { ecoscore_grade: [] },
+        { nutrition_grade: [], nova_group: [], ecoscore_grade: [] },
+      ])('refuses %j alone as no_filters, sending nothing', async (grades) => {
+        const result = await runToolContract(offSearchProductsTool, {
+          ...grades,
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { data: { reason: 'no_filters' } },
+        });
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      });
+
+      it('names ecoscore_grade in the no_filters recovery on both surfaces', async () => {
+        const result = await runToolContract(offSearchProductsTool, { page: 1, page_size: 20 });
+
+        expect(contractHint(result)).toContain('nutrition_grade, nova_group, ecoscore_grade, or');
+        expect(contractText(result)).toContain('ecoscore_grade');
+      });
+
+      it('treats empty grade arrays beside a query as no grade filter', async () => {
+        mockSearch(EMPTY);
+
+        const { params, structured } = await run({
+          query: 'muesli',
+          nutrition_grade: [],
+          ecoscore_grade: [],
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(params).toEqual({ page: 1, page_size: 20, query: 'muesli' });
+        expect(structured.text_index_snapshot).toBe(
+          `${INDEX_NOTE} A search by tag filters alone, without query, reads the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).`,
+        );
+        expect(String(structured.notice)).toMatch(/^No products found for query="muesli"\. /);
+        expect(String(structured.notice)).toContain('try expressing the product as tag filters');
+      });
+
+      it('echoes several grades as any of them on both surfaces, a single grade as before', async () => {
+        mockSearch(EMPTY);
+
+        const { structured, text } = await run({
+          nutrition_grade: ['a', 'b'],
+          nova_group: '1',
+          ecoscore_grade: ['a-plus', 'a'],
+          page: 1,
+          page_size: 20,
+        });
+
+        const notice =
+          'No products found for nutriscore="a" or "b", nova="1", ecoscore="a-plus" or "a". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.';
+        expect(structured.notice).toBe(notice);
+        expect(text).toContain(`> ${notice}`);
+      });
+
+      it('echoes several grades as any of them among the text-path causes', async () => {
+        mockSearch(EMPTY);
+
+        const { structured } = await run({
+          query: 'muesli',
+          nutrition_grade: ['a', 'b'],
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(String(structured.notice)).toMatch(
+          /^No products found for query="muesli", nutriscore="a" or "b"\. Every word/,
+        );
+      });
+
+      it.each<[Record<string, unknown>, string]>([
+        [{ nutrition_grade: ['a', 'b'] }, 'The nutrition_grade filter was'],
+        [
+          { nutrition_grade: 'a', ecoscore_grade: ['a', 'a-plus'] },
+          'The nutrition_grade and ecoscore_grade filters were',
+        ],
+        [
+          { nutrition_grade: 'a', nova_group: '1', ecoscore_grade: 'a' },
+          'The nutrition_grade, nova_group, and ecoscore_grade filters were',
+        ],
+      ])(
+        "says on a text search carrying %j that the grades matched and shown are the index's",
+        async (grades, lead) => {
+          mockSearch(EMPTY);
+
+          const { structured, text } = await run({
+            query: 'muesli',
+            ...grades,
+            page: 1,
+            page_size: 20,
+          });
+
+          expect(structured.text_index_snapshot).toBe(`${SNAPSHOT_LEAD} ${lead} ${GRADES_MATCHED}`);
+          expect(text).toContain('matched against the grades this index holds');
+        },
+      );
+
+      it('puts the grade sentence before the nutrient constraints it sits beside', async () => {
+        mockSearch(EMPTY);
+
+        const { structured } = await run({
+          nutrient_filters: [{ nutrient: 'proteins', operator: 'gte', value: 5 }],
+          ecoscore_grade: 'a',
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(structured.text_index_snapshot).toBe(
+          `${INDEX_NOTE} Nutrient constraints are served only by this index, so no form of this search reads the live database. The ecoscore_grade filter was ${GRADES_MATCHED} The nutrient constraints (proteins >= 5) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.`,
+        );
+      });
+
+      it('accepts one grade or an array of them and rejects any other value', () => {
+        const accepts = (grades: Record<string, unknown>) =>
+          offSearchProductsTool.input.safeParse({ ...grades, page: 1, page_size: 20 }).success;
+
+        for (const good of [
+          { ecoscore_grade: 'a-plus' },
+          { ecoscore_grade: ['a-plus', 'a', 'b', 'c', 'd', 'e', 'f'] },
+          { nutrition_grade: ['a', 'b', 'c', 'd', 'e'] },
+          { nova_group: ['1', '2', '3', '4'] },
+        ]) {
+          expect(accepts(good), JSON.stringify(good)).toBe(true);
+        }
+        for (const bad of [
+          { ecoscore_grade: 'unknown' },
+          { ecoscore_grade: 'A' },
+          { ecoscore_grade: '' },
+          { ecoscore_grade: ['a', 'g'] },
+          { ecoscore_grade: ['a-plus', 'a', 'b', 'c', 'd', 'e', 'f', 'a'] },
+          { nutrition_grade: 'f' },
+          { nutrition_grade: ['a', 'b', 'c', 'd', 'e', 'a'] },
+          { nova_group: '5' },
+          { nova_group: 4 },
+        ]) {
+          expect(accepts(bad), JSON.stringify(bad)).toBe(false);
+        }
+      });
+
+      it('describes each grade input as any-of against labels_tag, and the Green-Score scale and filed grade', () => {
+        for (const field of ['nutrition_grade', 'nova_group', 'ecoscore_grade']) {
+          expect(inputDescription(field), field).toContain('unlike labels_tag');
+        }
+        expect(inputDescription('ecoscore_grade')).toContain('"a" does not include "a-plus"');
+        expect(inputDescription('ecoscore_grade')).toContain('France');
+      });
+    });
+
+    describe('the Green-Score gate', () => {
+      it('serves a Green-Score search from a ready mirror whose last full load indexed it', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockMirrorIndexesGreenScore.mockResolvedValue(true);
+        mockSearch({
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+          count: 56,
+          page: 1,
+          page_count: 1,
+          page_size: 20,
+          products: [{ code: '1234567890001', ecoscore_grade: 'a' }],
+        });
+
+        const { params, structured } = await run({
+          ecoscore_grade: ['a', 'a-plus'],
+          page: 11,
+          page_size: 1,
+        });
+
+        expect(params).toEqual({
+          page: 11,
+          page_size: 1,
+          ecoscore_grade: ['a', 'a-plus'],
+          tags_confirmed: true,
+        });
+        expect(structured).toMatchObject({ total: 56, source: 'off_mirror', mirror_as_of: AS_OF });
+        expect(mockMirrorIndexesGreenScore).toHaveBeenCalledOnce();
+      });
+
+      it('reads a Green-Score search live, as with no mirror, until the mirror indexes it', async () => {
+        mockSearch(EMPTY);
+        const input = { nutrition_grade: 'a', ecoscore_grade: 'a', page: 1, page_size: 20 };
+
+        const noMirror = await run(input);
+        mockMirrorReady.mockResolvedValue(true);
+        const unindexed = await run(input);
+
+        expect(unindexed.params).toEqual({
+          page: 1,
+          page_size: 20,
+          nutrition_grade: 'a',
+          ecoscore_grade: 'a',
+        });
+        expect(unindexed).toEqual(noMirror);
+        expect(mockMirrorIndexesGreenScore).toHaveBeenCalledOnce();
+      });
+
+      it('looks nothing up for a Green-Score search the mirror cannot serve yet', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockSearch(EMPTY);
+
+        const { params } = await run({
+          categories_tag: 'Dark chocolates',
+          ecoscore_grade: 'a',
+          page: 1,
+          page_size: 20,
+        });
+
+        expect(params).toEqual({
+          page: 1,
+          page_size: 20,
+          categories_tag: 'Dark chocolates',
+          ecoscore_grade: 'a',
+        });
+        expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+      });
+
+      it('refuses page 11 of a Green-Score search the mirror cannot serve yet, naming ecoscore_grade on both surfaces', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+
+        const result = await runToolContract(offSearchProductsTool, {
+          categories_tag: 'Dark chocolates',
+          ecoscore_grade: ['a', 'a-plus'],
+          page: 11,
+          page_size: 20,
+        });
+
+        const message =
+          "A search by tag filters alone is served through page 10 only when it reads the live database, and page 11 was requested: this server's local copy of the export serves a search carrying ecoscore_grade only once a full reload has indexed Green-Score, and that reload has not completed.";
+        const hint =
+          "Request page 10 or lower — at page_size 20 that reaches the first 200 matches — or retry once this server's local copy of the export completes the full reload that indexes Green-Score. Without ecoscore_grade, the copy serves pages past 10 of a search whose every value it confirms.";
+        const { error } = result.structuredContent as { error: { message: string; data: unknown } };
+        expect(result.isError).toBe(true);
+        expect(error.message).toBe(message);
+        expect(error.data).toEqual({
+          reason: 'page_out_of_range',
+          page: 11,
+          page_size: 20,
+          max_page: 10,
+          recovery: { hint },
+          retryable: false,
+        });
+        expect(contractText(result)).toContain(message);
+        expect(contractText(result)).toContain(hint);
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+        expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+      });
+
+      it('refuses page 11 of a Green-Score search with no ready mirror by the live bound alone', async () => {
+        const result = await runToolContract(offSearchProductsTool, {
+          ecoscore_grade: 'a',
+          page: 11,
+          page_size: 20,
+        });
+
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            message:
+              'A search by tag filters alone is served through page 10 only, and page 11 was requested.',
+          },
+        });
+        expect(mockMirrorIndexesGreenScore).not.toHaveBeenCalled();
+      });
+
+      it('asks about Green-Score only for a tag-only search carrying ecoscore_grade', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockSearch(EMPTY);
+
+        await run({ nutrition_grade: 'a', page: 1, page_size: 20 });
+        await run({ query: 'muesli', ecoscore_grade: 'a', page: 1, page_size: 20 });
+        await run({ ecoscore_grade: [], nova_group: '1', page: 1, page_size: 20 });
+
+        expect(mockMirrorIndexesGreenScore).not.toHaveBeenCalled();
+        expect(mockMirrorReady).toHaveBeenCalledTimes(2);
+      });
+    });
+  });
+
+  // ── #88: the ingredient filter, served by the text index ─────────────────
+
+  describe('ingredient filter (#88)', () => {
+    const INDEX_NOTE =
+      'These results come from the text-search index, a snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them.';
+    const ONLY_HERE = 'This server answers ingredients_tag only from this index.';
+    const LIVE_COPY =
+      "the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).";
+    const EMPTY = { count: 0, page: 1, page_count: 0, page_size: 20, products: [] };
+    /** The live ingredient taxonomy's answer per term (taxonomy_names=ingredient, 2026-11-08). */
+    const INGREDIENT_OPTIONS = new Map([
+      ['inulin', [{ id: 'en:inulin', name: 'inulin' }]],
+      [
+        'oat',
+        [
+          { id: 'en:oat', name: 'Oat' },
+          { id: 'en:oat-fibre', name: 'Oat fibre' },
+        ],
+      ],
+    ]);
+
+    beforeEach(() => {
+      mockSuggestTaxonomy.mockImplementation(async (taxonomy: string, term: string) =>
+        taxonomy === 'ingredient' ? (INGREDIENT_OPTIONS.get(term) ?? []) : [],
+      );
+    });
+
+    /** One run through the contract runner: what the service was handed and both surfaces. */
+    async function run(input: Record<string, unknown>) {
+      mockSearchProducts.mockClear();
+      const result = await runToolContract(offSearchProductsTool, {
+        page: 1,
+        page_size: 20,
+        ...input,
+      });
+      return {
+        params: mockSearchProducts.mock.calls[0]?.[0],
+        structured: result.structuredContent as Record<string, unknown>,
+        text: contractText(result),
+        hint: contractHint(result),
+        isError: result.isError,
+      };
+    }
+
+    it('resolves a value against the ingredient taxonomy and hands it over canonical, never asking about the mirror', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockSearch(EMPTY);
+
+      const { params } = await run({ ingredients_tag: 'inulin' });
+
+      expect(params).toEqual({ page: 1, page_size: 20, ingredients_tag: 'en:inulin' });
+      expect(mockSuggestTaxonomy).toHaveBeenCalledWith(
+        'ingredient',
+        'inulin',
+        expect.anything(),
+        expect.any(Number),
+      );
+      expect(mockMirrorReady).not.toHaveBeenCalled();
+      expect(mockMirrorIndexesGreenScore).not.toHaveBeenCalled();
+    });
+
+    it('hands an array over as an array in caller order, even of one, as labels_tag does', async () => {
+      mockSearch(EMPTY);
+
+      const both = await run({ ingredients_tag: ['inulin', 'en:oat'] });
+      const one = await run({ ingredients_tag: ['inulin'] });
+
+      expect(both.params).toEqual({
+        page: 1,
+        page_size: 20,
+        ingredients_tag: ['en:inulin', 'en:oat'],
+      });
+      expect(one.params).toEqual({ page: 1, page_size: 20, ingredients_tag: ['en:inulin'] });
+    });
+
+    it('sends a page past 10 of a search without query, which the text index serves', async () => {
+      mockSearch({
+        count: 232,
+        page: 11,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const { params, structured, isError } = await run({
+        categories_tag: 'en:breakfast-cereals',
+        ingredients_tag: 'en:inulin',
+        page: 11,
+      });
+
+      expect(isError).toBeFalsy();
+      expect(params).toEqual({
+        page: 11,
+        page_size: 20,
+        categories_tag: 'en:breakfast-cereals',
+        ingredients_tag: 'en:inulin',
+      });
+      expect(structured).toMatchObject({ source: 'off_api', last_page: 12, truncated: true });
+    });
+
+    it('refuses a page past the text window, before any lookup or search', async () => {
+      const { structured } = await run({ ingredients_tag: 'en:inulin', page: 101, page_size: 100 });
+
+      expect(structured).toMatchObject({
+        error: {
+          data: {
+            reason: 'page_out_of_range',
+            page: 101,
+            page_size: 100,
+            max_page: 100,
+            result_window: 10_000,
+          },
+        },
+      });
+      expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('refuses additives_tag beside it, naming ingredients_tag on both surfaces, sending nothing', async () => {
+      const message =
+        'additives_tag filters only on searches the tag backend answers — a query, a nutrient constraint, or an ingredient filter moves the search to a backend with no additives field, so pairing them would match nothing regardless of the additive.';
+      const hint =
+        'Drop query, nutrient_filters, and ingredients_tag to search by tags alone and keep the additive filter, or drop additives_tag to keep them. Every other filter combines freely.';
+
+      const {
+        structured,
+        text,
+        hint: sentHint,
+      } = await run({
+        ingredients_tag: 'en:inulin',
+        additives_tag: 'en:e322',
+      });
+
+      expect(structured).toMatchObject({
+        error: {
+          message,
+          data: { reason: 'additives_filter_needs_tag_search', additives_tag: 'en:e322' },
+        },
+      });
+      expect(sentHint).toBe(hint);
+      expect(text).toContain(message);
+      expect(text).toContain(hint);
+      expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, Record<string, unknown>, string]>([
+      [
+        'other tag filters',
+        { categories_tag: 'en:breakfast-cereals' },
+        `The same tag filters without ingredients_tag read ${LIVE_COPY}`,
+      ],
+      [
+        'other tag filters and query',
+        { query: 'muesli', labels_tag: 'en:organic' },
+        `The same tag filters without ingredients_tag and query read ${LIVE_COPY}`,
+      ],
+      [
+        'no other tag filter',
+        {},
+        `A search by tag filters alone, without ingredients_tag, reads ${LIVE_COPY}`,
+      ],
+      [
+        'query and no other tag filter',
+        { query: 'muesli' },
+        `A search by tag filters alone, without ingredients_tag and query, reads ${LIVE_COPY}`,
+      ],
+    ])(
+      'says on a search carrying %s that dropping ingredients_tag reaches the live database',
+      async (_label, search, route) => {
+        mockSearch(EMPTY);
+
+        const { structured, text } = await run({ ...search, ingredients_tag: 'en:inulin' });
+
+        expect(structured.text_index_snapshot).toBe(`${INDEX_NOTE} ${ONLY_HERE} ${route}`);
+        expect(text).toContain(
+          '**Index freshness:** These results come from the text-search index',
+        );
+        expect(text).toContain('This server answers ingredients');
+      },
+    );
+
+    it('keeps the nutrient wording on a search carrying nutrient_filters too', async () => {
+      mockSearch(EMPTY);
+
+      const { structured } = await run({
+        ingredients_tag: 'en:inulin',
+        nutrient_filters: [{ nutrient: 'proteins', operator: 'gte', value: 5 }],
+      });
+
+      expect(structured.text_index_snapshot).toBe(
+        `${INDEX_NOTE} Nutrient constraints are served only by this index, so no form of this search reads the live database. The nutrient constraints (proteins >= 5) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.`,
+      );
+    });
+
+    it('sends grade arrays beside it to the text index, with the grade sentence and no Green-Score check', async () => {
+      mockMirrorReady.mockResolvedValue(true);
+      mockSearch(EMPTY);
+
+      const { params, structured } = await run({
+        ingredients_tag: 'en:inulin',
+        nutrition_grade: ['a', 'b'],
+        ecoscore_grade: 'a',
+      });
+
+      expect(params).toEqual({
+        page: 1,
+        page_size: 20,
+        ingredients_tag: 'en:inulin',
+        nutrition_grade: ['a', 'b'],
+        ecoscore_grade: 'a',
+      });
+      expect(structured.text_index_snapshot).toBe(
+        `${INDEX_NOTE} ${ONLY_HERE} The same tag filters without ingredients_tag read ${LIVE_COPY} The nutrition_grade and ecoscore_grade filters were matched against the grades this index holds, which each row shows; off_get_product returns the current record, whose grades can differ.`,
+      );
+      expect(mockMirrorReady).not.toHaveBeenCalled();
+      expect(mockMirrorIndexesGreenScore).not.toHaveBeenCalled();
+    });
+
+    it('echoes each value on an empty result, naming the one sent unconfirmed, on both surfaces', async () => {
+      mockSearch(EMPTY);
+
+      const { structured, text } = await run({
+        categories_tag: 'en:breakfast-cereals',
+        ingredients_tag: ['inulin', 'oats'],
+      });
+
+      const notice =
+        'No products found for category="en:breakfast-cereals", ingredient="inulin", ingredient="oats". Tag values are matched exactly on this path: ingredient="oats" was sent as "en:oats" (no matching Open Food Facts tag was found). Check tag IDs via off_browse_taxonomy. The text index may not hold recently contributed products, so an empty result here does not settle whether a matching product has been contributed: re-run the same tag filters without ingredients_tag to read the live database or this server\'s local copy of the export, or call off_get_product when the barcode is known.';
+      expect(structured.notice).toBe(notice);
+      expect(text).toContain('> No products found for category="en:breakfast-cereals"');
+      expect(text).toContain('was sent as "en:oats"');
+    });
+
+    it('advises tag filters on an empty result with no other tag filter', async () => {
+      mockSearch(EMPTY);
+
+      const { structured } = await run({ query: 'muesli', ingredients_tag: 'en:inulin' });
+
+      expect(String(structured.notice)).toMatch(
+        /^No products found for query="muesli", ingredient="en:inulin"\. /,
+      );
+      expect(String(structured.notice)).toContain(
+        ": a search without ingredients_tag and query reads the live database or this server's local copy of the export, so try expressing the product as tag filters instead (off_browse_taxonomy resolves them), or call off_get_product when the barcode is known.",
+      );
+    });
+
+    it.each([{ ingredients_tag: [] }, { ingredients_tag: ['  ', ''] }, { ingredients_tag: '' }])(
+      'refuses %j alone as no_filters, sending nothing',
+      async (input) => {
+        const { structured } = await run(input);
+
+        expect(structured).toMatchObject({ error: { data: { reason: 'no_filters' } } });
+        expect(mockSuggestTaxonomy).not.toHaveBeenCalled();
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      },
+    );
+
+    it('names ingredients_tag in the no_filters recovery on both surfaces', async () => {
+      const { hint, text } = await run({});
+
+      expect(hint).toContain('ingredients_analysis_tag, ingredients_tag, additives_tag');
+      expect(text).toContain('ingredients_tag');
+    });
+
+    it('takes one ID or up to 10, and rejects 11', () => {
+      const accepts = (ingredients_tag: unknown) =>
+        offSearchProductsTool.input.safeParse({ ingredients_tag }).success;
+
+      expect(accepts('en:inulin')).toBe(true);
+      expect(accepts(Array.from({ length: 10 }, (_, i) => `en:x${i}`))).toBe(true);
+      expect(accepts(Array.from({ length: 11 }, (_, i) => `en:x${i}`))).toBe(false);
+      expect(accepts(3)).toBe(false);
+    });
+
+    it('points at the ingredients facet, and at ingredients_analysis_tag for verdicts', () => {
+      const description = inputDescription('ingredients_tag');
+
+      expect(description).toContain('off_browse_taxonomy with facet="ingredients"');
+      expect(description).toContain('use ingredients_analysis_tag');
+      expect(description).toContain('singular');
+      expect(inputDescription('additives_tag')).toContain('ingredients_tag');
+      expect(offSearchProductsTool.description).toContain('ingredients_tag');
+    });
+  });
 });
 
 // ── #79: the local mirror end to end ─────────────────────────────────────────
@@ -4849,8 +5699,17 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
   let tool: typeof import('@/mcp-server/tools/definitions/search-products.tool.js')['offSearchProductsTool'];
   let closeStore: (() => Promise<void>) | undefined;
 
-  /** Writes `lines` into a store at `path` as a sync page does; `completed` marks the sync done. */
-  async function writeStore(path: string, lines: Record<string, unknown>[], completed: boolean) {
+  /**
+   * Writes `lines` into a store at `path` as a sync page does; `completed` marks the sync done.
+   * `load` stamps the rows at `rowVersion` and records a full load built at `loadVersion`; without
+   * it rows are version 1 and no full load is recorded.
+   */
+  async function writeStore(
+    path: string,
+    lines: Record<string, unknown>[],
+    completed: boolean,
+    load?: { loadVersion: number; rowVersion: number },
+  ) {
     const writer = openMirrorStore(path);
     try {
       const handle = await writer.raw();
@@ -4868,7 +5727,7 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
           created_t: record.createdT,
           last_modified_t: record.lastModifiedT,
           generation: 1,
-          record_version: 1,
+          record_version: load?.rowVersion ?? 1,
           tag_ids: JSON.stringify(
             [...new Set(record.tags.map((key) => ids.get(key) as number))].sort((a, b) => a - b),
           ),
@@ -4876,6 +5735,14 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
         })),
         [],
       );
+      if (load) {
+        writeMirrorLoad(handle, {
+          generation: 1,
+          loadedAt: AS_OF,
+          recordVersion: load.loadVersion,
+          skippedLines: 0,
+        });
+      }
       if (completed) {
         await writer.writeState({
           status: 'complete',
@@ -5178,6 +6045,28 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
         true,
       );
     });
+
+    it('serves an ingredient search from the text index, never the store, past page 10 too (#88)', async () => {
+      const { result, structured } = await call({
+        ingredients_tag: 'en:inulin',
+        page: 11,
+        page_size: 2,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(structured.source).toBe('off_api');
+      expect(structured).not.toHaveProperty('mirror_as_of');
+      expect(String(structured.text_index_snapshot)).toContain(
+        'This server answers ingredients_tag only from this index.',
+      );
+      expect(paths()).toEqual(['/autocomplete', '/search']);
+      const [, init] = vi.mocked(global.fetch).mock.calls[1] ?? [];
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        q: 'ingredients_tags:"en:inulin"',
+        page: 11,
+        page_size: 2,
+      });
+    });
   });
 
   describe('without a ready store', () => {
@@ -5212,6 +6101,118 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
       expect(paths()).toEqual(['/api/v2/search']);
       const searchUrl = new URL(String(vi.mocked(global.fetch).mock.calls[0]?.[0]));
       expect(searchUrl.searchParams.get('brands_tags')).toBe('Nutella');
+    });
+  });
+
+  describe('grade filters (#85)', () => {
+    /**
+     * Five jars: Nutri-Score a, a, b, c, and none; Green-Score as filed for France a-plus, a, a, f,
+     * and none, jar 3 showing its world grade b.
+     */
+    const GRADED = [
+      jar(1, {
+        popularity_key: 50,
+        nutrition_grades_tags: ['a'],
+        environmental_score_tags: ['a-plus'],
+        environmental_score_grade: 'a-plus',
+      }),
+      jar(2, {
+        popularity_key: 40,
+        nutrition_grades_tags: ['a'],
+        environmental_score_tags: ['a'],
+        environmental_score_grade: 'a',
+      }),
+      jar(3, {
+        popularity_key: 30,
+        nutrition_grades_tags: ['b'],
+        environmental_score_tags: ['a'],
+        environmental_score_grade: 'b',
+      }),
+      jar(4, {
+        popularity_key: 20,
+        nutrition_grades_tags: ['c'],
+        environmental_score_tags: ['f'],
+        environmental_score_grade: 'f',
+      }),
+      jar(5, { popularity_key: 10 }),
+    ];
+
+    /** Serves a completed store of `GRADED`, its rows and full load as `load` gives them. */
+    async function serveGraded(load?: { loadVersion: number; rowVersion: number }) {
+      const path = join(dir, 'store.sqlite');
+      await writeStore(path, GRADED, true, load);
+      await serve(path);
+    }
+
+    it('serves any-of Nutri-Score from the store, its total the single grades summed, sending nothing', async () => {
+      await serveGraded();
+
+      const a = await call({ nutrition_grade: 'a', page: 1, page_size: 50 });
+      const b = await call({ nutrition_grade: 'b', page: 1, page_size: 50 });
+      const either = await call({ nutrition_grade: ['b', 'a'], page: 1, page_size: 50 });
+
+      expect([a.structured.total, b.structured.total]).toEqual([2, 1]);
+      expect(either.structured).toMatchObject({
+        total: 3,
+        total_is_lower_bound: false,
+        source: 'off_mirror',
+      });
+      expect(either.barcodes).toEqual([1, 2, 3].map(code));
+      expect(requests).toEqual([]);
+    });
+
+    it('serves a Green-Score search from a store whose last full load indexed it, past the live page bound', async () => {
+      await serveGraded({ loadVersion: 2, rowVersion: 2 });
+
+      const first = await call({ ecoscore_grade: ['a-plus', 'a'], page: 1, page_size: 50 });
+      const deep = await call({ ecoscore_grade: ['a-plus', 'a'], page: 11, page_size: 1 });
+
+      expect(first.barcodes).toEqual([1, 2, 3].map(code));
+      expect(first.structured.products?.[2]).toMatchObject({ ecoscore_grade: 'b' });
+      expect(first.structured).toMatchObject({
+        total: 3,
+        source: 'off_mirror',
+        mirror_as_of: AS_OF,
+      });
+      expect(deep.structured).toMatchObject({
+        total: 3,
+        page: 11,
+        page_count: 0,
+        last_page: 3,
+        source: 'off_mirror',
+      });
+      expect(requests).toEqual([]);
+    });
+
+    it.each<[string, { loadVersion: number; rowVersion: number } | undefined]>([
+      ['no full load recorded', undefined],
+      ['a load built at record version 1', { loadVersion: 1, rowVersion: 1 }],
+      ['a version-1 load a reload has rewritten part-way', { loadVersion: 1, rowVersion: 2 }],
+    ])(
+      'reads a Green-Score search live with %s, and refuses its page 11 naming ecoscore_grade',
+      async (_label, load) => {
+        await serveGraded(load);
+
+        const { structured } = await call({ ecoscore_grade: 'a', page: 1, page_size: 2 });
+        const refusal = await refusalOf({ ecoscore_grade: 'a', page: 11, page_size: 1 });
+
+        expect(structured.source).toBe('off_api');
+        expect(paths()).toEqual(['/api/v2/search']);
+        const searchUrl = new URL(String(vi.mocked(global.fetch).mock.calls[0]?.[0]));
+        expect(searchUrl.searchParams.get('environmental_score_tags')).toBe('a');
+        expect(refusal.message).toContain(
+          'serves a search carrying ecoscore_grade only once a full reload has indexed Green-Score',
+        );
+      },
+    );
+
+    it('serves a search without Green-Score from an older load, as before', async () => {
+      await serveGraded({ loadVersion: 1, rowVersion: 1 });
+
+      const { structured } = await call({ nutrition_grade: 'a', page: 11, page_size: 1 });
+
+      expect(structured).toMatchObject({ total: 2, page: 11, source: 'off_mirror' });
+      expect(requests).toEqual([]);
     });
   });
 });

@@ -122,6 +122,10 @@ describe('TaxonomyService.canonicalizeTag', () => {
       ['countries', 'United States', 'en:united-states'],
       ['allergens', 'en:peanuts', 'en:peanuts'],
       ['categories', 'en:breakfast-cereals', 'en:breakfast-cereals'],
+      // By display name alone, since neither value slugs to the ID; the second reads the name's
+      // hyphen ("Mono- and diglycerides") as a space.
+      ['additives', 'E330 citric acid', 'en:e330'],
+      ['additives', 'e471 mono and diglycerides of fatty acids', 'en:e471'],
     ] as const)('resolves %s %j to %s without a lookup', async (facet, input, id) => {
       await expect(taxonomy.canonicalizeTag(facet, input, ctx)).resolves.toEqual({
         value: id,
@@ -242,6 +246,18 @@ describe('TaxonomyService.canonicalizeTag', () => {
       expect(lookupUrl().searchParams.get('size')).toBe('2000');
     });
 
+    it('accepts a name match ahead of a plural', async () => {
+      stubOptions([
+        { id: 'en:nuts', text: 'Nuts' },
+        { id: 'en:tree-nuts', text: 'nut' },
+      ]);
+
+      await expect(taxonomy.canonicalizeTag('allergens', 'nut', ctx)).resolves.toEqual({
+        value: 'en:tree-nuts',
+        resolution: 'vocabulary',
+      });
+    });
+
     it('accepts the option whose ID is the value plus "s" (live response for "nut")', async () => {
       stubOptions([{ id: 'en:nuts', text: 'Nuts' }]);
 
@@ -326,6 +342,82 @@ describe('TaxonomyService.canonicalizeTag', () => {
       await expect(
         taxonomy.canonicalizeTag('categories', 'FR:Confitures de fraises', ctx),
       ).resolves.toMatchObject({ value: 'fr:confitures-de-fraises', reason: 'no_match' });
+    });
+  });
+
+  describe('ingredients (#88)', () => {
+    it.each([
+      // Live 2026-11-08, taxonomy_names=ingredient. ID equality confirms the first two; the third
+      // is the name rule, on the synonym text the live answer gives en:egg.
+      ['inulin', 'en:inulin', [{ id: 'en:inulin', text: 'inulin' }]],
+      [
+        'oat',
+        'en:oat',
+        [
+          { id: 'en:oat', text: 'Oat' },
+          { id: 'en:oat-fibre', text: 'Oat fibre' },
+          { id: 'en:e322a', text: 'Oat lecithin' },
+          { id: 'en:oat-oil', text: 'oat oil' },
+        ],
+      ],
+      [
+        'eggs',
+        'en:egg',
+        [
+          { id: 'en:eggs-from-switzerland', text: 'Eggs from Switzerland' },
+          {
+            id: 'en:eggs-yolk-powder-from-free-range-hens',
+            text: 'Eggs yolk powder from free range hens',
+          },
+          { id: 'en:egg', text: 'eggs' },
+          { id: 'en:eggs-from-caged-hens', text: 'eggs from caged hens' },
+          { id: 'en:egg-yolk', text: 'eggs yolk' },
+          { id: 'en:egg-yolk-powder', text: 'eggs yolk powder' },
+        ],
+      ],
+    ] as const)(
+      'confirms %j as %s against the live ingredient taxonomy',
+      async (term, id, options) => {
+        stubOptions([...options]);
+
+        await expect(taxonomy.canonicalizeTag('ingredients', term, ctx)).resolves.toEqual({
+          value: id,
+          resolution: 'vocabulary',
+        });
+        expect(global.fetch).toHaveBeenCalledOnce();
+        expect(lookupUrl().searchParams.get('taxonomy_names')).toBe('ingredient');
+        expect(lookupUrl().searchParams.get('q')).toBe(term);
+      },
+    );
+
+    it('leaves the plural "oats" unconfirmed: the live answer is empty and no singular is tried', async () => {
+      // Live 2026-11-08: the autocomplete answers `oats` with no options, and the text index counts
+      // ingredients_tags:"en:oats" as 0 where en:oat matches thousands.
+      stubOptions([]);
+
+      await expect(taxonomy.canonicalizeTag('ingredients', 'oats', ctx)).resolves.toEqual({
+        value: 'en:oats',
+        resolution: 'normalized',
+        reason: 'no_match',
+      });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it('checks no offline sample, so a value the allergen sample holds is still looked up', async () => {
+      stubOptions([{ id: 'en:egg', text: 'eggs' }]);
+
+      await expect(taxonomy.canonicalizeTag('allergens', 'eggs', ctx)).resolves.toEqual({
+        value: 'en:eggs',
+        resolution: 'vocabulary',
+      });
+      expect(global.fetch).not.toHaveBeenCalled();
+
+      await expect(taxonomy.canonicalizeTag('ingredients', 'eggs', ctx)).resolves.toEqual({
+        value: 'en:egg',
+        resolution: 'vocabulary',
+      });
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(lookupUrl().searchParams.get('taxonomy_names')).toBe('ingredient');
     });
   });
 
@@ -642,6 +734,175 @@ describe('TaxonomyService.search — fallback notice by cause (#77)', () => {
     expect(result.notice).toBe(
       `The live Open Food Facts categories vocabulary could not be reached or gave no usable answer (Open Food Facts is unavailable (HTTP 503): unavailable (failed after 4 attempts)). ${SAMPLE} Retry for an authoritative answer.`,
     );
+  });
+
+  describe('for ingredients, which has no offline sample (#88)', () => {
+    /** What every ingredients fallback says in place of the sample sentence. */
+    const LIVE_ONLY =
+      'No ingredients tags are listed, because this facet resolves only against the live vocabulary: the empty list does not mean the term has no tag.';
+
+    it.each([
+      {
+        cause: 'a spent budget',
+        budget: 1,
+        answer: async () => mockResponse({ took: 1, timed_out: false, options: [] }),
+        notice: `This server's own per-minute taxonomy budget is spent, so nothing was sent to Open Food Facts and the live ingredients vocabulary went unchecked. ${LIVE_ONLY} A lookup slot frees in about 60 s; retry then for an authoritative answer.`,
+      },
+      {
+        cause: 'an upstream 429',
+        budget: 100,
+        answer: async () => mockResponse({ detail: 'slow down' }, 429),
+        notice: `Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429), so the live ingredients vocabulary went unchecked. ${LIVE_ONLY} Retry in about a minute for an authoritative answer.`,
+      },
+      {
+        cause: 'an outage',
+        budget: 100,
+        answer: async () => mockResponse('unavailable', 503),
+        notice: `The live Open Food Facts ingredients vocabulary could not be reached or gave no usable answer (Open Food Facts is unavailable (HTTP 503): unavailable (failed after 4 attempts)). ${LIVE_ONLY} Retry for an authoritative answer.`,
+      },
+    ])(
+      'names $cause and lists nothing, describing no sample',
+      async ({ budget, answer, notice }) => {
+        const taxonomy = makeTaxonomy(budget);
+        global.fetch = vi.fn(answer);
+
+        const result = await onFakeTimers(async () => {
+          // A one-slot budget is spent by a first lookup, so the second is refused locally.
+          if (budget === 1) await taxonomy.search('ingredients', 'whey', 20, createMockContext());
+          return await taxonomy.search('ingredients', 'inulin', 20, createMockContext());
+        });
+
+        expect(result).toEqual({ facet: 'ingredients', tags: [], matched_in_facet: 0, notice });
+        expect(result.notice).not.toContain('offline');
+      },
+    );
+  });
+});
+
+describe('TaxonomyService.search — the no-term and no-match notices', () => {
+  const globalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = globalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('names the offline sample and its size for a sampled facet with no term', async () => {
+    const taxonomy = makeTaxonomy();
+    stubOptions([]);
+
+    const result = await taxonomy.search('categories', undefined, 20, createMockContext());
+
+    expect(result.tags).toHaveLength(20);
+    expect(result.matched_in_facet).toBe(73);
+    expect(result.notice).toBe(
+      "This is this server's offline categories sample (73 entries), not the Open Food Facts categories taxonomy, which is far larger and cannot be listed in full — pass a search term to resolve one against the live vocabulary.",
+    );
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('closes the no-match notice of a sampled facet with the plural-category hint', async () => {
+    const taxonomy = makeTaxonomy();
+    stubOptions([]);
+
+    await expect(taxonomy.search('labels', 'zork', 20, createMockContext())).resolves.toEqual({
+      facet: 'labels',
+      tags: [],
+      matched_in_facet: 0,
+      notice:
+        'No labels tag matched "zork" in the Open Food Facts vocabulary. Matching is on whole words in the tag name, so try a single simpler word (e.g. "hummus" rather than "hummus dip"); note also that many category tags are plural upstream ("kombucha" resolves to en:kombuchas).',
+    });
+  });
+
+  describe('for ingredients, which has no offline sample (#88)', () => {
+    const NO_TERM =
+      'Open Food Facts cannot list the ingredients vocabulary without a search term, so no tags are returned — pass a search term to resolve one against the live vocabulary (ingredient IDs are singular: "oat" resolves to en:oat).';
+
+    it.each([undefined, '', '   '])(
+      'returns no tags for term %j and asks for one, sending nothing',
+      async (term) => {
+        const taxonomy = makeTaxonomy();
+        stubOptions([]);
+
+        await expect(
+          taxonomy.search('ingredients', term, 20, createMockContext()),
+        ).resolves.toEqual({
+          facet: 'ingredients',
+          tags: [],
+          matched_in_facet: 0,
+          notice: NO_TERM,
+        });
+        expect(global.fetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('closes the no-match notice with the singular hint in place of the plural one', async () => {
+      const taxonomy = makeTaxonomy();
+      stubOptions([]);
+
+      await expect(
+        taxonomy.search('ingredients', 'oats', 20, createMockContext()),
+      ).resolves.toEqual({
+        facet: 'ingredients',
+        tags: [],
+        matched_in_facet: 0,
+        notice:
+          'No ingredients tag matched "oats" in the Open Food Facts vocabulary. Matching is on whole words in the tag name, so try a single simpler word (e.g. "hummus" rather than "hummus dip"); note also that ingredient IDs are singular ("oats" finds nothing, "oat" resolves to en:oat).',
+      });
+      expect(lookupUrl().searchParams.get('taxonomy_names')).toBe('ingredient');
+    });
+
+    it('leads with the tag the live answer names, lifting en:egg from third, the rest in upstream order', async () => {
+      // Live 2026-11-08 for `eggs`: rankExactTagFirst promotes nothing (no en:eggs, en:eggss or
+      // en:eggses), and the accept rule confirms en:egg by its synonym text "eggs".
+      const taxonomy = makeTaxonomy();
+      stubOptions([
+        { id: 'en:eggs-from-switzerland', text: 'Eggs from Switzerland' },
+        {
+          id: 'en:eggs-yolk-powder-from-free-range-hens',
+          text: 'Eggs yolk powder from free range hens',
+        },
+        { id: 'en:egg', text: 'eggs' },
+        { id: 'en:eggs-from-caged-hens', text: 'eggs from caged hens' },
+        { id: 'en:egg-yolk', text: 'eggs yolk' },
+        { id: 'en:egg-yolk-powder', text: 'eggs yolk powder' },
+      ]);
+
+      const result = await taxonomy.search('ingredients', 'eggs', 20, createMockContext());
+
+      expect(result.tags.map((tag) => tag.id)).toEqual([
+        'en:egg',
+        'en:eggs-from-switzerland',
+        'en:eggs-yolk-powder-from-free-range-hens',
+        'en:eggs-from-caged-hens',
+        'en:egg-yolk',
+        'en:egg-yolk-powder',
+      ]);
+      expect(result.tags[0]).toEqual({ id: 'en:egg', name: 'eggs' });
+      expect(result.matched_in_facet).toBe(6);
+      expect(result).not.toHaveProperty('notice');
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it('adds and counts the tag the live answer confirms where the substring gate drops it', async () => {
+      // Synthetic: the term spells with spaces what the ID and the name spell with hyphens, so the
+      // gate drops the one option, which the accept rule confirms by its ID. With no sample to take
+      // the entry from, it is listed as the live answer gave it.
+      const taxonomy = makeTaxonomy();
+      const term = 'semi skimmed milk';
+      stubOptions([{ id: 'en:semi-skimmed-milk', text: 'semi-skimmed milk' }]);
+
+      await expect(taxonomy.search('ingredients', term, 20, createMockContext())).resolves.toEqual({
+        facet: 'ingredients',
+        tags: [{ id: 'en:semi-skimmed-milk', name: 'semi-skimmed milk' }],
+        matched_in_facet: 1,
+      });
+      expect(global.fetch).toHaveBeenCalledOnce();
+      // Browsing agrees with filtering on the same term.
+      await expect(
+        taxonomy.canonicalizeTag('ingredients', term, createMockContext()),
+      ).resolves.toEqual({ value: 'en:semi-skimmed-milk', resolution: 'vocabulary' });
+    });
   });
 });
 

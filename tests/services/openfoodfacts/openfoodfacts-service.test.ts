@@ -52,12 +52,17 @@ import {
   getMirrorStore,
   openMirrorStore,
 } from '@/services/mirror/mirror-store.js';
-import { buildMirrorRecord, normalizeCodeZeroes } from '@/services/mirror/record-builder.js';
+import {
+  buildMirrorRecord,
+  MIRROR_RECORD_VERSION,
+  normalizeCodeZeroes,
+} from '@/services/mirror/record-builder.js';
 import {
   ANALYZER_STOP_WORDS,
   STOP_WORD_LANGS,
 } from '@/services/openfoodfacts/analyzer-stop-words.js';
 import {
+  getOpenFoodFactsService,
   initOpenFoodFactsService,
   OpenFoodFactsService,
   type ProductRead,
@@ -1299,6 +1304,179 @@ describe('OpenFoodFactsService', () => {
       expect(url).toContain('nutrition_grades_tags=a');
       expect(url).not.toContain('nutrition_grades_tags=en');
       expect(url).toContain('nova_groups_tags=1');
+    });
+  });
+
+  // ── #85: any-of grade filters and the Green-Score filter ─────────────────
+
+  describe('searchProducts — grade filters (#85)', () => {
+    /** The live tag search URL `params` sends. */
+    async function tagUrl(params: ProductSearch): Promise<string> {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_EMPTY));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      return String(vi.mocked(global.fetch).mock.calls[0]?.[0]);
+    }
+
+    /** The text search `q` `params` sends. */
+    async function textQ(params: ProductSearch): Promise<string> {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TEXT_SEARCH_EMPTY));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      return sentQ();
+    }
+
+    const SCALAR_URL =
+      'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&categories_tags=en%3Abreakfast-cereals&nutrition_grades_tags=b&nova_groups_tags=3&page=1&page_size=20';
+
+    describe('a single grade, as before', () => {
+      it('sends a tag-only search the URL it always sent', async () => {
+        await expect(
+          tagUrl({ categories_tag: 'en:breakfast-cereals', nutrition_grade: 'b', nova_group: '3' }),
+        ).resolves.toBe(SCALAR_URL);
+      });
+
+      it('sends a text search the bare grade and NOVA clauses it always sent', async () => {
+        await expect(
+          textQ({ query: 'muesli', nutrition_grade: 'b', nova_group: '3' }),
+        ).resolves.toBe('nutriscore_grade:b nova_group:3 muesli');
+      });
+    });
+
+    describe('several grades, any of them', () => {
+      it('joins each grade input with | on the live tag search, Green-Score after NOVA', async () => {
+        await expect(
+          tagUrl({
+            nutrition_grade: ['a', 'b'],
+            nova_group: ['1', '2'],
+            ecoscore_grade: ['a', 'a-plus'],
+            countries_tag: 'en:france',
+          }),
+        ).resolves.toBe(
+          'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&nutrition_grades_tags=a%7Cb&nova_groups_tags=1%7C2&environmental_score_tags=a%7Ca-plus&countries_tags=en%3Afrance&page=1&page_size=20',
+        );
+      });
+
+      it('sends one Green-Score grade as environmental_score_tags, bare', async () => {
+        const url = new URL(await tagUrl({ ecoscore_grade: 'a-plus' }));
+
+        expect(url.searchParams.get('environmental_score_tags')).toBe('a-plus');
+        expect(url.searchParams.has('ecoscore_tags')).toBe(false);
+      });
+
+      it('sends a one-element array as the scalar, and an empty one as no filter', async () => {
+        await expect(
+          tagUrl({
+            categories_tag: 'en:breakfast-cereals',
+            nutrition_grade: ['b'],
+            nova_group: ['3'],
+          }),
+        ).resolves.toBe(SCALAR_URL);
+        await expect(
+          tagUrl({
+            categories_tag: 'en:breakfast-cereals',
+            nutrition_grade: [],
+            ecoscore_grade: [],
+          }),
+        ).resolves.toBe(
+          'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&categories_tags=en%3Abreakfast-cereals&page=1&page_size=20',
+        );
+      });
+
+      it('sends each grade input to the text index as one OR group, quoting a-plus', async () => {
+        await expect(
+          textQ({
+            query: 'muesli',
+            nutrition_grade: ['a', 'b'],
+            nova_group: ['1', '2'],
+            ecoscore_grade: ['a', 'a-plus'],
+            countries_tag: 'en:france',
+          }),
+        ).resolves.toBe(
+          'nutriscore_grade:(a OR b) nova_group:(1 OR 2) ecoscore_grade:(a OR "a-plus") countries_tags:"en:france" muesli',
+        );
+      });
+
+      it.each([
+        ['a', 'ecoscore_grade:a muesli'],
+        ['a-plus', 'ecoscore_grade:"a-plus" muesli'],
+      ])('sends one Green-Score grade %j to the text index as one clause', async (grade, q) => {
+        await expect(textQ({ query: 'muesli', ecoscore_grade: grade })).resolves.toBe(q);
+      });
+
+      it('sends a one-element array to the text index as the scalar, and an empty one as no clause', async () => {
+        await expect(
+          textQ({ query: 'muesli', nutrition_grade: ['b'], nova_group: ['3'], ecoscore_grade: [] }),
+        ).resolves.toBe('nutriscore_grade:b nova_group:3 muesli');
+      });
+    });
+  });
+
+  // ── #88: the ingredient filter routes to the text index ──────────────────
+
+  describe('searchProducts — ingredient filter (#88)', () => {
+    /** The request a search sends, against an empty text answer. */
+    async function sent(params: ProductSearch): Promise<ReturnType<typeof sentRequest>> {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TEXT_SEARCH_EMPTY));
+      await svc.searchProducts(params, createMockContext());
+      expect(global.fetch).toHaveBeenCalledOnce();
+      return sentRequest();
+    }
+
+    it.each<[string, NonNullable<ProductSearch['ingredients_tag']>]>([
+      ['a single ID', 'en:inulin'],
+      ['a one-element array', ['en:inulin']],
+    ])('sends %s as one clause, alone in q', async (_label, ingredients_tag) => {
+      const request = await sent({ ingredients_tag, page: 1, page_size: 20 });
+
+      expect(request.url).toBe(TEXT_SEARCH_URL);
+      expect(request.body?.q).toBe('ingredients_tags:"en:inulin"');
+    });
+
+    it('sends one clause per value, after the verdict clause and before the grade groups', async () => {
+      const request = await sent({
+        query: 'muesli',
+        ingredients_analysis_tag: 'en:vegan',
+        ingredients_tag: ['en:inulin', 'en:oat'],
+        nutrition_grade: ['a', 'b'],
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(request.body?.q).toBe(
+        'ingredients_analysis_tags:"en:vegan" ingredients_tags:"en:inulin" ingredients_tags:"en:oat" nutriscore_grade:(a OR b) muesli',
+      );
+    });
+
+    it('reads the text index for a search without query, past page 10, whatever tags_confirmed says', async () => {
+      const request = await sent({
+        categories_tag: 'en:breakfast-cereals',
+        ingredients_tag: 'en:inulin',
+        page: 11,
+        page_size: 20,
+        tags_confirmed: true,
+      });
+
+      expect(request.url).toBe(TEXT_SEARCH_URL);
+      expect(request.body).toMatchObject({
+        q: 'categories_tags:"en:breakfast-cereals" ingredients_tags:"en:inulin"',
+        page: 11,
+        page_size: 20,
+      });
+    });
+
+    it.each<[string, Pick<ProductSearch, 'ingredients_tag'>]>([
+      ['an empty array', { ingredients_tag: [] }],
+      ['an empty string', { ingredients_tag: '' }],
+      ['no value', {}],
+    ])('leaves a tag-only search with %s on the tag path', async (_label, ingredients) => {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_EMPTY));
+
+      await svc.searchProducts(
+        { categories_tag: 'en:breakfast-cereals', ...ingredients, page: 1, page_size: 20 },
+        createMockContext(),
+      );
+
+      expect(new URL(sentRequest().url).pathname).toBe('/api/v2/search');
+      expect(sentRequest().url).not.toContain('ingredients_tags');
     });
   });
 
@@ -3542,6 +3720,24 @@ describe('OpenFoodFactsService', () => {
         );
       });
 
+      it('sends a tag-only page 10 at page_size 100, the live search’s own page maximum', async () => {
+        routeFetch();
+
+        await offSearchProductsTool.handler(
+          offSearchProductsTool.input.parse({
+            categories_tag: 'en:pizzas',
+            page: 10,
+            page_size: 100,
+          }),
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(requestLog()).toEqual(['/api/v2/search']);
+        expect(sentRequest().url).toBe(
+          `${TAG_SEARCH_PREFIX}&categories_tags=en%3Apizzas&page=10&page_size=100`,
+        );
+      });
+
       it('rejects a tag-only page past 10 before any request', async () => {
         // Product Opener answers every anonymous page past 10 with a 401 and a rendered page,
         // whatever the page_size (Display.pm `search_and_display_products`).
@@ -3588,6 +3784,53 @@ describe('OpenFoodFactsService', () => {
         );
 
         expect(result.last_page).toBe(10);
+      });
+
+      describe('the ingredient filter (#88)', () => {
+        it('resolves each value against the ingredient taxonomy and ANDs one text clause per value beside grade groups', async () => {
+          routeFetch({
+            ingredient: [
+              { id: 'en:inulin', text: 'inulin' },
+              { id: 'en:oat', text: 'Oat' },
+            ],
+          });
+
+          await offSearchProductsTool.handler(
+            offSearchProductsTool.input.parse({
+              categories_tag: 'en:breakfast-cereals',
+              ingredients_tag: ['inulin', 'oat'],
+              nutrition_grade: ['a', 'b'],
+            }),
+            createMockContext({ errors: offSearchProductsTool.errors }),
+          );
+
+          expect(requestLog()).toEqual([
+            'autocomplete:ingredient:inulin',
+            'autocomplete:ingredient:oat',
+            '/search',
+          ]);
+          expect(sentQ(2)).toBe(
+            'categories_tags:"en:breakfast-cereals" ingredients_tags:"en:inulin" ingredients_tags:"en:oat" nutriscore_grade:(a OR b)',
+          );
+        });
+
+        it('sends a value nothing confirms normalized, and names it on the empty result', async () => {
+          global.fetch = vi.fn(async (input: unknown) => {
+            const url = new URL(String(input));
+            return url.pathname === '/autocomplete'
+              ? mockResponse({ took: 1, timed_out: false, options: [] })
+              : textHits([]);
+          });
+
+          const result = await runToolContract(offSearchProductsTool, {
+            ingredients_tag: 'oats',
+          });
+
+          expect(sentQ(1)).toBe('ingredients_tags:"en:oats"');
+          expect((result.structuredContent as { notice?: string }).notice).toContain(
+            'ingredient="oats" was sent as "en:oats" (no matching Open Food Facts tag was found)',
+          );
+        });
       });
     });
   });
@@ -4125,8 +4368,8 @@ describe('OpenFoodFactsService', () => {
         expect(listedSugars(outputs[1] as SearchOutput)).toEqual([2]);
       });
 
-      it('fills a capped 50-row page from an over-cap page_size, then reports what it lost', async () => {
-        const hits = Array.from({ length: 50 }, (_, i) => ({
+      it('fills a capped 100-row page from an over-cap page_size, then reports what it lost', async () => {
+        const hits = Array.from({ length: 100 }, (_, i) => ({
           code: String(3_017_620_422_003 + i),
           nutriments: { sugars_100g: i % 2 === 0 ? 2 : 3.5 },
         }));
@@ -4134,23 +4377,37 @@ describe('OpenFoodFactsService', () => {
 
         const result = await runToolContract(offSearchProductsTool, {
           nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
-          page_size: 80,
+          page_size: 150,
         });
 
-        expect(sentRequest().body?.page_size).toBe(50);
+        expect(sentRequest().body?.page_size).toBe(100);
         expect(result.structuredContent).toMatchObject({
-          page_size: 50,
-          page_count: 25,
-          outside_constraints: 25,
-          last_page: 37,
+          page_size: 100,
+          page_count: 50,
+          outside_constraints: 50,
+          last_page: 19,
           truncated: true,
-          shown: 25,
-          cap: 50,
+          shown: 50,
+          cap: 100,
         });
         expect((result.structuredContent as { page_size_capped?: string }).page_size_capped).toBe(
-          'page_size 80 is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 2 for results 51–100.',
+          'page_size 150 is above the 100 results one call returns; this page was served at page_size 100. Pages are counted at that size: request page 2 for results 101–200.',
         );
-        expect(allText(result)).toContain('showing 25)');
+        expect(allText(result)).toContain('showing 50)');
+      });
+
+      it('sends page 100 at page_size 100 to the text backend, the last page inside its window', async () => {
+        global.fetch = vi.fn().mockResolvedValue(textHits([], 12_000));
+
+        const result = await runToolContract(offSearchProductsTool, {
+          query: 'chocolate',
+          page: 100,
+          page_size: 100,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(sentRequest().body).toMatchObject({ page: 100, page_size: 100 });
+        expect(result.structuredContent).not.toHaveProperty('page_size_capped');
       });
 
       it('adds neither the field nor its line on a clean constrained page', async () => {
@@ -5910,6 +6167,7 @@ describe('OpenFoodFactsService', () => {
     /** Every field a product read asks Open Food Facts for. */
     const PRODUCT_FIELD_LIST = [
       'product_name',
+      'generic_name',
       'brands',
       'quantity',
       'ingredients_text',
@@ -5921,6 +6179,7 @@ describe('OpenFoodFactsService', () => {
       'nutriscore_grade',
       'nova_group',
       'ecoscore_grade',
+      'nutrient_levels',
       'nutriments',
       'serving_size',
       'serving_quantity',
@@ -5956,11 +6215,17 @@ describe('OpenFoodFactsService', () => {
      * batch upsert), runs `sql` on it, and points `OFF_MIRROR_PATH` at it. The checkpoint encodes
      * `AS_OF` unless `checkpoint` is false. `firstLoadRunning` writes the state the sync runner
      * holds while a store's first full load is still ingesting instead: in progress, with no
-     * completion time and no checkpoint, over rows already stored.
+     * completion time and no checkpoint, over rows already stored. Rows are stamped with the
+     * current `MIRROR_RECORD_VERSION` unless `recordVersion` names an older builder's.
      */
     async function writeMirror(
       lines: Line[],
-      options: { checkpoint?: boolean; sql?: string[]; firstLoadRunning?: boolean } = {},
+      options: {
+        checkpoint?: boolean;
+        sql?: string[];
+        firstLoadRunning?: boolean;
+        recordVersion?: number;
+      } = {},
     ): Promise<void> {
       const writer = openMirrorStore(storePath());
       try {
@@ -5980,7 +6245,7 @@ describe('OpenFoodFactsService', () => {
               created_t: record.createdT,
               last_modified_t: record.lastModifiedT,
               generation: 1,
-              record_version: 1,
+              record_version: options.recordVersion ?? MIRROR_RECORD_VERSION,
               tag_ids: JSON.stringify(
                 [...new Set(record.tags.map((key) => ids.get(key) as number))].sort(
                   (a, b) => a - b,
@@ -6295,7 +6560,7 @@ describe('OpenFoodFactsService', () => {
           const prepare = handle.prepare.bind(handle);
           let synced = false;
           const spy = vi.spyOn(handle, 'prepare').mockImplementation((sql: string) => {
-            if (!synced && sql.startsWith('SELECT code, doc FROM products')) {
+            if (!synced && sql.startsWith('SELECT code, doc, record_version FROM products')) {
               synced = true;
               writerHandle
                 .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
@@ -6768,6 +7033,7 @@ describe('OpenFoodFactsService', () => {
         // page_size of 20 too; page_size 3 reaches 9,999 at page 3,333, so the bound is on the
         // product, never a rounded page count.
         const BOUNDARIES: [string, ProductSearch, ProductSearch][] = [
+          ['page_size 100', { page: 100, page_size: 100 }, { page: 101, page_size: 100 }],
           ['page_size 50', { page: 200, page_size: 50 }, { page: 201, page_size: 50 }],
           ['page_size 1', { page: 10_000, page_size: 1 }, { page: 10_001, page_size: 1 }],
           ['page_size 3', { page: 3_333, page_size: 3 }, { page: 3_334, page_size: 3 }],
@@ -6884,6 +7150,7 @@ describe('OpenFoodFactsService', () => {
             nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 5 }],
           },
         ],
+        ['an ingredient filter (#88)', { labels_tag: 'en:organic', ingredients_tag: 'en:oat' }],
       ])(
         'reads a search carrying %s from the text index, whatever tags_confirmed says',
         async (_label, params) => {
@@ -6986,6 +7253,630 @@ describe('OpenFoodFactsService', () => {
         expect(global.fetch).toHaveBeenCalledOnce();
         expect(new URL(sentRequest().url).pathname).toBe('/api/v2/search');
         expect(warnings(ctx)).toEqual([]);
+      });
+    });
+
+    describe('grade filters and the Green-Score gate (#85)', () => {
+      /** A synthetic schema 1004 export line with the given grade fields. */
+      function gradedLine(code: string, popularity: number, fields: Line): Line {
+        return {
+          code,
+          schema_version: 1004,
+          lc: 'en',
+          product_name: `Product ${code}`,
+          popularity_key: popularity,
+          ...fields,
+        };
+      }
+
+      /**
+       * Nutri-Score a, a, b, c, and none; Green-Score as filed for France a-plus, a, a, f, and none.
+       * 40000003 is filed `a` for France and shows its world grade `b`, as a live row would.
+       */
+      const CORPUS: Line[] = [
+        gradedLine('40000001', 50, {
+          nutrition_grades_tags: ['a'],
+          environmental_score_tags: ['a-plus'],
+          environmental_score_grade: 'a-plus',
+        }),
+        gradedLine('40000002', 40, {
+          nutrition_grades_tags: ['a'],
+          environmental_score_tags: ['a'],
+          environmental_score_grade: 'a',
+        }),
+        gradedLine('40000003', 30, {
+          nutrition_grades_tags: ['b'],
+          environmental_score_tags: ['a'],
+          environmental_score_grade: 'b',
+        }),
+        gradedLine('40000004', 20, {
+          nutrition_grades_tags: ['c'],
+          environmental_score_tags: ['f'],
+          environmental_score_grade: 'f',
+        }),
+        gradedLine('40000005', 10, {}),
+      ];
+
+      /** Records a completed full load built at record version `version`. */
+      const loadAt = (version: number) =>
+        `INSERT INTO mirror_load(id, generation, loaded_at, record_version) VALUES (1, 1, '2026-11-01T06:00:00.000Z', ${version})`;
+
+      /** The stores whose last completed full load does not index Green-Score. */
+      const OLDER_LOADS: [string, Parameters<typeof writeMirror>[1]][] = [
+        ['no full load recorded', {}],
+        ['a load built at record version 1', { sql: [loadAt(1)], recordVersion: 1 }],
+        [
+          'a version-1 load whose rows a reload has rewritten part-way',
+          { sql: [loadAt(1)], recordVersion: 2 },
+        ],
+      ];
+
+      const codes = (outcome: SearchOutcome) => served(outcome).products.map((row) => row.code);
+
+      beforeEach(() => {
+        vi.mocked(searchByTags).mockClear();
+      });
+
+      it.each<[string, () => Promise<void>, boolean]>([
+        ['no mirror configured', async () => undefined, false],
+        ...OLDER_LOADS.map(([label, options]): [string, () => Promise<void>, boolean] => [
+          label,
+          () => writeMirror(CORPUS, options),
+          false,
+        ]),
+        [
+          'a version-2 load on a store not ready to serve',
+          () => writeMirror(CORPUS, { sql: [loadAt(2)], firstLoadRunning: true }),
+          false,
+        ],
+        ['a load built at record version 2', () => writeMirror(CORPUS, { sql: [loadAt(2)] }), true],
+        ['a load built at record version 3', () => writeMirror(CORPUS, { sql: [loadAt(3)] }), true],
+      ])('answers mirrorIndexesGreenScore for %s', async (_label, build, expected) => {
+        await build();
+        forbidFetch();
+
+        await expect(svc.mirrorIndexesGreenScore(createMockContext())).resolves.toBe(expected);
+      });
+
+      it('serves a Green-Score search from a store whose last full load indexed it, by the grade filed for France', async () => {
+        await writeMirror(CORPUS, { sql: [loadAt(2)] });
+        forbidFetch();
+
+        const outcome = served(
+          await svc.searchProducts(
+            { ecoscore_grade: 'a', tags_confirmed: true },
+            createMockContext(),
+          ),
+        );
+
+        expect(outcome).toMatchObject({ count: 2, count_is_exact: true, source: 'off_mirror' });
+        expect(
+          outcome.products.map(({ code, ecoscore_grade }) => ({ code, ecoscore_grade })),
+        ).toEqual([
+          { code: '40000002', ecoscore_grade: 'a' },
+          { code: '40000003', ecoscore_grade: 'b' },
+        ]);
+        expect(searchByTags).toHaveBeenCalledOnce();
+      });
+
+      it('serves any-of grade groups from the store, each total the single grades summed', async () => {
+        await writeMirror(CORPUS, { sql: [loadAt(2)] });
+        forbidFetch();
+        const ctx = createMockContext();
+        const search = (params: ProductSearch) =>
+          svc.searchProducts({ ...params, tags_confirmed: true }, ctx);
+
+        const nutri = served(await search({ nutrition_grade: ['a', 'b'] }));
+        const green = served(await search({ ecoscore_grade: ['a-plus', 'a'] }));
+
+        expect(nutri.count).toBe(3);
+        expect(codes(nutri)).toEqual(['40000001', '40000002', '40000003']);
+        expect(green.count).toBe(3);
+        expect(codes(green)).toEqual(['40000001', '40000002', '40000003']);
+        expect(nutri.source).toBe('off_mirror');
+      });
+
+      it.each(OLDER_LOADS)(
+        'reads a Green-Score search live, running no store search, with %s',
+        async (_label, options) => {
+          await writeMirror(CORPUS, options);
+          global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_HITS));
+          const ctx = createMockContext();
+
+          const outcome = served(
+            await svc.searchProducts(
+              { ecoscore_grade: ['a', 'a-plus'], page: 3, tags_confirmed: true },
+              ctx,
+            ),
+          );
+
+          expect(outcome.source).toBe('off_api');
+          expect(searchByTags).not.toHaveBeenCalled();
+          expect(global.fetch).toHaveBeenCalledOnce();
+          const url = new URL(sentRequest().url);
+          expect(url.pathname).toBe('/api/v2/search');
+          expect(url.searchParams.get('environmental_score_tags')).toBe('a|a-plus');
+          expect(warnings(ctx)).toEqual([]);
+        },
+      );
+
+      it.each(OLDER_LOADS)(
+        'refuses a Green-Score page past 10, and past the window, by the live bound with %s',
+        async (_label, options) => {
+          await writeMirror(CORPUS, options);
+          forbidFetch();
+          const ctx = createMockContext();
+
+          for (const paging of [{ page: 11 }, { page: 201, page_size: 50 }]) {
+            await expect(
+              svc.searchProducts({ ecoscore_grade: 'a', ...paging, tags_confirmed: true }, ctx),
+            ).resolves.toEqual({ status: 'page_out_of_range', bound: 'live_max_page' });
+          }
+          expect(searchByTags).not.toHaveBeenCalled();
+          expect(warnings(ctx)).toEqual([]);
+        },
+      );
+
+      it('refuses a Green-Score page past the window by the window once the store indexes it', async () => {
+        await writeMirror(CORPUS, { sql: [loadAt(2)] });
+        forbidFetch();
+
+        await expect(
+          svc.searchProducts(
+            { ecoscore_grade: 'a', page: 201, page_size: 50, tags_confirmed: true },
+            createMockContext(),
+          ),
+        ).resolves.toEqual({ status: 'page_out_of_range', bound: 'mirror_window' });
+        expect(searchByTags).not.toHaveBeenCalled();
+      });
+
+      it('serves a search without Green-Score from an older load, as before', async () => {
+        await writeMirror(CORPUS, { sql: [loadAt(1)], recordVersion: 1 });
+        forbidFetch();
+
+        const outcome = served(
+          await svc.searchProducts(
+            { nutrition_grade: 'a', page: 11, page_size: 1, tags_confirmed: true },
+            createMockContext(),
+          ),
+        );
+
+        expect(outcome).toMatchObject({ count: 2, page: 11, products: [], source: 'off_mirror' });
+      });
+    });
+
+    describe('generic name, nutrient levels, and the record version (#87)', () => {
+      /** As-sold per 100 ml; generic name "assaisonnement". */
+      const PER_100ML = '0008017310112';
+
+      /** What a row built at record version 1 holds: the doc without either field. */
+      const VERSION_1_DOC = `UPDATE products SET doc = json_remove(doc, '$.generic_name', '$.nutrient_levels')`;
+
+      it('asks for both fields on a full read, the list the fields enum offers', async () => {
+        const urls: string[] = [];
+        global.fetch = vi.fn(async (input: unknown) => {
+          urls.push(String(input));
+          return mockResponse({ status: 1, product: {} });
+        }) as typeof fetch;
+
+        await svc.getProduct(OATS, createMockContext());
+
+        const sent = new URL(urls[0] ?? '').searchParams.get('fields')?.split(',');
+        expect(sent).toEqual(PRODUCT_FIELD_LIST);
+        expect(sent).toEqual(offGetProductTool.input.shape.fields.unwrap().element.options);
+      });
+
+      it('reads a full product live from a row built before both fields, and serves a rewritten one', async () => {
+        const oats = mirrorFixture(OATS);
+        const other = mirrorFixture(PER_100ML);
+        // Mid-reload: the current builder has rewritten one row and not yet the other.
+        await writeMirror([oats.line, other.line], {
+          sql: [
+            `${VERSION_1_DOC} WHERE code = '${OATS}'`,
+            `UPDATE products SET record_version = 1 WHERE code = '${OATS}'`,
+          ],
+        });
+        const requests = stubLive([oats, other]);
+        const ctx = createMockContext();
+
+        const stale = await svc.getProduct(OATS, ctx);
+        const rewritten = await svc.getProduct(PER_100ML, ctx);
+
+        expect(stale?.source).toBe('off_api');
+        expect(stale?.product).toMatchObject({
+          generic_name: 'Rolled oats',
+          nutrient_levels: { fat: 'moderate', salt: 'low', 'saturated-fat': 'low', sugars: 'low' },
+        });
+        expect(rewritten).toMatchObject({
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+          product: {
+            generic_name: 'assaisonnement',
+            nutrient_levels: {
+              fat: 'low',
+              salt: 'moderate',
+              'saturated-fat': 'low',
+              sugars: 'high',
+            },
+          },
+        });
+        expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it.each([
+        ['naming neither field', 'product_name,brands', []],
+        ['naming generic_name', 'product_name,generic_name', [`/api/v2/product/${OATS}.json`]],
+        [
+          'naming nutrient_levels',
+          'nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit',
+          [`/api/v2/product/${OATS}.json`],
+        ],
+      ])(
+        'serves a subset %s from a row built before both fields only when it names neither',
+        async (_label, fields, livePaths) => {
+          await writeMirror([mirrorFixture(OATS).line], {
+            recordVersion: 1,
+            sql: [VERSION_1_DOC],
+          });
+          const requests = stubLive([mirrorFixture(OATS)]);
+
+          const read = await svc.getProductFields(OATS, fields, createMockContext());
+
+          expect(read?.source).toBe(livePaths.length > 0 ? 'off_api' : 'off_mirror');
+          expect(Object.keys(read?.product ?? {}).sort()).toEqual(
+            fields
+              .split(',')
+              .filter((field) => field in mirrorFixture(OATS).live.product)
+              .sort(),
+          );
+          expect(requests).toEqual(livePaths);
+        },
+      );
+
+      it('keeps off_compare_products on rows built before both fields, sending nothing', async () => {
+        await writeMirror([mirrorFixture(OATS).line, mirrorFixture(PER_100ML).line], {
+          recordVersion: 1,
+          sql: [VERSION_1_DOC],
+        });
+        forbidFetch();
+
+        const result = await runToolContract(offCompareProductsTool, {
+          barcodes: [OATS, PER_100ML],
+        });
+
+        expect(result.isError).toBeFalsy();
+        const rows = (result.structuredContent as { products: { source?: string }[] }).products;
+        expect(rows.map((row) => row.source)).toEqual(['off_mirror', 'off_mirror']);
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        [
+          'an as-sold record',
+          OATS,
+          {
+            generic_name: 'Rolled oats',
+            nutrient_levels: {
+              basis: 'as_sold',
+              fat: 'moderate',
+              saturated_fat: 'low',
+              sugars: 'low',
+              salt: 'low',
+            },
+          },
+        ],
+        [
+          'a record whose read serves its prepared figures',
+          BOTH,
+          {
+            generic_name: 'Harina para preparar galletas',
+            nutrient_levels: {
+              basis: 'prepared',
+              fat: 'high',
+              saturated_fat: 'high',
+              sugars: 'high',
+              salt: 'moderate',
+            },
+          },
+        ],
+      ])(
+        'off_get_product serves %s’s generic name and levels from a current row as it reads them live',
+        async (_label, code, expected) => {
+          const fixture = mirrorFixture(code);
+
+          const runs = await liveThenMirror([fixture], [fixture], () =>
+            runToolContract(offGetProductTool, { barcode: code }),
+          );
+
+          expect(runs.mirrorRequests).toEqual([]);
+          expect((runs.mirror.structuredContent as { product: unknown }).product).toMatchObject(
+            expected,
+          );
+          expectSameAnswer(runs.live, runs.mirror, PRODUCT_PROVENANCE);
+        },
+      );
+
+      describe('a row built before both fields whose live read fails or finds nothing', () => {
+        type Degraded = {
+          product: Record<string, unknown>;
+          requested_fields?: string[];
+          source?: string;
+          mirror_as_of?: string;
+          mirror_snapshot?: string;
+          mirror_fields_unread?: string;
+        };
+
+        /**
+         * Runs `run` on fake timers, a second at a time, until it settles. A mirror read awaits the
+         * store before the live read schedules its first backoff, so one `runAllTimersAsync`
+         * returns before there is a timer to run.
+         */
+        async function onSteppedTimers<T>(run: () => Promise<T>): Promise<T> {
+          vi.useFakeTimers({
+            toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+          });
+          try {
+            let settled = false;
+            const pending = run().finally(() => {
+              settled = true;
+            });
+            pending.catch(() => undefined);
+            for (let second = 0; second < 120 && !settled; second++) {
+              await vi.advanceTimersByTimeAsync(1_000);
+            }
+            return await pending;
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+
+        /** Answers every v2 read of `code` with `answer`; any other request fails the call. */
+        function stubProductRoute(
+          code: string,
+          answer: (signal: AbortSignal) => Promise<Response>,
+        ): string[] {
+          const requests: string[] = [];
+          global.fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+            const url = new URL(String(input));
+            requests.push(url.pathname);
+            if (
+              url.hostname !== 'world.openfoodfacts.org' ||
+              url.pathname !== `/api/v2/product/${code}.json`
+            ) {
+              throw new Error(`Unexpected request: ${url.href}`);
+            }
+            return answer(init?.signal as AbortSignal);
+          }) as typeof fetch;
+          return requests;
+        }
+
+        /** A complete store holding `code` as a row built at record version 1. */
+        function writeVersion1Row(code: string): Promise<void> {
+          return writeMirror([mirrorFixture(code).line], {
+            recordVersion: 1,
+            sql: [VERSION_1_DOC],
+          });
+        }
+
+        /** Every text block of a run, joined: format() output plus trailer. */
+        function runText(run: ToolRun): string {
+          return (run.content as { type: string; text?: string }[])
+            .map((block) => block.text ?? '')
+            .join('\n');
+        }
+
+        /**
+         * The product off_get_product answers for `input` when the live read of a version-1 row
+         * succeeds, without the two fields the row predates: what the row itself holds.
+         */
+        async function storedProduct(code: string, input: Record<string, unknown>) {
+          stubLive([mirrorFixture(code)]);
+          const live = await runToolContract(offGetProductTool, input as { barcode: string });
+          expect((live.structuredContent as Degraded).source).toBe('off_api');
+          const { generic_name, nutrient_levels, ...stored } = (live.structuredContent as Degraded)
+            .product;
+          return { stored, generic_name, nutrient_levels };
+        }
+
+        const BOTH_UNREAD =
+          "generic_name and nutrient_levels are absent because they were not read, not because Open Food Facts lacks them: this server's local copy of this product predates them, and the live read for them";
+
+        const FAILURES: [string, (signal: AbortSignal) => Promise<Response>, string][] = [
+          ['HTTP 429', async () => mockResponse('', 429), 'rate_limited'],
+          ['HTTP 400', async () => mockResponse('', 400), 'upstream_rejected'],
+          ['HTTP 403', async () => mockResponse('', 403), 'upstream_rejected'],
+          ['HTTP 501', async () => mockResponse('', 501), 'upstream_rejected'],
+          ['HTTP 500', async () => mockResponse('', 500), 'upstream_error'],
+          ['HTTP 503', async () => mockResponse('', 503), 'upstream_error'],
+          ['HTTP 504', async () => mockResponse('', 504), 'upstream_timeout'],
+          ['HTTP 408', async () => mockResponse('', 408), 'upstream_timeout'],
+          [
+            'a dropped connection',
+            async () => {
+              throw new TypeError('fetch failed');
+            },
+            'upstream_error',
+          ],
+          ['a malformed envelope', async () => mockResponse({ status: 1 }), 'upstream_error'],
+          [
+            'no answer',
+            (signal) =>
+              new Promise<Response>((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason));
+              }),
+            'upstream_timeout',
+          ],
+        ];
+
+        it.each(FAILURES)(
+          'answers a full read from the stored row, both fields named unread, when the live read answers %s',
+          async (_label, answer, reason) => {
+            await writeVersion1Row(OATS);
+            const { stored, generic_name } = await storedProduct(OATS, { barcode: OATS });
+            expect(generic_name).toBe('Rolled oats');
+            const requests = stubProductRoute(OATS, answer);
+
+            const result = await onSteppedTimers(() =>
+              runToolContract(offGetProductTool, { barcode: OATS }),
+            );
+
+            expect(result.isError).toBeFalsy();
+            expect(requests.length).toBeGreaterThan(0);
+            const { product, ...rest } = result.structuredContent as Degraded;
+            expect(product).toEqual(stored);
+            expect(rest).toMatchObject({
+              source: 'off_mirror',
+              mirror_as_of: AS_OF,
+              mirror_snapshot: PRODUCT_NOTE,
+            });
+            const note = rest.mirror_fields_unread ?? '';
+            expect(note.startsWith(`${BOTH_UNREAD} failed (${reason}: "`)).toBe(true);
+            expect(note.endsWith('"). Retry later to read them.')).toBe(true);
+            const text = runText(result);
+            expect(text).toContain(`**Unread fields:** ${note}`);
+            expect(text).toContain('Other missing fields = not yet entered.');
+            expect(text).not.toMatch(/\*\*Generic name:\*\*|\*\*Nutrient levels/);
+          },
+        );
+
+        it('names the failure an HTTP 503 ended the live read with, on both surfaces', async () => {
+          await writeVersion1Row(OATS);
+          stubProductRoute(OATS, async () => mockResponse('', 503));
+
+          const result = await onSteppedTimers(() =>
+            runToolContract(offGetProductTool, { barcode: OATS }),
+          );
+
+          const note = `${BOTH_UNREAD} failed (upstream_error: "Open Food Facts is unavailable (HTTP 503). (failed after 4 attempts)"). Retry later to read them.`;
+          expect((result.structuredContent as Degraded).mirror_fields_unread).toBe(note);
+          expect(runText(result)).toContain(`**Unread fields:** ${note}`);
+        });
+
+        it.each([
+          ['HTTP 404', async () => mockResponse(PRODUCT_NOT_FOUND_404, 404)],
+          ['status 0', async () => mockResponse({ status: 0, status_verbose: 'not found' })],
+        ])(
+          'answers a full read from the stored row when the live read finds no product (%s)',
+          async (_label, answer) => {
+            await writeVersion1Row(OATS);
+            const { stored } = await storedProduct(OATS, { barcode: OATS });
+            const requests = stubProductRoute(OATS, answer);
+
+            const result = await runToolContract(offGetProductTool, { barcode: OATS });
+
+            expect(result.isError).toBeFalsy();
+            expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+            const { product, ...rest } = result.structuredContent as Degraded;
+            expect(product).toEqual(stored);
+            const note = `${BOTH_UNREAD} found no product under this barcode, which Open Food Facts may have removed since ${AS_OF}.`;
+            expect(rest).toMatchObject({
+              source: 'off_mirror',
+              mirror_as_of: AS_OF,
+              mirror_fields_unread: note,
+            });
+            expect(runText(result)).toContain(`**Unread fields:** ${note}`);
+          },
+        );
+
+        it('answers from the stored row without a request when the product budget is spent', async () => {
+          await writeVersion1Row(OATS);
+          const { stored } = await storedProduct(OATS, { barcode: OATS });
+          global.fetch = vi.fn(async () => mockResponse({ status: 0 })) as typeof fetch;
+          // The mocked config allows 100 product reads a minute; the stored-product read spent one.
+          for (let i = 0; i < 99; i++) {
+            await getOpenFoodFactsService().getProduct(
+              `9${String(i).padStart(12, '0')}`,
+              createMockContext(),
+            );
+          }
+          vi.mocked(global.fetch).mockClear();
+
+          const result = await runToolContract(offGetProductTool, { barcode: OATS });
+
+          expect(result.isError).toBeFalsy();
+          expect(global.fetch).not.toHaveBeenCalled();
+          const { product, mirror_fields_unread } = result.structuredContent as Degraded;
+          expect(product).toEqual(stored);
+          expect(
+            mirror_fields_unread?.startsWith(
+              `${BOTH_UNREAD} failed (rate_limited: "openfoodfacts-mcp-server declined this product request: its own client-side budget of 100 product requests/min is spent, so nothing was sent to Open Food Facts. A slot frees in about `,
+            ),
+          ).toBe(true);
+        });
+
+        it('names only nutrient_levels unread for a subset naming it, keeping what it depends on', async () => {
+          await writeVersion1Row(OATS);
+          const input = { barcode: OATS, fields: ['nutrient_levels'] };
+          const { stored, nutrient_levels } = await storedProduct(OATS, input);
+          expect(nutrient_levels).toBeDefined();
+          expect(Object.keys(stored)).toContain('nutriments');
+          stubProductRoute(OATS, async () => mockResponse('', 503));
+
+          const result = await onSteppedTimers(() =>
+            runToolContract(offGetProductTool, input as { barcode: string }),
+          );
+
+          expect(result.isError).toBeFalsy();
+          const { product, requested_fields, mirror_fields_unread } =
+            result.structuredContent as Degraded;
+          expect(product).toEqual(stored);
+          expect(requested_fields).toEqual([
+            'nutrient_levels',
+            'nutriments',
+            'serving_size',
+            'serving_quantity',
+            'serving_quantity_unit',
+          ]);
+          expect(mirror_fields_unread).toBe(
+            'nutrient_levels is absent because it was not read, not because Open Food Facts lacks it: this server\'s local copy of this product predates it, and the live read for it failed (upstream_error: "Open Food Facts is unavailable (HTTP 503). (failed after 4 attempts)"). Retry later to read it.',
+          );
+        });
+
+        it('settles a prepared-only stored row from its own stored sets, with no second read', async () => {
+          await writeMirror([mirrorFixture(NESQUIK).line], {
+            recordVersion: 1,
+            sql: [VERSION_1_DOC],
+          });
+          const requests = stubProductRoute(NESQUIK, async () => mockResponse('', 503));
+
+          const result = await onSteppedTimers(() =>
+            runToolContract(offGetProductTool, { barcode: NESQUIK }),
+          );
+
+          expect(result.isError).toBeFalsy();
+          expect(new Set(requests)).toEqual(new Set([`/api/v2/product/${NESQUIK}.json`]));
+          const { product, source } = result.structuredContent as Degraded;
+          expect(source).toBe('off_mirror');
+          expect(product).toMatchObject({
+            nutriments: { energy_kcal_100g: 327, stored_as_sold: { status: 'read' } },
+          });
+        });
+
+        it('ends the call as RequestCancelled when the caller aborts the live read', async () => {
+          await writeVersion1Row(OATS);
+          const controller = new AbortController();
+          global.fetch = vi.fn(
+            (_input: unknown, init?: RequestInit) =>
+              new Promise<Response>((_resolve, reject) => {
+                const signal = init?.signal as AbortSignal;
+                signal.addEventListener('abort', () => reject(signal.reason));
+                controller.abort();
+              }),
+          ) as typeof fetch;
+
+          const result = await runToolContract(
+            offGetProductTool,
+            { barcode: OATS },
+            { context: { signal: controller.signal } },
+          );
+
+          expect(result.isError).toBe(true);
+          const { error } = result.structuredContent as { error: McpErrorish };
+          expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+          expect(result.structuredContent).not.toHaveProperty('product');
+          expect(global.fetch).toHaveBeenCalledOnce();
+        });
       });
     });
 

@@ -2,8 +2,8 @@
   "schema": "1002",
   "shape": "both",
   "code": "3175681026650",
-  "capturedAt": "2026-11-01T13:08:23.824Z",
-  "request": "/api/v2/product/3175681026650.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:00:46.181Z",
+  "request": "/api/v2/product/3175681026650.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "3175681026650",
@@ -1823,6 +1823,7 @@
       ],
       "ecoscore_grade": "unknown",
       "ecoscore_tags": ["unknown"],
+      "generic_name": "",
       "image_url": "https://images.openfoodfacts.org/images/products/317/568/102/6650/front_fr.28.400.jpg",
       "ingredients": [
         {
@@ -2198,6 +2199,7 @@
       "labels_tags": ["en:source-of-proteins", "en:high-proteins"],
       "last_modified_t": 1563289435,
       "nova_group": 4,
+      "nutrient_levels": {},
       "nutriments": {
         "calcium_prepared": 0.24,
         "calcium_prepared_100g": 0.24,

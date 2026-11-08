@@ -2,8 +2,8 @@
   "schema": "le1000",
   "shape": "no_nutrition",
   "code": "0025000054167",
-  "capturedAt": "2026-11-01T13:06:39.812Z",
-  "request": "/api/v2/product/0025000054167.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:02:02.874Z",
+  "request": "/api/v2/product/0025000054167.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0025000054167",
@@ -1089,6 +1089,7 @@
       ],
       "ecoscore_grade": "c",
       "ecoscore_tags": ["c"],
+      "generic_name": "orange juice",
       "image_url": "https://images.openfoodfacts.org/images/products/002/500/005/4167/front_en.20.400.jpg",
       "ingredients": [
         {
@@ -1153,6 +1154,7 @@
       "labels_tags": [],
       "last_modified_t": 1728123221,
       "nova_group": 1,
+      "nutrient_levels": {},
       "nutriments": {
         "nova-group": 1,
         "nova-group_100g": 1,

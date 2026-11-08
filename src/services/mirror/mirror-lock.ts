@@ -1,7 +1,8 @@
 /**
- * @fileoverview Cross-process sync lock for the mirror store. `defineMirror()` guards against
- * overlapping runs only within one instance, while `mirror:init` runs in its own process and the
- * scheduled refresh in a child of the server, so both share this lease row in the store itself.
+ * @fileoverview Cross-process sync lock for the mirror store. `mirror:init` runs in its own process
+ * and the scheduled refresh in a child of the server, so both share this lease row in the store
+ * itself. It is held for a whole sync run, not one `runSync`, which is why `mirror-sync.ts` leaves
+ * the framework's own sync lease off the store it hands the runner.
  * @module services/mirror/mirror-lock
  */
 

@@ -2,8 +2,9 @@
  * @fileoverview Tests for off_browse_taxonomy — live taxonomy resolution against the
  * search-a-licious autocomplete endpoint, the offline-sample merge and fallback (GH issue #14),
  * bare NOVA group tag IDs (GH issue #15), exact-term ranking of live suggestions (GH issue #42),
- * the tag output shape (GH issue #43), the per-call limit cap (GH issues #57 and #70), and caller
- * cancellation (GH issue #60).
+ * the tag output shape (GH issue #43), the per-call limit cap (GH issues #57 and #70), caller
+ * cancellation (GH issue #60), and the tag canonicalization confirms leading the list (GH issue
+ * #84).
  *
  * The taxonomy service now makes an HTTP call for the five open facets, so these stub global
  * `fetch` rather than mocking `fetchWithTimeout`: the framework helper throws on a non-2xx, so a
@@ -252,6 +253,7 @@ describe('off_browse_taxonomy', () => {
         ['allergens', 'allergen'],
         ['additives', 'additive'],
         ['countries', 'country'],
+        ['ingredients', 'ingredient'],
       ];
 
       for (const [facet, taxonomyName] of expected) {
@@ -977,9 +979,9 @@ describe('off_browse_taxonomy', () => {
       ]);
     });
 
-    it('keeps the offline block ahead of the live one, in its own order', async () => {
-      // "milk" matches three embedded categories, one of them the exact en:milks. The embedded
-      // block is merged first in its hand-maintained order; the ranking never reaches into it.
+    it('lifts the confirmed tag out of the offline block and keeps the rest of it ahead of the live one, in its own order (#84)', async () => {
+      // "milk" matches three embedded categories. en:milks, the plural the live answer confirms,
+      // leads (#84); the other two keep their hand-maintained order ahead of the live matches.
       stubAutocompleteBySize([
         { id: 'en:milk-chocolates', text: 'Milk chocolates' },
         { id: 'en:milks', text: 'Milks' },
@@ -992,12 +994,496 @@ describe('off_browse_taxonomy', () => {
       );
 
       expect(result.tags.map((t) => t.id)).toEqual([
-        'en:fermented-milk-products',
         'en:milks',
+        'en:fermented-milk-products',
         'en:plant-based-milk-alternatives',
         'en:milk-chocolates',
         'en:whole-milks',
       ]);
+    });
+
+    it('still ranks every exact or plural live ID ahead of the compounds, behind the confirmed one (#84)', async () => {
+      // The accept rule confirms the ID-equal en:lentil over the plural; rankExactTagFirst still
+      // lifts en:lentils past the compound upstream listed first.
+      stubAutocompleteBySize([
+        { id: 'en:lentil-soups', text: 'Lentil soups' },
+        { id: 'en:lentils', text: 'Lentils' },
+        { id: 'en:lentil', text: 'Lentil' },
+      ]);
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'lentil', limit: 10 },
+        ctx,
+      );
+
+      expect(result.tags.map((t) => t.id)).toEqual(['en:lentil', 'en:lentils', 'en:lentil-soups']);
+    });
+  });
+
+  // ── #84: the tag canonicalizeTag confirms leads the whole list ───────────
+
+  describe('the confirmed tag leads (#84)', () => {
+    /**
+     * Live autocomplete answers, captured 2026-11-08, as `[id, text]` in upstream order. `cereal`
+     * and `chees` keep their first three entries, their last, and every entry the embedded sample
+     * also lists; the rest are whole.
+     */
+    const LIVE = {
+      US: [
+        ['en:united-states', 'US'],
+        ['en:soviet-union', 'USSR'],
+      ],
+      cream: [
+        ['en:cream-pies', 'Cream Pies'],
+        ['en:cream-of-asparagus-soups', 'Cream of asparagus soups'],
+        ['en:cream-of-carrot-soups', 'Cream of carrot soups'],
+        ['en:cream-of-champignon-mushroom-soups', 'Cream of champignon mushroom soups'],
+        ['en:cream-of-zucchini-soups', 'Cream of courgette soups'],
+        ['en:cream-of-leek-soups', 'Cream of leek soups'],
+        ['en:cream-of-mushroom-soups', 'Cream of mushroom soups'],
+        ['en:cream-of-pumpkin-soups', 'Cream of pumpkin soups'],
+        ['en:cream-of-tomato-soups', 'Cream of tomato soups'],
+        ['en:cream-of-vegetable-soups', 'Cream of vegetable soups'],
+        ['en:cream-puff', 'Cream puff'],
+        ['en:cream-sauce-for-pizza-base', 'Cream sauce for pizza base'],
+        ['en:carbonara-sauces', 'Cream sauce with lardoons'],
+        ['en:cream-sauce-with-shallots', 'Cream sauce with shallots'],
+        ['en:cream-sauces', 'Cream sauces'],
+        ['en:cream-sauces-with-herbs', 'Cream sauces with herbs'],
+        ['en:cream-sauces-with-mushrooms', 'Cream sauces with mushrooms'],
+        ['en:cream-sauces-with-spices', 'Cream sauces with spices'],
+        ['en:cream-soups', 'Cream soups'],
+        ['en:creamer', 'Creamer'],
+        ['en:creams', 'Creams'],
+        ['en:creamy-almond-turron', 'Creamy almond turrón'],
+        ['en:creamy-peanut-turron', 'Creamy peanut turrón'],
+        ['en:creamy-puddings', 'Creamy puddings'],
+        ['en:creamy-quark', 'Creamy quark'],
+        ['en:cream-cheeses', 'cream cheese'],
+      ],
+      milk: [
+        ['en:semi-skimmed-milks', '2% milk'],
+        ['en:milk-bread-rolls', 'Milk bread rolls'],
+        ['en:milk-bread-rolls-with-chocolate', 'Milk bread rolls with chocolate'],
+        ['en:milk-choclate-sprinkles', 'Milk choclate sprinkles'],
+        ['en:milk-chocolate-bar', 'Milk chocolate bar'],
+        ['en:milk-chocolate-filled-with-praline', 'Milk chocolate bar filled with praline'],
+        ['en:milk-chocolate-bar-with-nougat', 'Milk chocolate bar with nougat'],
+        ['en:puffed-cereal-milk-chocolates', 'Milk chocolate bar with popped cereals'],
+        [
+          'en:milk-chocolate-bar-without-sugar-with-sweeteners',
+          'Milk chocolate bar without sugar with sweeteners',
+        ],
+        ['en:milk-chocolate-biscuits', 'Milk chocolate biscuits'],
+        ['en:milk-chocolate-candies', 'Milk chocolate candies'],
+        ['en:milk-chocolate-molds', 'Milk chocolate molds'],
+        ['en:milk-chocolates-with-almonds', 'Milk chocolate with almonds'],
+        ['en:milk-chocolate-with-caramel', 'Milk chocolate with caramel'],
+        ['en:milk-chocolate-with-dried-fruits', 'Milk chocolate with dried fruits'],
+        ['en:milk-chocolates-with-hazelnuts', 'Milk chocolate with hazelnuts'],
+        ['en:milk-chocolates-with-fleur-de-sel', 'Milk chocolates with fleur de sel'],
+        ['en:milk-chocolates-with-praline', 'Milk chocolates with praline'],
+        ['en:milk-chocolates-with-raisins', 'Milk chocolates with raisins'],
+        ['en:milk-chocolates-with-sweeteners', 'Milk chocolates with sweeteners'],
+        ['en:milk-drinks-fermented-with-bifidus', 'Milk drinks fermented with Bifidus'],
+        ['en:milk-drinks-fermented-with-l-casei', 'Milk drinks fermented with L casei'],
+        ['en:milk-jams', 'Milk jam'],
+        ['en:milk-powders', 'Milk powders'],
+        ['en:dairies', 'Milk products'],
+        ['en:milk-roll-from-bakery', 'Milk roll from bakery'],
+        ['en:milkshakes', 'Milk-shakes'],
+        ['en:milkshakes-from-fast-foods-restaurant', 'Milk-shakes from fast foods restaurant'],
+        ['en:milk-shakes-preparations', 'Milk-shakes preparations'],
+        ['en:milkfat', 'Milkfat'],
+        ['en:milks', 'Milks'],
+        ['en:milks-for-premature-babies', 'Milks for premature babies'],
+        ['en:milkshake-ipa', 'Milkshake IPA'],
+        [
+          'en:chocolate-covered-bars-with-milk-and-cereals',
+          'Milky cereal breakfast bar fortified with vitamins',
+        ],
+        ['en:milky-cereal-based-beverages', 'Milky cereal-based beverage'],
+        ['en:fruit-and-milk-beverages', 'milk and fruit juices'],
+        ['en:milk-chocolates', 'milk chocolate'],
+        ['en:milk-substitutes', 'milk replacement'],
+        ['en:milk-stouts', 'milk stout'],
+        ['en:dairy-drinks', 'milk-based drinks'],
+      ],
+      water: [
+        ['en:watercress', 'Watercress'],
+        ['en:watercress-soups', 'Watercress soups'],
+        ['en:waterloo-cheese', 'Waterloo cheese'],
+        ['en:watermelon-jams', 'Watermelon jams'],
+        ['en:watermelon-pulp', 'Watermelon pulp'],
+        ['en:watermelon-seed-oils', 'Watermelon seed oils'],
+        ['en:watermelon-syrups', 'Watermelon syrups'],
+        ['en:watermelons', 'Watermelons'],
+        ['en:waters', 'Waters'],
+        ['en:waterzooi', 'Waterzooi'],
+      ],
+      nuts: [['en:nuts', 'Nuts']],
+      drinks: [
+        ['en:beverages', 'Drinks'],
+        ['en:alcoholic-beverages', 'drinks with alcohol'],
+      ],
+      cookies: [
+        ['en:cookies-with-chocolate-and-coconut', 'Cookies with chocolate and coconut'],
+        ['en:cookies-with-chocolate-and-nougat', 'Cookies with chocolate and nougat'],
+        ['en:cookies-with-milk-chocolate', 'Cookies with milk chocolate'],
+        ['en:biscuits', 'cookies'],
+      ],
+      cereal: [
+        ['en:cereal-bar-with-almonds', 'Cereal bar with almonds'],
+        ['en:cereal-bar-with-almonds-or-hazelnuts', 'Cereal bar with almonds or hazelnuts'],
+        [
+          'en:cereal-bar-with-chocolate-fortified-with-vitamins-and-minerals',
+          'Cereal bar with chocolate fortified with vitamins ',
+        ],
+        ['en:cereals-and-their-products', 'Cereals'],
+        ['en:cereals-and-potatoes', 'Cereals and potatoes'],
+        ['en:cereals-for-babies', 'Cereals for babies'],
+        ['en:cereals-based-beverages', 'Cereals-based beverages'],
+      ],
+      chees: [
+        ['en:cheese-naans', 'Cheese Naans'],
+        ['en:cheese-and-ham-breaded', 'Cheese and ham breaded'],
+        ['en:cheese-and-mushrooms-pizza', 'Cheese and mushrooms pizza'],
+        ['en:cheesecakes', 'Cheesecakes'],
+        ['en:cheeses', 'Cheeses'],
+        ['en:cheeses-for-kids', 'Cheeses for kids'],
+        ['en:pasteurized-cheeses', 'cheeses made from pasteurized milk'],
+      ],
+      'plant based milk alternatives': [
+        ['en:plant-based-milk-alternatives', 'Plant-based milk alternatives'],
+      ],
+      // taxonomy_names=ingredient; en:egg carries the synonym text "eggs".
+      eggs: [
+        ['en:eggs-from-switzerland', 'Eggs from Switzerland'],
+        ['en:eggs-yolk-powder-from-free-range-hens', 'Eggs yolk powder from free range hens'],
+        ['en:egg', 'eggs'],
+        ['en:eggs-from-caged-hens', 'eggs from caged hens'],
+        ['en:egg-yolk', 'eggs yolk'],
+        ['en:egg-yolk-powder', 'eggs yolk powder'],
+      ],
+    } satisfies Record<string, [id: string, text: string][]>;
+
+    /** Stub the autocomplete with one captured answer. */
+    function stubCaptured(term: keyof typeof LIVE): void {
+      stubAutocomplete(LIVE[term].map(([id, text]) => ({ id, text })));
+    }
+
+    it.each([
+      { facet: 'countries', search: 'US', limit: 3, tag: 'en:united-states', matched: 5 },
+      { facet: 'categories', search: 'cream', limit: 2, tag: 'en:creams', matched: 28 },
+      { facet: 'categories', search: 'milk', limit: 1, tag: 'en:milks', matched: 42 },
+      { facet: 'categories', search: 'water', limit: 1, tag: 'en:waters', matched: 12 },
+      { facet: 'allergens', search: 'nuts', limit: 1, tag: 'en:nuts', matched: 2 },
+      { facet: 'categories', search: 'drinks', limit: 1, tag: 'en:beverages', matched: 5 },
+      { facet: 'categories', search: 'cookies', limit: 1, tag: 'en:biscuits', matched: 4 },
+      // No offline sample: the confirmed tag comes from the live answer alone, from third (#88).
+      { facet: 'ingredients', search: 'eggs', limit: 1, tag: 'en:egg', matched: 6 },
+    ] as const)(
+      '$facet "$search" at limit $limit leads with $tag, the value canonicalizeTag confirms',
+      async ({ facet, search, limit, tag, matched }) => {
+        stubCaptured(search);
+
+        const result = await runToolContract(offBrowseTaxonomyTool, { facet, search, limit });
+
+        // Still one autocomplete request for the call.
+        expect(global.fetch).toHaveBeenCalledOnce();
+        const structured = result.structuredContent as { tags: { id: string }[]; notice?: string };
+        expect(structured.tags[0]?.id).toBe(tag);
+        // Nothing was added or dropped: the match count the cut names is unchanged.
+        expect(structured.notice).toContain(
+          `The term matched ${matched} tags, and these are the first ${limit}.`,
+        );
+        const firstRow = contractText(result)
+          .split('\n')
+          .find((line) => line.startsWith('- '));
+        expect(firstRow).toContain(`\`${tag}\``);
+
+        // Browsing agrees with filtering on the same term.
+        await expect(
+          getTaxonomyService().canonicalizeTag(facet, search, createMockContext()),
+        ).resolves.toEqual({ value: structured.tags[0]?.id, resolution: 'vocabulary' });
+      },
+    );
+
+    it('moves only the confirmed tag: milk keeps the rest of the embedded block, then the live matches in upstream order', async () => {
+      stubCaptured('milk');
+
+      const result = await offBrowseTaxonomyTool.handler(
+        { facet: 'categories', search: 'milk', limit: 200 },
+        ctx,
+      );
+
+      const live = LIVE.milk.map(([id]) => id).filter((id) => id !== 'en:milks');
+      expect(result.tags.map((t) => t.id)).toEqual([
+        'en:milks',
+        'en:fermented-milk-products',
+        'en:plant-based-milk-alternatives',
+        ...live,
+      ]);
+    });
+
+    it('confirms by the name the live answer gives, and keeps the embedded display name of a sample entry', async () => {
+      const svc = getTaxonomyService();
+
+      // Live {id: en:beverages, text: "Drinks"}; no embedded entry matches "drinks" on it.
+      stubCaptured('drinks');
+      const drinks = await svc.search('categories', 'drinks', 1, ctx);
+      expect(drinks.tags).toEqual([{ id: 'en:beverages', name: 'Drinks' }]);
+
+      // Live {id: en:biscuits, text: "cookies"}; the sample lists it as "Biscuits" via an alias.
+      stubCaptured('cookies');
+      const cookies = await svc.search('categories', 'cookies', 20, createMockContext());
+      expect(cookies.tags[0]).toEqual({ id: 'en:biscuits', name: 'Biscuits' });
+    });
+
+    it.each([
+      [
+        'cereal',
+        ['en:breakfast-cereals', 'en:cereals-and-potatoes', 'en:cereals-and-their-products'],
+      ],
+      ['chees', ['en:cheeses', 'en:fresh-cheeses']],
+    ] as const)(
+      'keeps the embedded block, then upstream order, for "%s", which confirms no tag',
+      async (search, embedded) => {
+        stubCaptured(search);
+
+        const result = await offBrowseTaxonomyTool.handler(
+          { facet: 'categories', search, limit: 200 },
+          ctx,
+        );
+
+        const sampled: readonly string[] = embedded;
+        const live = LIVE[search].map(([id]) => id).filter((id) => !sampled.includes(id));
+        expect(result.tags.map((t) => t.id)).toEqual([...embedded, ...live]);
+        await expect(
+          getTaxonomyService().canonicalizeTag('categories', search, createMockContext()),
+        ).resolves.toMatchObject({ resolution: 'normalized', reason: 'no_match' });
+      },
+    );
+
+    it('leads the offline fallback with the tag the sample confirms', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new TypeError('Unable to connect.'));
+
+      vi.useFakeTimers();
+      let result: Awaited<ReturnType<typeof runToolContract>>;
+      try {
+        const pending = runToolContract(offBrowseTaxonomyTool, {
+          facet: 'allergens',
+          search: 'nuts',
+          limit: 1,
+        });
+        await vi.runAllTimersAsync();
+        result = await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const structured = result.structuredContent as { tags: { id: string }[]; notice?: string };
+      expect(structured.tags.map((t) => t.id)).toEqual(['en:nuts']);
+      expect(structured.notice).toContain('offline sample');
+      const text = contractText(result);
+      expect(text).toContain('- `en:nuts` — Nuts');
+      expect(text).not.toContain('en:peanuts');
+    });
+
+    describe('a confirmed tag the substring gate drops', () => {
+      /**
+       * The term spells with spaces what the tag spells with hyphens, so neither its ID nor its
+       * name contains the term, while the sample confirms it by its normalized ID.
+       */
+      const TERM = 'plant based milk alternatives';
+      const ROW = '- `en:plant-based-milk-alternatives` — Plant-based milk alternatives';
+
+      it('is listed first and counted, on both surfaces', async () => {
+        stubCaptured(TERM);
+
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: TERM,
+        });
+
+        expect(global.fetch).toHaveBeenCalledOnce();
+        const structured = result.structuredContent as { tags: unknown[] } & Record<
+          string,
+          unknown
+        >;
+        expect(structured.tags).toEqual([
+          { id: 'en:plant-based-milk-alternatives', name: 'Plant-based milk alternatives' },
+        ]);
+        for (const key of ['truncated', 'shown', 'cap', 'notice']) {
+          expect(structured).not.toHaveProperty(key);
+        }
+        const text = contractText(result);
+        expect(text).toContain('## categories (1 entries)');
+        expect(text).toContain(ROW);
+        expect(text).not.toContain('No categories tag matched');
+
+        await expect(
+          getTaxonomyService().canonicalizeTag('categories', TERM, createMockContext()),
+        ).resolves.toEqual({ value: 'en:plant-based-milk-alternatives', resolution: 'vocabulary' });
+      });
+
+      it('counts toward the match total a cut names', async () => {
+        stubAutocomplete([
+          ...LIVE[TERM].map(([id, text]) => ({ id, text })),
+          // Synthetic: a suggestion whose name does contain the spaced term.
+          { id: 'en:plant-based-milk-alternatives-for-babies', text: `${TERM} for babies` },
+        ]);
+
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: TERM,
+          limit: 1,
+        });
+
+        const structured = result.structuredContent as {
+          tags: { id: string }[];
+          notice?: string;
+        };
+        expect(structured.tags.map((t) => t.id)).toEqual(['en:plant-based-milk-alternatives']);
+        expect(structured.notice).toContain('The term matched 2 tags, and these are the first 1.');
+        expect(contractText(result)).toContain(ROW);
+      });
+
+      it('is listed first when the live answer does not name it, since the sample settles the accept rule first', async () => {
+        // Synthetic: an answer without the tag, as for the E-number terms the autocomplete answers
+        // with unrelated tags. canonicalizeTag confirms the tag from the sample with no lookup.
+        stubAutocomplete([]);
+
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: TERM,
+        });
+
+        expect(global.fetch).toHaveBeenCalledOnce();
+        const structured = result.structuredContent as { tags: { id: string }[] };
+        expect(structured.tags.map((t) => t.id)).toEqual(['en:plant-based-milk-alternatives']);
+        expect(contractText(result)).toContain(ROW);
+        await expect(
+          getTaxonomyService().canonicalizeTag('categories', TERM, createMockContext()),
+        ).resolves.toEqual({ value: 'en:plant-based-milk-alternatives', resolution: 'vocabulary' });
+      });
+
+      it('is listed first on the offline fallback too, counted in the sample sentence', async () => {
+        global.fetch = vi.fn().mockRejectedValue(new TypeError('Unable to connect.'));
+
+        vi.useFakeTimers();
+        let result: Awaited<ReturnType<typeof runToolContract>>;
+        try {
+          const pending = runToolContract(offBrowseTaxonomyTool, {
+            facet: 'categories',
+            search: TERM,
+          });
+          await vi.runAllTimersAsync();
+          result = await pending;
+        } finally {
+          vi.useRealTimers();
+        }
+
+        const structured = result.structuredContent as {
+          tags: { id: string }[];
+          notice?: string;
+        };
+        expect(structured.tags.map((t) => t.id)).toEqual(['en:plant-based-milk-alternatives']);
+        expect(structured.notice).toContain(
+          "These 1 result(s) come from this server's offline sample",
+        );
+        const text = contractText(result);
+        expect(text).toContain(ROW);
+        expect(text).toContain('These 1 result(s)');
+      });
+
+      it('is named in the search description, beside the substring rule it is an exception to', () => {
+        const { description } = offBrowseTaxonomyTool.input.shape.search;
+        expect(description).toContain(
+          `even when neither its ID nor its name contains the term as typed ("${TERM}" → en:plant-based-milk-alternatives)`,
+        );
+      });
+    });
+  });
+
+  // ── #88: ingredients, a live facet with no offline sample ────────────────
+
+  describe('the ingredients facet (#88)', () => {
+    /** Runs a call to settlement with the retry backoff collapsed onto fake timers. */
+    async function settled(input: z.input<typeof offBrowseTaxonomyTool.input>) {
+      vi.useFakeTimers();
+      try {
+        const pending = runToolContract(offBrowseTaxonomyTool, input);
+        await vi.runAllTimersAsync();
+        return await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it('resolves "inulin" to en:inulin against the ingredient taxonomy, on both surfaces', async () => {
+      stubAutocomplete([{ id: 'en:inulin', text: 'inulin' }]);
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'ingredients',
+        search: 'inulin',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { tags: unknown[] } & Record<string, unknown>;
+      expect(structured.tags).toEqual([{ id: 'en:inulin', name: 'inulin' }]);
+      expect(structured).not.toHaveProperty('notice');
+      expect(structured).not.toHaveProperty('total_in_facet');
+      expect(contractText(result)).toContain('- `en:inulin` — inulin');
+      expect(fetchedUrl().searchParams.get('taxonomy_names')).toBe('ingredient');
+      expect(fetchedUrl().searchParams.get('q')).toBe('inulin');
+    });
+
+    it('returns no tags without a term, with the pass-a-term notice on both surfaces', async () => {
+      const result = await runToolContract(offBrowseTaxonomyTool, { facet: 'ingredients' });
+
+      const structured = result.structuredContent as { tags: unknown[]; notice?: string };
+      expect(structured.tags).toEqual([]);
+      expect(structured.notice).toMatch(
+        /^Open Food Facts cannot list the ingredients vocabulary without a search term, /,
+      );
+      expect(structured.notice).not.toContain('offline');
+      const text = contractText(result);
+      expect(text).toContain('## ingredients (0 entries)');
+      expect(text).toContain('No tags returned for this query.');
+      expect(text).toContain('pass a search term to resolve one against the live vocabulary');
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it('names the cause of a failed lookup without describing an offline sample, on both surfaces', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new TypeError('Unable to connect.'));
+
+      const result = await settled({ facet: 'ingredients', search: 'inulin' });
+
+      const structured = result.structuredContent as { tags: unknown[]; notice?: string };
+      expect(structured.tags).toEqual([]);
+      expect(structured.notice).toMatch(
+        /^The live Open Food Facts ingredients vocabulary could not be reached /,
+      );
+      expect(structured.notice).toContain('resolves only against the live vocabulary');
+      expect(structured.notice).not.toContain('offline');
+      const text = contractText(result);
+      expect(text).toContain('could not be reached');
+      expect(text).toContain('resolves only against the live vocabulary');
+      expect(text).not.toContain('offline');
+    });
+
+    it('says ingredient IDs are singular when nothing matched, on both surfaces', async () => {
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'ingredients',
+        search: 'oats',
+      });
+
+      const notice = String((result.structuredContent as { notice?: string }).notice);
+      expect(notice).toContain('No ingredients tag matched "oats"');
+      expect(notice).toContain('ingredient IDs are singular');
+      expect(notice).not.toContain('plural upstream');
+      expect(contractText(result)).toContain('ingredient IDs are singular');
     });
   });
 

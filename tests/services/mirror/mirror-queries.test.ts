@@ -2,9 +2,10 @@
  * @fileoverview Tests for the mirror's read queries against a real store built through the write
  * path: export lines (the live fixtures under `tests/fixtures/mirror/` and synthetic ones) through
  * the record builder, `TagIds`, and the store's batch upsert. Covers barcode lookup (hit, miss,
- * leading zeros, duplicates) and tag-only search: ANDed includes, exclusions as absence, unknown
- * values, the stored brand and NOVA forms, every sort key with nulls and ties, and paging to and
- * past the last page with the exact total.
+ * leading zeros, duplicates) and tag-only search: ANDed includes, any-of lists (driving, sought, and
+ * excluded, on both page cuts), exclusions as absence, unknown values, the stored brand and NOVA
+ * forms, every sort key with nulls and ties, and paging to and past the last page with the exact
+ * total.
  * @module tests/services/mirror/mirror-queries.test
  */
 
@@ -60,8 +61,11 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-/** Writes export lines the way a sync page does: builder, tag ids, one batch upsert. */
-async function write(lines: Line[]): Promise<void> {
+/**
+ * Writes export lines the way a sync page does: builder, tag ids, one batch upsert, each row stamped
+ * with `recordVersion` as the record version that built it.
+ */
+async function write(lines: Line[], recordVersion = 1): Promise<void> {
   const handle = await store.raw();
   const records = lines.map((line) => {
     const record = buildMirrorRecord(line);
@@ -77,7 +81,7 @@ async function write(lines: Line[]): Promise<void> {
       created_t: record.createdT,
       last_modified_t: record.lastModifiedT,
       generation: 1,
-      record_version: 1,
+      record_version: recordVersion,
       tag_ids: JSON.stringify(
         [...new Set(record.tags.map((key) => ids.get(key) as number))].sort((a, b) => a - b),
       ),
@@ -132,10 +136,23 @@ describe('getByCodes', () => {
     ]);
   });
 
-  it('returns the stored document of a barcode the store holds', async () => {
+  it('returns the stored document of a barcode the store holds, with its row’s record version', async () => {
     const docs = await getByCodes(store, ['3175681026650']);
     expect([...docs.keys()]).toEqual(['3175681026650']);
-    expect(docs.get('3175681026650')).toEqual(buildMirrorRecord(fixtureLine('3175681026650'))?.doc);
+    expect(docs.get('3175681026650')).toEqual({
+      doc: buildMirrorRecord(fixtureLine('3175681026650'))?.doc,
+      recordVersion: 1,
+    });
+  });
+
+  it('reads each row’s own record version, as a reload leaves rows of two versions side by side', async () => {
+    await write([fixtureLine('0030000010402')], 2);
+
+    const docs = await getByCodes(store, ['0030000010402', '3175681026650', '01723380']);
+
+    expect(
+      Object.fromEntries([...docs].map(([code, stored]) => [code, stored.recordVersion])),
+    ).toEqual({ '0030000010402': 2, '3175681026650': 1, '01723380': 1 });
   });
 
   it('has no entry for a barcode the store lacks, beside a hit', async () => {
@@ -147,10 +164,10 @@ describe('getByCodes', () => {
   it('finds a code given with fewer or more leading zeros than the store keeps, keyed as given', async () => {
     const docs = await getByCodes(store, ['030000010402', '30000010402', '0000001723380']);
     expect([...docs.keys()]).toEqual(['030000010402', '30000010402', '0000001723380']);
-    expect(docs.get('030000010402')?.code).toBe('0030000010402');
-    expect(docs.get('30000010402')?.code).toBe('0030000010402');
+    expect(docs.get('030000010402')?.doc.code).toBe('0030000010402');
+    expect(docs.get('30000010402')?.doc.code).toBe('0030000010402');
     // A 13-digit code starting 00000 is the EAN-8 it pads.
-    expect(docs.get('0000001723380')?.code).toBe('01723380');
+    expect(docs.get('0000001723380')?.doc.code).toBe('01723380');
   });
 
   it('accepts duplicate inputs, a miss among them', async () => {
@@ -161,7 +178,7 @@ describe('getByCodes', () => {
       '9999999999994',
     ]);
     expect([...docs.keys()]).toEqual(['01723380']);
-    expect(docs.get('01723380')?.code).toBe('01723380');
+    expect(docs.get('01723380')?.doc.code).toBe('01723380');
   });
 
   it('returns an empty map for no barcodes', async () => {
@@ -317,6 +334,138 @@ describe('searchByTags filters', () => {
       { codes: ['4000000000002'], total: 2 },
       { codes: [], total: 2 },
     ]);
+  });
+});
+
+describe('searchByTags any-of lists', () => {
+  const grade = (value: string | readonly string[]): MirrorTagFilter => ({
+    facet: 'nutrition_grades',
+    value,
+  });
+  const gradeland: MirrorTagFilter = { facet: 'countries', value: 'en:gradeland' };
+
+  beforeEach(async () => {
+    await write([
+      line('6000000000001', {
+        popularity_key: 60,
+        countries_tags: ['en:gradeland'],
+        nutrition_grades_tags: ['a'],
+      }),
+      line('6000000000002', {
+        popularity_key: 50,
+        countries_tags: ['en:gradeland'],
+        nutrition_grades_tags: ['b'],
+      }),
+      line('6000000000003', {
+        popularity_key: 40,
+        countries_tags: ['en:gradeland'],
+        nutrition_grades_tags: ['c'],
+      }),
+      // Two grades on one product: the store indexes what the export holds.
+      line('6000000000004', {
+        popularity_key: 30,
+        countries_tags: ['en:gradeland'],
+        nutrition_grades_tags: ['a', 'b'],
+      }),
+      line('6000000000005', { popularity_key: 20, nutrition_grades_tags: ['e'] }),
+      line('6000000000006', { popularity_key: 10, countries_tags: ['en:gradeland'] }),
+    ]);
+  });
+
+  it('matches a product carrying any value of a list, one carrying two of them once', async () => {
+    expect(await search([grade(['a', 'b'])])).toEqual({
+      codes: ['6000000000001', '6000000000002', '6000000000004'],
+      total: 3,
+    });
+  });
+
+  it('totals a list of values no product shares as their single totals summed', async () => {
+    const b = await search([grade('b')]);
+    const c = await search([grade('c')]);
+    const either = await search([grade(['b', 'c'])]);
+    expect(either).toEqual({
+      codes: ['6000000000002', '6000000000003', '6000000000004'],
+      total: 3,
+    });
+    expect(either.total).toBe(b.total + c.total);
+  });
+
+  it.each([
+    ['a one-value list', ['a']],
+    ['a list repeating one value', ['a', 'a']],
+  ])('serves %s exactly as that value, through the same statements', async (_label, value) => {
+    const scalar = await recordingReader();
+    const listed = await recordingReader();
+    const run = (reader: { raw: () => Promise<SqliteHandle> }, filter: MirrorTagFilter) =>
+      searchByTags(reader, {
+        include: [filter, gradeland],
+        exclude: [],
+        page: 1,
+        pageSize: 50,
+      });
+    const expected = await run(scalar.reader, grade('a'));
+    const page = await run(listed.reader, grade(value));
+    expect(page.docs.map((doc) => doc.code)).toEqual(['6000000000001', '6000000000004']);
+    expect(page).toEqual(expected);
+    expect(listed.statements).toEqual(scalar.statements);
+  });
+
+  it('treats an empty list as no filter, as an include or an exclusion', async () => {
+    const everyGradeland = {
+      codes: ['6000000000001', '6000000000002', '6000000000003', '6000000000004', '6000000000006'],
+      total: 5,
+    };
+    expect(await search([grade([]), gradeland])).toEqual(everyGradeland);
+    expect(await search([gradeland], { exclude: [grade([])] })).toEqual(everyGradeland);
+    expect(await search([grade([])])).toEqual(await search([]));
+    expect((await search([grade([])])).total).toBe(6);
+  });
+
+  it('takes from an include list the values an exclusion on its facet names', async () => {
+    expect(await search([grade(['a', 'b'])], { exclude: [grade('b')] })).toEqual({
+      codes: ['6000000000001'],
+      total: 1,
+    });
+  });
+
+  it('excludes a product carrying any value of an exclusion list, as one exclusion per value', async () => {
+    const listed = await recordingReader();
+    const each = await recordingReader();
+    const run = (reader: { raw: () => Promise<SqliteHandle> }, exclude: MirrorTagFilter[]) =>
+      searchByTags(reader, { include: [gradeland], exclude, page: 1, pageSize: 50 });
+    const page = await run(listed.reader, [grade(['a', 'b'])]);
+    expect(page.docs.map((doc) => doc.code)).toEqual(['6000000000003', '6000000000006']);
+    expect(page.total).toBe(2);
+    expect(page).toEqual(await run(each.reader, [grade('a'), grade('b')]));
+    expect(listed.statements).toEqual(each.statements);
+  });
+
+  it('drops the values of a list no product carries, and answers 0 for a list holding none', async () => {
+    expect(await search([grade(['a', 'not-a-grade'])])).toEqual({
+      codes: ['6000000000001', '6000000000004'],
+      total: 2,
+    });
+
+    const { reader, statements } = await recordingReader();
+    const page = await searchByTags(reader, {
+      include: [grade(['not-a-grade', 'nor-this']), gradeland],
+      exclude: [grade('c')],
+      page: 1,
+      pageSize: 50,
+    });
+    expect(page).toEqual({ total: 0, docs: [] });
+    expect(statements.filter((sql) => sql.includes('product_tags'))).toEqual([]);
+  });
+
+  it('reads a list given twice, in either order, once', async () => {
+    const once = await recordingReader();
+    const twice = await recordingReader();
+    const run = (reader: { raw: () => Promise<SqliteHandle> }, include: MirrorTagFilter[]) =>
+      searchByTags(reader, { include, exclude: [], page: 1, pageSize: 50 });
+    const page = await run(twice.reader, [grade(['a', 'b']), grade(['b', 'a'])]);
+    expect(page.total).toBe(3);
+    expect(page).toEqual(await run(once.reader, [grade(['a', 'b'])]));
+    expect(twice.statements).toEqual(once.statements);
   });
 });
 
@@ -493,6 +642,12 @@ describe('searchByTags cuts', () => {
   const few: MirrorTagFilter = { facet: 'labels', value: 'en:few' };
   const x: MirrorTagFilter = { facet: 'allergens', value: 'en:x' };
   const hasX = (l: Line) => l.allergens_tags !== undefined;
+  /** An any-of list of labels, and the lines it selects. */
+  const anyOf = (...labels: string[]): MirrorTagFilter => ({ facet: 'labels', value: labels });
+  const labeledAny =
+    (...labels: string[]) =>
+    (l: Line) =>
+      labels.some((label) => labeled(label)(l));
 
   /** The codes `keep` selects, in search order, computed from the lines alone. */
   function expected(keep: (l: Line) => boolean, sortBy: SortKey): string[] {
@@ -542,6 +697,47 @@ describe('searchByTags cuts', () => {
       [common, few, pair],
       [x],
       (l) => labeled('en:common')(l) && labeled('en:few')(l) && labeled('en:pair')(l) && !hasX(l),
+    ],
+    // Any-of lists, driving, sought, merged beside, and excluded.
+    ['a list alone', [anyOf('en:rare', 'en:few')], [], labeledAny('en:rare', 'en:few')],
+    // Every `en:few` product is also `en:pair`: each is counted once.
+    [
+      'a list of overlapping values less an exclusion',
+      [anyOf('en:few', 'en:pair')],
+      [x],
+      (l) => labeledAny('en:few', 'en:pair')(l) && !hasX(l),
+    ],
+    // Rare enough that subtracting it from the include's postings would read least, but a list's
+    // summed postings count the 30 products carrying both values twice: the stream counts it.
+    [
+      'a list of overlapping values less a rare exclusion',
+      [anyOf('en:few', 'en:pair')],
+      [rare],
+      (l) => labeledAny('en:few', 'en:pair')(l) && !labeled('en:rare')(l),
+    ],
+    [
+      'a list, an include merged with it, and an exclusion',
+      [anyOf('en:rare', 'en:few'), pair],
+      [x],
+      (l) => labeledAny('en:rare', 'en:few')(l) && labeled('en:pair')(l) && !hasX(l),
+    ],
+    [
+      'an include and a list it seeks',
+      [few, anyOf('en:common', 'en:rare')],
+      [],
+      (l) => labeled('en:few')(l) && labeledAny('en:common', 'en:rare')(l),
+    ],
+    [
+      'an include less an exclusion list',
+      [pair],
+      [anyOf('en:rare', 'en:few')],
+      (l) => labeled('en:pair')(l) && !labeledAny('en:rare', 'en:few')(l),
+    ],
+    [
+      'an exclusion list alone',
+      [],
+      [anyOf('en:common', 'en:rare')],
+      (l) => !labeledAny('en:common', 'en:rare')(l),
     ],
   ];
 
@@ -866,6 +1062,161 @@ describe('searchByTags cuts', () => {
     const cut = pageStatement(statements);
     expect(cut).toContain('FROM products w INDEXED BY products_popularity_key_sort');
     expect(cut).not.toContain('CROSS JOIN');
+  });
+
+  /**
+   * Serves every page by popularity through one recording reader, the one past the last included,
+   * each checked against the lines; returns the statements that served them and the total.
+   */
+  async function everyPage(
+    include: MirrorTagFilter[],
+    keep: (l: Line) => boolean,
+    pageSize: number,
+  ): Promise<{ cuts: string[]; statements: string[]; total: number }> {
+    const { reader, statements } = await recordingReader();
+    const order = expected(keep, 'popularity_key');
+    const last = Math.ceil(order.length / pageSize);
+    for (let pageNumber = 1; pageNumber <= last + 1; pageNumber++) {
+      const page = await searchByTags(reader, { include, exclude: [], page: pageNumber, pageSize });
+      expect(page.total).toBe(order.length);
+      expect(page.docs.map((doc) => doc.code)).toEqual(
+        order.slice((pageNumber - 1) * pageSize, pageNumber * pageSize),
+      );
+    }
+    const cuts = statements.filter((sql) => sql.includes('SELECT p.doc FROM'));
+    return { cuts, statements, total: order.length };
+  }
+
+  it('cuts the pages of a driving list both ways, reading its values’ postings as one union', async () => {
+    const { cuts, statements, total } = await everyPage(
+      [anyOf('en:rare', 'en:few')],
+      labeledAny('en:rare', 'en:few'),
+      7,
+    );
+    expect(total).toBe(32);
+    // A walk serves the pages nearest either end of the 32 matches, the postings those between.
+    expect(
+      cuts.filter((sql) =>
+        sql.includes(
+          'FROM products w INDEXED BY products_popularity_key_sort WHERE EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id IN (?, ?) AND i.code = w.code)',
+        ),
+      ),
+    ).toHaveLength(2);
+    expect(
+      cuts.filter((sql) =>
+        sql.includes(
+          `FROM (${POSTINGS_OF} UNION ${POSTINGS_OF}) AS d CROSS JOIN products w INDEXED BY products_code_sort_keys ON w.code = d.code`,
+        ),
+      ),
+    ).toHaveLength(3);
+    const counts = [...new Set(matchCounts(statements))];
+    expect(counts).toEqual([
+      `SELECT COUNT(*) AS n FROM (${POSTINGS_OF} UNION ${POSTINGS_OF}) AS d`,
+    ]);
+    const plan = await queryPlan(counts[0] as string);
+    expect(plan).toContain('MERGE (UNION)');
+    expect(plan.join('\n')).not.toMatch(/TEMP B-TREE|SCAN product_tags/);
+  });
+
+  it('cuts the pages of a sought list both ways, seeking its values per driving posting', async () => {
+    const sought =
+      'EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id IN (?, ?) AND i.code = d.code)';
+    const { cuts, statements, total } = await everyPage(
+      [few, anyOf('en:common', 'en:rare')],
+      (l) => labeled('en:few')(l) && labeledAny('en:common', 'en:rare')(l),
+      4,
+    );
+    expect(total).toBe(20);
+    // few (30) drives; the walk serves the first and last of the five pages.
+    expect(
+      cuts.filter((sql) =>
+        sql.includes(
+          'FROM products w INDEXED BY products_popularity_key_sort WHERE EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id = ? AND i.code = w.code) AND EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id IN (?, ?) AND i.code = w.code)',
+        ),
+      ),
+    ).toHaveLength(2);
+    expect(
+      cuts.filter((sql) =>
+        sql.includes(
+          `FROM product_tags d CROSS JOIN products w INDEXED BY products_code_sort_keys ON w.code = d.code WHERE d.tag_id = ? AND ${sought}`,
+        ),
+      ),
+    ).toHaveLength(3);
+    const counts = [...new Set(matchCounts(statements))];
+    expect(counts).toEqual([
+      `SELECT COUNT(*) AS n FROM product_tags d WHERE d.tag_id = ? AND ${sought}`,
+    ]);
+    expect((await queryPlan(counts[0] as string)).join('\n')).not.toMatch(
+      /TEMP B-TREE|SCAN product_tags/,
+    );
+  });
+
+  it('seeks a list beside a driving include where a single filter of its size is merged', async () => {
+    // few (30) drives, and a filter of up to 150 postings costs less to merge than to seek: pair
+    // (120) alone is merged, rare ∪ pair (122) sought.
+    const single = await recordingReader();
+    await searchByTags(single.reader, { include: [few, pair], exclude: [], page: 1, pageSize: 10 });
+    expect(matchCounts(single.statements)).toEqual([
+      `SELECT COUNT(*) AS n FROM (${POSTINGS_OF} INTERSECT ${POSTINGS_OF}) AS d`,
+    ]);
+
+    const listed = await recordingReader();
+    const page = await searchByTags(listed.reader, {
+      include: [few, anyOf('en:rare', 'en:pair')],
+      exclude: [],
+      page: 1,
+      pageSize: 10,
+    });
+    expect(page.total).toBe(30);
+    const counts = matchCounts(listed.statements);
+    expect(counts).toEqual([
+      'SELECT COUNT(*) AS n FROM product_tags d WHERE d.tag_id = ? AND EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id IN (?, ?) AND i.code = d.code)',
+    ]);
+    expect((await queryPlan(counts[0] as string)).join('\n')).not.toMatch(
+      /TEMP B-TREE|SCAN product_tags/,
+    );
+  });
+
+  it('merges single filters with a driving list in one ordered pass over their postings', async () => {
+    const { reader, statements } = await recordingReader();
+    const page = await searchByTags(reader, {
+      include: [anyOf('en:rare', 'en:few'), pair],
+      exclude: [x],
+      page: 1,
+      pageSize: 10,
+    });
+    expect(page.total).toBe(
+      lines.filter((l) => labeledAny('en:rare', 'en:few')(l) && labeled('en:pair')(l) && !hasX(l))
+        .length,
+    );
+    // rare ∪ few (32) drives; pair (120) and x (48) are merged with it, none sought.
+    const counts = matchCounts(statements);
+    expect(counts).toEqual([
+      `SELECT COUNT(*) AS n FROM (${POSTINGS_OF} UNION ${POSTINGS_OF} INTERSECT ${POSTINGS_OF} EXCEPT ${POSTINGS_OF}) AS d`,
+    ]);
+    const plan = await queryPlan(counts[0] as string);
+    expect(plan).toEqual(
+      expect.arrayContaining(['MERGE (UNION)', 'MERGE (INTERSECT)', 'MERGE (EXCEPT)']),
+    );
+    expect(plan.join('\n')).not.toMatch(/TEMP B-TREE|SCAN product_tags/);
+  });
+
+  it('ranks a list by every value’s postings summed, so a single include below the sum drives it', async () => {
+    // few ∪ pair sums to 150 postings, more than x's 48, though few alone (30) carries fewer: x
+    // drives, and the list is sought for each x posting.
+    const { reader, statements } = await recordingReader();
+    const page = await searchByTags(reader, {
+      include: [anyOf('en:few', 'en:pair'), x],
+      exclude: [],
+      page: 1,
+      pageSize: 10,
+    });
+    const keep = (l: Line) => labeledAny('en:few', 'en:pair')(l) && hasX(l);
+    expect(page.total).toBe(24);
+    expect(page.docs.map((doc) => doc.code)).toEqual(expected(keep, 'popularity_key').slice(0, 10));
+    expect(matchCounts(statements)).toEqual([
+      'SELECT COUNT(*) AS n FROM product_tags d WHERE d.tag_id = ? AND EXISTS (SELECT 1 FROM product_tags i WHERE i.tag_id IN (?, ?) AND i.code = d.code)',
+    ]);
   });
 
   it.each([

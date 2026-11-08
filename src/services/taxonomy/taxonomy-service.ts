@@ -1,8 +1,9 @@
 /**
  * @fileoverview Taxonomy service for Open Food Facts tag vocabularies. Resolves a search term
  * against the live search-a-licious autocomplete endpoint and merges the result with an embedded
- * vocabulary, which also serves unfiltered browsing, the two fixed facets, and offline operation.
- * Also canonicalizes the tag values a text search quotes into exact-match clauses.
+ * vocabulary, which also serves unfiltered browsing, the two fixed facets, and offline operation —
+ * for every facet but ingredients, which resolves only live. Also canonicalizes the tag values a
+ * text search quotes into exact-match clauses.
  * @module services/taxonomy/taxonomy-service
  */
 
@@ -36,6 +37,7 @@ export type Facet =
   | 'allergens'
   | 'additives'
   | 'countries'
+  | 'ingredients'
   | 'nova_groups'
   | 'nutrition_grades';
 
@@ -44,11 +46,20 @@ export type Facet =
 /* -------------------------------------------------------------------------- */
 
 /**
- * Offline sample of each facet, and the whole vocabulary for the two fixed facets. For the live
- * facets this is a small, hand-maintained slice of a much larger upstream taxonomy — it is merged
- * ahead of live suggestions rather than replaced by them, because the autocomplete endpoint matches
- * on display names and answers an E-number query with unrelated E-numbers, so `additives` searches
- * that resolve correctly here would regress on a live-only path.
+ * A facet with an embedded vocabulary: every one but `ingredients`. The ingredient taxonomy is large
+ * and its IDs singular, so a hand-kept slice would list little a caller needs; its values resolve
+ * only against the live autocomplete, and without a search term nothing is listed.
+ */
+type SampledFacet = Exclude<Facet, 'ingredients'>;
+
+/**
+ * Offline sample of each `SampledFacet`, and the whole vocabulary for the two fixed facets. For
+ * the live facets this is a small, hand-maintained slice of a much larger upstream taxonomy — it is
+ * merged ahead of live suggestions rather than replaced by them, because the autocomplete endpoint
+ * matches on display names and answers an E-number query with unrelated E-numbers, so `additives`
+ * searches that resolve correctly here would regress on a live-only path. The one exception is the
+ * tag the term itself names (`confirmedTag`), which leads the list from whichever source supplied
+ * it: a small limit would otherwise cut it behind sample entries that merely contain the term.
  *
  * Every ID here is a top-level key in the published taxonomy dumps
  * (https://static.openfoodfacts.org/data/taxonomies/). A synonym or singular form is not an error
@@ -56,7 +67,7 @@ export type Facet =
  * a term with no canonical key is left out rather than approximated, and the human word it was
  * carrying moves to `aliases` on the entry that does have one.
  */
-const TAXONOMY: Record<Facet, EmbeddedEntry[]> = {
+const TAXONOMY: Record<SampledFacet, EmbeddedEntry[]> = {
   categories: [
     { id: 'en:beverages', name: 'Beverages' },
     { id: 'en:breakfast-cereals', name: 'Breakfast cereals' },
@@ -315,6 +326,7 @@ const LIVE_TAXONOMY_NAME = {
   allergens: 'allergen',
   additives: 'additive',
   countries: 'country',
+  ingredients: 'ingredient',
 } as const satisfies Partial<Record<Facet, string>>;
 
 /** A facet the live autocomplete serves. */
@@ -322,6 +334,15 @@ type LiveFacet = keyof typeof LIVE_TAXONOMY_NAME;
 
 function isLiveFacet(facet: Facet): facet is LiveFacet {
   return facet in LIVE_TAXONOMY_NAME;
+}
+
+function isSampled(facet: Facet): facet is SampledFacet {
+  return facet in TAXONOMY;
+}
+
+/** The offline sample a live facet's values are checked against first: none for `ingredients`. */
+function sampleOf(facet: LiveFacet): readonly EmbeddedEntry[] {
+  return isSampled(facet) ? TAXONOMY[facet] : [];
 }
 
 /**
@@ -345,7 +366,10 @@ const toTag = ({ aliases: _aliases, ...tag }: EmbeddedEntry): TaxonomyEntry => t
  * `en:<slug>s`, or `en:<slug>es`, where the slug is the lowercased term with whitespace runs
  * hyphenated, the normalization tag IDs use — ahead of the rest, which keep upstream order. Only
  * an equal ID moves, so a compound that merely shares a word (`en:red-lentils` for "lentil") stays
- * where upstream put it. Nothing is added or dropped.
+ * where upstream put it. Nothing is added or dropped. Wider than the accept rule
+ * (`confirmedTag`), which lifts the one tag it confirms to the front of the whole list: this
+ * orders the live portion behind it, so every exact or plural ID still precedes the compounds when
+ * a term has several, or when the rule confirms none (`chees` → `en:cheeses`).
  */
 function rankExactTagFirst(live: TaxonomyEntry[], term: string): TaxonomyEntry[] {
   const slug = term.toLowerCase().replace(/\s+/g, '-');
@@ -354,6 +378,23 @@ function rankExactTagFirst(live: TaxonomyEntry[], term: string): TaxonomyEntry[]
     ...live.filter((entry) => exact.has(entry.id)),
     ...live.filter((entry) => !exact.has(entry.id)),
   ];
+}
+
+/**
+ * The tags led by the `confirmed` one, the rest keeping their order. A tag the list holds moves to
+ * the front. One the substring gate dropped is added there as the `sample` lists it, or else as the
+ * live answer did: the accept rule reads hyphens as spaces while the gate reads the term as typed,
+ * so `plant based milk alternatives` confirms a tag whose ID and name both spell it with hyphens.
+ */
+function confirmedFirst(
+  tags: TaxonomyEntry[],
+  confirmed: TaxonomyEntry | undefined,
+  sample: readonly EmbeddedEntry[],
+): TaxonomyEntry[] {
+  if (!confirmed) return tags;
+  const held = tags.find((tag) => tag.id === confirmed.id);
+  if (held) return [held, ...tags.filter((tag) => tag !== held)];
+  return [toTag(sample.find((entry) => entry.id === confirmed.id) ?? confirmed), ...tags];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -417,23 +458,24 @@ function lookupFailure(error: unknown): LookupFailure {
 }
 
 /**
- * The notice for a search answered from the offline sample because the live lookup failed. Only an
- * unavailable vocabulary is blamed on the vocabulary, with the failure's own message: a spent
- * budget sent nothing, and a 429 is a limit to wait out. Each names its wait when one is known.
+ * The notice for a search the live lookup failed, so answered from the offline sample, or with
+ * nothing for a facet that has none; `listed` says which. Only an unavailable vocabulary is blamed
+ * on the vocabulary, with the failure's own message: a spent budget sent nothing, and a 429 is a
+ * limit to wait out. Each names its wait when one is known.
  */
 function fallbackNotice(
   failure: LookupFailure,
   facet: string,
   message: string,
-  sample: string,
+  listed: string,
 ): string {
   switch (failure.cause) {
     case 'budget_spent':
-      return `This server's own per-minute taxonomy budget is spent, so nothing was sent to Open Food Facts and the live ${facet} vocabulary went unchecked. ${sample} A lookup slot frees in about ${failure.retryAfter} s; retry then for an authoritative answer.`;
+      return `This server's own per-minute taxonomy budget is spent, so nothing was sent to Open Food Facts and the live ${facet} vocabulary went unchecked. ${listed} A lookup slot frees in about ${failure.retryAfter} s; retry then for an authoritative answer.`;
     case 'rate_limited':
-      return `Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429), so the live ${facet} vocabulary went unchecked. ${sample} ${failure.retryAfter === undefined ? 'Retry in about a minute for an authoritative answer.' : `Open Food Facts asked for a wait of ${failure.retryAfter} s; retry then for an authoritative answer.`}`;
+      return `Open Food Facts is rate-limiting this server's taxonomy lookups (HTTP 429), so the live ${facet} vocabulary went unchecked. ${listed} ${failure.retryAfter === undefined ? 'Retry in about a minute for an authoritative answer.' : `Open Food Facts asked for a wait of ${failure.retryAfter} s; retry then for an authoritative answer.`}`;
     case 'unavailable':
-      return `The live Open Food Facts ${facet} vocabulary could not be reached or gave no usable answer (${message}). ${sample} Retry for an authoritative answer.`;
+      return `The live Open Food Facts ${facet} vocabulary could not be reached or gave no usable answer (${message}). ${listed} Retry for an authoritative answer.`;
     default: {
       const unhandled: never = failure;
       throw new Error(`Unhandled lookup failure: ${JSON.stringify(unhandled)}`);
@@ -495,14 +537,62 @@ function comparableName(text: string): string {
 }
 
 /**
+ * A trimmed taxonomy value as the accept rule compares entries to it: the tag ID Product Opener
+ * would normalize it to, and its name with any language prefix stripped, reduced for equality.
+ */
+type AcceptKey = { normalized: string; name: string };
+
+function acceptKey(trimmed: string): AcceptKey {
+  return {
+    normalized: normalizeTaxonomyValue(trimmed),
+    name: comparableName(trimmed.replace(LANGUAGE_PREFIX, '')),
+  };
+}
+
+/**
+ * The accept rule: the one vocabulary entry a taxonomy value names, or `undefined`.
+ * `canonicalizeTag` and `search()` both settle on it, so the tag browsing lists first is the one a
+ * filter on the same value resolves to. In order: an entry of the offline `sample` whose ID equals
+ * the normalized value or whose name equals the value's; then, from the `live` answer, an entry
+ * whose ID equals it, one whose name does — the autocomplete's `text`, the synonym it matched —
+ * and one whose ID is its plural. Embedded aliases take no part: they are wider than upstream
+ * synonyms.
+ *
+ * The plural rule is live-only because the autocomplete answers `nut` with
+ * `{id: en:nuts, text: Nuts}`, whose name is the plural, while Product Opener canonicalizes
+ * `en:nut` to `en:nuts` itself (and counts `en:chocolate` exactly as `en:chocolates`). The plural
+ * is the value plus `s`, or plus `es` only after an `ES_PLURAL_STEM` ending — narrower than
+ * `rankExactTagFirst`, which only ranks and never resolves. A first match settles each step, so
+ * the answer is single-valued.
+ */
+function confirmedTag(
+  key: AcceptKey,
+  sample: readonly TaxonomyEntry[],
+  live: readonly TaxonomyEntry[] = [],
+): TaxonomyEntry | undefined {
+  const named = (entry: TaxonomyEntry) => comparableName(entry.name) === key.name;
+  const sampled = sample.find((entry) => entry.id === key.normalized || named(entry));
+  if (sampled) return sampled;
+
+  const plurals = new Set([
+    `${key.normalized}s`,
+    ...(ES_PLURAL_STEM.test(key.normalized) ? [`${key.normalized}es`] : []),
+  ]);
+  return (
+    live.find((entry) => entry.id === key.normalized) ??
+    live.find(named) ??
+    live.find((entry) => plurals.has(entry.id))
+  );
+}
+
+/**
  * A taxonomy value the offline sample did not confirm, as the live lookup needs it: the trimmed
- * input, its normalized tag ID, the autocomplete term, and the ID-or-name match of the accept rule.
+ * input, the autocomplete term, and the accept rule's key.
  */
 type LiveLookupValue = {
   trimmed: string;
-  normalized: string;
   term: string;
-  isMatch: (entry: TaxonomyEntry) => boolean;
+  key: AcceptKey;
 };
 
 /**
@@ -541,10 +631,10 @@ export type TaxonomySearchResult = {
   matched_in_facet: number;
   /**
    * Agent-facing caveat about how this answer was produced — that the vocabulary listed is the
-   * offline sample, that the live vocabulary went unchecked and why (unreachable or no usable
-   * answer, Open Food Facts rate-limiting this server, or this server's own taxonomy budget spent,
-   * with the wait when one is known), or that nothing matched. Absent when the live resolution
-   * answered normally.
+   * offline sample, or that a facet with none lists nothing without a search term, that the live
+   * vocabulary went unchecked and why (unreachable or no usable answer, Open Food Facts
+   * rate-limiting this server, or this server's own taxonomy budget spent, with the wait when one
+   * is known), or that nothing matched. Absent when the live resolution answered normally.
    */
   notice?: string;
 };
@@ -561,13 +651,12 @@ export class TaxonomyService {
    * Canonicalize one tag value before it is quoted into an exact tag clause. Brands are slugged,
    * after any language prefix is dropped: Product Opener matches `brands_tags=xx:nutella` and
    * `=en:nutella` as it matches `=nutella`, and slugging the prefix would turn its colon into part
-   * of the slug (`xx-nutella`), which no brand carries. A taxonomy value is confirmed against the
-   * offline sample first, then the live autocomplete, accepting only an entry whose ID equals the
-   * normalized value, whose name equals the value with its language prefix stripped (compared
-   * case-insensitively, hyphens read as spaces), or —
-   * live only — whose ID is the normalized value plus `s` or `es`. So a synonym (`US` →
-   * `en:united-states`) or singular (`en:peanut` → `en:peanuts`, `en:nut` → `en:nuts`) resolves,
-   * and a prefix or partial match never does (`nutell` is not `nutella`, `US` is not `USSR`).
+   * of the slug (`xx-nutella`), which no brand carries. A taxonomy value is confirmed by the accept
+   * rule (`confirmedTag`) against the offline sample first, then the live autocomplete; an
+   * `ingredients` value, which has no sample, always takes the lookup. So a synonym (`US` →
+   * `en:united-states`, `eggs` → `en:egg`) or singular (`en:peanut` → `en:peanuts`, `en:nut` →
+   * `en:nuts`) resolves, and a prefix or partial match never does (`nutell` is not `nutella`, `US`
+   * is not `USSR`).
    *
    * Throws only when the caller cancels (`ctx.signal` aborted), so a cancellation ends the call
    * rather than reading as a failed lookup. Anything nothing confirms comes back normalized the way
@@ -590,19 +679,15 @@ export class TaxonomyService {
       };
     }
 
-    const normalized = normalizeTaxonomyValue(trimmed);
-    const term = trimmed.replace(LANGUAGE_PREFIX, '').replace(/-/g, ' ').trim();
-    const name = comparableName(term);
-    const isMatch = (entry: TaxonomyEntry) =>
-      entry.id === normalized || comparableName(entry.name) === name;
-
-    const offline = TAXONOMY[facet].find(isMatch);
+    const key = acceptKey(trimmed);
+    const offline = confirmedTag(key, sampleOf(facet));
     if (offline) return { value: offline.id, resolution: 'vocabulary' };
 
+    const term = trimmed.replace(LANGUAGE_PREFIX, '').replace(/-/g, ' ').trim();
     return await this.lookUp(
       facet,
-      { trimmed, normalized, term, isMatch },
-      `${facet}\u0000${normalized}`,
+      { trimmed, term, key },
+      `${facet}\u0000${key.normalized}`,
       deadlineAt,
       ctx,
     );
@@ -647,7 +732,7 @@ export class TaxonomyService {
     const remainingMs = deadlineAt - Date.now();
     if (remainingMs <= 0) {
       return {
-        value: value.normalized,
+        value: value.key.normalized,
         resolution: 'normalized',
         reason: 'lookup_failed',
         cause: 'unavailable',
@@ -663,13 +748,8 @@ export class TaxonomyService {
   }
 
   /**
-   * The live half of `canonicalizeTag`: one autocomplete lookup, the accept rule, and the cache
-   * write for a settled answer. The accept rule, in order: an option whose ID is the normalized
-   * value; one whose name equals the value; one whose ID is its plural. The autocomplete answers
-   * `nut` with `{id: en:nuts, text: Nuts}`, whose name is the plural, while Product Opener
-   * canonicalizes `en:nut` to `en:nuts` itself (and counts `en:chocolate` exactly as
-   * `en:chocolates`). The plural is the value plus `s`, or plus `es` only after an `ES_PLURAL_STEM`
-   * ending — narrower than `rankExactTagFirst`, which only ranks and never resolves.
+   * The live half of `canonicalizeTag`: one autocomplete lookup, the accept rule
+   * (`confirmedTag`) over the sample and its answer, and the cache write for a settled answer.
    */
   private async resolveLive(
     facet: LiveFacet,
@@ -678,7 +758,8 @@ export class TaxonomyService {
     deadlineMs: number,
     ctx: Context,
   ): Promise<CanonicalTag> {
-    const { trimmed, normalized, term, isMatch } = value;
+    const { trimmed, term, key } = value;
+    const { normalized } = key;
     let live: TaxonomyEntry[];
     try {
       live = await this.off.suggestTaxonomy(LIVE_TAXONOMY_NAME[facet], term, ctx, deadlineMs);
@@ -699,14 +780,7 @@ export class TaxonomyService {
       return { value: normalized, resolution: 'normalized', reason: 'lookup_failed', ...failure };
     }
 
-    const plurals = new Set([
-      `${normalized}s`,
-      ...(ES_PLURAL_STEM.test(normalized) ? [`${normalized}es`] : []),
-    ]);
-    const confirmed =
-      live.find((entry) => entry.id === normalized) ??
-      live.find((entry) => isMatch(entry)) ??
-      live.find((entry) => plurals.has(entry.id));
+    const confirmed = confirmedTag(key, sampleOf(facet), live);
     const resolved: CanonicalTag = confirmed
       ? { value: confirmed.id, resolution: 'vocabulary' }
       : { value: normalized, resolution: 'normalized', reason: 'no_match' };
@@ -721,8 +795,10 @@ export class TaxonomyService {
 
   /**
    * Resolve tags for a facet. With a search term, the live Open Food Facts vocabulary is queried
-   * and its suggestions merged behind the embedded matches; without one, the embedded sample is
-   * listed, because the upstream endpoint suggests against a term and cannot enumerate a facet.
+   * and its suggestions merged behind the embedded matches, led by the tag the term names
+   * (`confirmedTag`); without one, the embedded sample is listed, because the upstream endpoint
+   * suggests against a term and cannot enumerate a facet — so `ingredients`, which has no sample,
+   * lists nothing and asks for a term.
    */
   async search(
     facet: Facet,
@@ -730,11 +806,10 @@ export class TaxonomyService {
     limit: number,
     ctx: Context,
   ): Promise<TaxonomySearchResult> {
-    const embedded = TAXONOMY[facet];
     const term = search?.trim();
-    const taxonomyName = isLiveFacet(facet) ? LIVE_TAXONOMY_NAME[facet] : undefined;
 
-    if (!taxonomyName) {
+    if (!isLiveFacet(facet)) {
+      const embedded = TAXONOMY[facet];
       const matched = term ? embedded.filter((entry) => matchesTerm(entry, term)) : embedded;
       return {
         facet,
@@ -744,27 +819,36 @@ export class TaxonomyService {
       };
     }
 
+    const embedded = sampleOf(facet);
     if (!term) {
+      if (!isSampled(facet)) {
+        return {
+          facet,
+          tags: [],
+          matched_in_facet: 0,
+          notice:
+            'Open Food Facts cannot list the ingredients vocabulary without a search term, so no tags are returned — pass a search term to resolve one against the live vocabulary (ingredient IDs are singular: "oat" resolves to en:oat).',
+        };
+      }
       return {
         facet,
         tags: embedded.slice(0, limit).map(toTag),
         matched_in_facet: embedded.length,
-        notice:
-          `This is this server's offline ${facet} sample (${embedded.length} entries), not the Open Food Facts ` +
-          `${facet} taxonomy, which is far larger and cannot be listed in full — pass a search term to resolve ` +
-          'one against the live vocabulary.',
+        notice: `This is this server's offline ${facet} sample (${embedded.length} entries), not the Open Food Facts ${facet} taxonomy, which is far larger and cannot be listed in full — pass a search term to resolve one against the live vocabulary.`,
       };
     }
 
     const offline = embedded.filter((entry) => matchesTerm(entry, term));
+    const key = acceptKey(term);
 
     /**
      * The live call is the enrichment, not the answer of record: a caller asking for `en:organic`
      * during an Open Food Facts outage is better served by the offline match plus a caveat than by
-     * a failure, and a caller whose term matches nothing offline needs to be told the vocabulary
-     * went unchecked rather than reading an empty list as "no such tag". Both are the failure this
-     * degradation exists to prevent, so the throw is absorbed here and reported in `notice` — except
-     * a caller cancellation, which ends the call: nobody is left to read a degraded answer.
+     * a failure, and a caller whose term matches nothing offline (every `ingredients` term) needs to
+     * be told the vocabulary went unchecked rather than reading an empty list as "no such tag". Both
+     * are the failure this degradation exists to prevent, so the throw is absorbed here and reported
+     * in `notice` — except a caller cancellation, which ends the call: nobody is left to read a
+     * degraded answer.
      */
     let live: TaxonomyEntry[];
     try {
@@ -778,23 +862,26 @@ export class TaxonomyService {
        * has no offset, so reading everything is what makes the match count below exact, up to the
        * size a lookup asks for.
        */
-      live = await this.off.suggestTaxonomy(taxonomyName, term, ctx);
+      live = await this.off.suggestTaxonomy(LIVE_TAXONOMY_NAME[facet], term, ctx);
     } catch (error) {
       if (ctx.signal.aborted) throw error;
       const message = error instanceof Error ? error.message : String(error);
       const failure = lookupFailure(error);
-      ctx.log.warning('Live taxonomy resolution failed — falling back to the offline sample', {
+      ctx.log.warning('Live taxonomy resolution failed — answering without the live vocabulary', {
         facet,
         term,
         cause: failure.cause,
         error: message,
       });
-      const sample = `These ${offline.length} result(s) come from this server's offline sample of ${embedded.length} entries, so a term the sample does not cover reads as no match here even when the tag exists upstream.`;
+      const fallback = confirmedFirst(offline.map(toTag), confirmedTag(key, embedded), embedded);
+      const listed = isSampled(facet)
+        ? `These ${fallback.length} result(s) come from this server's offline sample of ${embedded.length} entries, so a term the sample does not cover reads as no match here even when the tag exists upstream.`
+        : `No ${facet} tags are listed, because this facet resolves only against the live vocabulary: the empty list does not mean the term has no tag.`;
       return {
         facet,
-        tags: offline.slice(0, limit).map(toTag),
-        matched_in_facet: offline.length,
-        notice: fallbackNotice(failure, facet, message, sample),
+        tags: fallback.slice(0, limit),
+        matched_in_facet: fallback.length,
+        notice: fallbackNotice(failure, facet, message, listed),
       };
     }
 
@@ -805,8 +892,12 @@ export class TaxonomyService {
      * answer `e330` with tags that do not contain it. Measured across ordinary terms (cheese,
      * kombucha, olive oil, organic, tofu, …) this drops nothing and removes only that noise.
      *
-     * What survives is ranked exact-tag first, the live portion only: the embedded block keeps its
-     * hand-maintained order ahead of it.
+     * What survives is ranked exact-tag first within the live portion, and the embedded block keeps
+     * its hand-maintained order ahead of it. Then the one tag the accept rule confirms leads, moved
+     * there or, when the gate dropped it, added there and counted, so row 1 is the tag a filter on
+     * the same term resolves to. The rule reads the live answer itself, whose `text` is the synonym
+     * the term matched: in the merge an embedded entry's display name replaces it (`cookies`
+     * reaches `en:biscuits`, listed as "Biscuits").
      */
     const seen = new Set(offline.map((entry) => entry.id));
     const liveMatches: TaxonomyEntry[] = [];
@@ -816,17 +907,23 @@ export class TaxonomyService {
         liveMatches.push(entry);
       }
     }
-    const merged = [...offline.map(toTag), ...rankExactTagFirst(liveMatches, term)];
+    const merged = confirmedFirst(
+      [...offline.map(toTag), ...rankExactTagFirst(liveMatches, term)],
+      confirmedTag(key, embedded, live),
+      embedded,
+    );
+    // Ingredient IDs run the other way from category IDs, so each facet's hint names its own form.
+    const form =
+      facet === 'ingredients'
+        ? 'ingredient IDs are singular ("oats" finds nothing, "oat" resolves to en:oat)'
+        : 'many category tags are plural upstream ("kombucha" resolves to en:kombuchas)';
 
     return {
       facet,
       tags: merged.slice(0, limit),
       matched_in_facet: merged.length,
       ...(merged.length === 0 && {
-        notice:
-          `No ${facet} tag matched "${term}" in the Open Food Facts vocabulary. Matching is on whole words in ` +
-          'the tag name, so try a single simpler word (e.g. "hummus" rather than "hummus dip"); note also that ' +
-          'many category tags are plural upstream ("kombucha" resolves to en:kombuchas).',
+        notice: `No ${facet} tag matched "${term}" in the Open Food Facts vocabulary. Matching is on whole words in the tag name, so try a single simpler word (e.g. "hummus" rather than "hummus dip"); note also that ${form}.`,
       }),
     };
   }

@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for the mirror store: the tag postings the triggers keep in step with
  * `products.tag_ids` and the plans of the statements those triggers and a full load's sweep run,
- * readiness (a completed sync AND products), the as-of time, the checkpoint encoding, the status
+ * readiness (a completed sync AND products), whether Green-Score is indexed (the last full load's
+ * record version), the as-of time, the checkpoint encoding, the status
  * report and `mirror:verify`'s exit code, that an unset `OFF_MIRROR_PATH`, or one naming no file
  * (one that disappears after an open gave up included), builds no store, and how long the serving
  * store waits on a sync's write lock.
@@ -27,6 +28,7 @@ import {
   decodeCheckpoint,
   encodeCheckpoint,
   ensureSortIndexes,
+  indexesGreenScore,
   isMirrorReady,
   mirrorAsOf,
   openMirrorStore,
@@ -309,6 +311,33 @@ describe('isMirrorReady', () => {
     expect(await isMirrorReady(store)).toBe(true);
     await store.writeState({ status: 'error', error: 'HTTP 503' });
     expect(await isMirrorReady(store)).toBe(true);
+  });
+});
+
+describe('indexesGreenScore', () => {
+  const fullLoad = (recordVersion: number) => ({
+    generation: 1,
+    loadedAt: '2026-11-08T00:00:00.000Z',
+    recordVersion,
+    skippedLines: 0,
+  });
+
+  it('is false before a full load completes, though rows built at version 2 are stored', async () => {
+    await store.applyBatch([row('A', [], { record_version: 2 })], []);
+    expect(await indexesGreenScore(store)).toBe(false);
+  });
+
+  it('is false after a load built at version 1, while a reload has rewritten rows at version 2', async () => {
+    writeMirrorLoad(await store.raw(), fullLoad(1));
+    await store.applyBatch([row('A', [], { record_version: 1 })], []);
+    expect(await indexesGreenScore(store)).toBe(false);
+    await store.applyBatch([row('B', [], { record_version: 2 })], []);
+    expect(await indexesGreenScore(store)).toBe(false);
+  });
+
+  it.each([2, 3])('is true once a full load built at version %i completes', async (version) => {
+    writeMirrorLoad(await store.raw(), fullLoad(version));
+    expect(await indexesGreenScore(store)).toBe(true);
   });
 });
 

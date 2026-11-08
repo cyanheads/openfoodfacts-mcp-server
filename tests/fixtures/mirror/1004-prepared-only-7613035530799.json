@@ -2,8 +2,8 @@
   "schema": "1004",
   "shape": "prepared_only",
   "code": "7613035530799",
-  "capturedAt": "2026-11-01T13:04:51.684Z",
-  "request": "/api/v2/product/7613035530799.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:01:48.263Z",
+  "request": "/api/v2/product/7613035530799.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "GET /api/v2/product/7613035530799.json?fields=raw at 2026-11-01T13:05:23.754Z, image_* and selected_images fields removed",
   "line": {
     "_id": "7613035530799",
@@ -4407,6 +4407,7 @@
         "en:environmental-score-packaging-unspecified-material"
       ],
       "ecoscore_grade": "a-plus",
+      "generic_name": "",
       "image_url": "https://images.openfoodfacts.org/images/products/761/303/553/0799/front_en.199.400.jpg",
       "ingredients": [
         {
@@ -4525,6 +4526,12 @@
       ],
       "last_modified_t": 1790090792,
       "nova_group": 4,
+      "nutrient_levels": {
+        "fat": "low",
+        "salt": "low",
+        "saturated-fat": "low",
+        "sugars": "moderate"
+      },
       "nutriments": {
         "calcium_prepared": 0.12,
         "calcium_prepared_100g": 0.12,

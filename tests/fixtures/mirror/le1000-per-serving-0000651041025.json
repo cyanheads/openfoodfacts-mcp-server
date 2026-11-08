@@ -2,8 +2,8 @@
   "schema": "le1000",
   "shape": "per_serving",
   "code": "0000651041025",
-  "capturedAt": "2026-11-01T13:05:47.802Z",
-  "request": "/api/v2/product/0000651041025.json?fields=product_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-08T17:02:10.181Z",
+  "request": "/api/v2/product/0000651041025.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0000651041025",
@@ -870,6 +870,12 @@
       ],
       "ingredients_text": "GREEN LEAF.",
       "last_modified_t": 1740179836,
+      "nutrient_levels": {
+        "fat": "low",
+        "salt": "low",
+        "saturated-fat": "low",
+        "sugars": "low"
+      },
       "nutriments": {
         "calcium": 0.0282352941176471,
         "calcium_100g": 0.0282352941176471,

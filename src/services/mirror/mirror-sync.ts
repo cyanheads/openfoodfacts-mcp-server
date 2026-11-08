@@ -148,10 +148,16 @@ export async function runMirrorSync(options: MirrorSyncOptions): Promise<MirrorS
  * and once more when its run fails, so a run another process reclaimed the lease from would
  * otherwise overwrite the state of the run that reclaimed it, moving a completed load's checkpoint
  * back and leaving a resumable cursor behind.
+ *
+ * The framework's own sync lease is left off: with it, the runner commits each page and state write
+ * through the lease rather than these two, so their checks would never run. `lock` also fences what
+ * that lease cannot, since the runner claims and releases it per `runSync`: the sort index builds,
+ * `ANALYZE`, and the WAL truncate around the runs, and the gap between a full load and its deltas.
  */
 function leased(store: MirrorStore, lock: MirrorLock): MirrorStore {
+  const { syncLease, ...rest } = store;
   return {
-    ...store,
+    ...rest,
     async applyBatch(records, tombstones) {
       lock.assertHeld();
       await store.applyBatch(records, tombstones);

@@ -24,8 +24,12 @@ vi.mock('@/config/server-config.js', () => ({
 
 import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
+import type { MirrorBuilder } from '@/services/mirror/mirror-ingester.js';
+import * as recordBuilder from '@/services/mirror/record-builder.js';
 import {
   buildMirrorRecord,
+  fieldsNewerThan,
+  MIRROR_RECORD_VERSION,
   MIRROR_TAG_FACETS,
   type MirrorRecord,
   mirrorTagKey,
@@ -597,6 +601,81 @@ describe('buildMirrorRecord', () => {
   });
 });
 
+describe('generic_name and nutrient_levels (#87)', () => {
+  it.each<[string, Json, string | undefined]>([
+    // 4000417025005: the v2 read answers "" although the English name is set.
+    [
+      'the main-language name when it is empty, over a set translation',
+      { lc: 'nl', generic_name: '', generic_name_en: 'Dark chocolate with marzipan filling' },
+      '',
+    ],
+    [
+      'the main-language name over a translation',
+      { lc: 'fr', generic_name: 'Eau De Source', generic_name_en: 'Spring water' },
+      'Eau De Source',
+    ],
+    [
+      'the English name when no main-language one is stored',
+      { lc: 'fr', generic_name_en: 'Spring water', generic_name_fr: 'Eau de source' },
+      'Spring water',
+    ],
+    [
+      'the product language’s name when the English one is empty',
+      { lc: 'fr', generic_name_en: '', generic_name_fr: 'Eau de source' },
+      'Eau de source',
+    ],
+    ['nothing when no name is stored', { lc: 'fr', generic_name_de: 'Quellwasser' }, undefined],
+  ])('projects generic_name as the v2 read does: %s', (_label, fields, expected) => {
+    const { doc } = record({ code: '3274080005003', schema_version: 1004, ...fields });
+    expect('generic_name' in doc).toBe(expected !== undefined);
+    expect(doc.generic_name).toBe(expected);
+  });
+
+  it.each<[string, unknown]>([
+    ['a full verdict', { fat: 'low', salt: 'low', 'saturated-fat': 'low', sugars: 'moderate' }],
+    ['a partial one', { fat: 'low' }],
+    ['an empty one', {}],
+  ])('stores nutrient_levels as the export holds it: %s', (_label, levels) => {
+    const { doc } = record({
+      code: '7613035530799',
+      schema_version: 1004,
+      nutrient_levels: levels,
+    });
+    expect(doc.nutrient_levels).toEqual(levels);
+  });
+
+  it('stores no nutrient_levels for a line without one', () => {
+    expect('nutrient_levels' in record({ code: '7613035530799', schema_version: 1004 }).doc).toBe(
+      false,
+    );
+  });
+
+  it('builds at record version 2, the version that added both fields, through the seam the sync reads', () => {
+    // The sync reloads a store whose last load is older than the builder it is handed
+    // (mirror-sync.test.ts); the production builder is this module, at 2 since #87.
+    const builder: MirrorBuilder = recordBuilder;
+    expect(builder.MIRROR_RECORD_VERSION).toBe(2);
+    expect(MIRROR_RECORD_VERSION).toBe(2);
+  });
+
+  it.each<[string, number, string[], string[]]>([
+    ['no field', 1, [], []],
+    ['the fields off_compare_products reads', 1, ['product_name', 'brands', 'nutriments'], []],
+    ['generic_name', 1, ['product_name', 'generic_name'], ['generic_name']],
+    ['nutrient_levels', 1, ['nutrient_levels', 'nutriments'], ['nutrient_levels']],
+    [
+      'both, in request order',
+      1,
+      ['nutrient_levels', 'product_name', 'generic_name'],
+      ['nutrient_levels', 'generic_name'],
+    ],
+    ['both from a row built at 2', 2, ['generic_name', 'nutrient_levels'], []],
+    ['a field the doc never holds', 1, ['last_modified_t'], []],
+  ])('names what a row stamped below a field lacks of %s', (_label, version, fields, lacks) => {
+    expect(fieldsNewerThan(version, fields)).toEqual(lacks);
+  });
+});
+
 describe('serving_size re-parse', () => {
   it.each([
     ['1/2 cup (60 g)', 60, 'ml'],
@@ -713,6 +792,7 @@ describe('mirrorTagKey and toStoredTag', () => {
       'additives',
       'nutrition_grades',
       'nova_groups',
+      'environmental_score',
       'countries',
     ]);
   });
@@ -754,6 +834,45 @@ describe('mirrorTagKey and toStoredTag', () => {
       expect(() => toStoredTag(facet, 'en:x')).toThrow(`Unknown mirror tag facet: ${facet}`);
     },
   );
+});
+
+describe('the Green-Score facet', () => {
+  const greenScoreKeys = (line: unknown) =>
+    record(line).tags.filter((key) => key.startsWith('environmental_score:'));
+
+  it('indexes environmental_score_tags, the field live search filters on', () => {
+    expect(fixture('01723380').line.environmental_score_tags).toEqual(['c']);
+    expect(greenScoreKeys(fixture('01723380').line)).toEqual(['environmental_score:c']);
+  });
+
+  it('never indexes the ecoscore_tags copy, alone or beside environmental_score_tags', () => {
+    // A pre-1000 record holds only ecoscore_tags, which live environmental_score_tags= never finds.
+    expect(fixture('0025000054167').line.ecoscore_tags).toEqual(['c']);
+    expect(fixture('0025000054167').line.environmental_score_tags).toBeUndefined();
+    expect(greenScoreKeys(fixture('0025000054167').line)).toEqual([]);
+    expect(
+      greenScoreKeys({
+        code: '6000000000007',
+        schema_version: 1004,
+        lc: 'en',
+        environmental_score_tags: ['b'],
+        ecoscore_tags: ['d'],
+      }),
+    ).toEqual(['environmental_score:b']);
+  });
+
+  it.each([
+    ['a-plus', 'a-plus'],
+    ['a', 'a'],
+    ['f', 'f'],
+  ])('stores the grade %s as %s', (canonical, stored) => {
+    expect(toStoredTag('environmental_score', canonical)).toBe(stored);
+  });
+
+  it('starts at record version 2, which the builder writes now', () => {
+    expect(recordBuilder.GREEN_SCORE_RECORD_VERSION).toBe(2);
+    expect(recordBuilder.GREEN_SCORE_RECORD_VERSION).toBeLessThanOrEqual(MIRROR_RECORD_VERSION);
+  });
 });
 
 /* --- Timing ---------------------------------------------------------------------------------- */

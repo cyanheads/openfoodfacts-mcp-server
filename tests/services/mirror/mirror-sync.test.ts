@@ -1603,20 +1603,25 @@ describe('mirror refresh', () => {
     });
 
     it('is refused on resuming a sweep a 0.4.2 build persisted for a load that stamped no product', async () => {
-      // A 0.4.2 build persisted the sweep cursor with the last ingest page, then was stopped.
-      (await probe.raw()).prepare("UPDATE mirror_sync_state SET status = 'error', cursor = ?").run(
-        JSON.stringify({
-          v: 1,
-          generation: 2,
-          phase: 'sweep',
-          line: 2,
-          maxModifiedT: 0,
-          rowid: 0,
-          skipped: 2,
-          etag: '"e2"',
-          totalBytes: 40,
-        }),
-      );
+      /**
+       * A 0.4.2 build persisted the sweep cursor with the last ingest page, then was stopped. It
+       * recorded no run mode, which the runner reads as an init's, the mode a full load runs in.
+       */
+      (await probe.raw())
+        .prepare("UPDATE mirror_sync_state SET status = 'error', mode = NULL, cursor = ?")
+        .run(
+          JSON.stringify({
+            v: 1,
+            generation: 2,
+            phase: 'sweep',
+            line: 2,
+            maxModifiedT: 0,
+            rowid: 0,
+            skipped: 2,
+            etag: '"e2"',
+            totalBytes: 40,
+          }),
+        );
 
       await expect(sync('refresh')).rejects.toMatchObject({
         data: { reason: 'export_no_products' },

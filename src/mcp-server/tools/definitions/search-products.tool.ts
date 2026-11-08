@@ -41,10 +41,11 @@ import {
 import { mdInline } from '@/utils/markdown.js';
 
 /**
- * Most results one search call returns. A larger `page_size` is served at this size and disclosed,
- * and `page` then counts pages of this size.
+ * Most results one search call returns: `/api/v2/search`'s own anonymous page maximum, which it
+ * clamps a larger `page_size` to, and a page the text backend and the mirror serve too. A larger
+ * `page_size` is served at this size and disclosed, and `page` then counts pages of this size.
  */
-const SEARCH_PAGE_SIZE_CAP = 50;
+const SEARCH_PAGE_SIZE_CAP = 100;
 
 /** Comparison symbol per operator, for echoing a constraint back to the caller in the notice. */
 const NUTRIENT_OPERATOR_SYMBOLS: Record<NutrientOperator, string> = {
@@ -58,16 +59,35 @@ const NUTRIENT_OPERATOR_SYMBOLS: Record<NutrientOperator, string> = {
  * The string tag filters, the facet whose vocabulary each draws on, and the label the empty-result
  * notice echoes it under. On the text path each value is canonicalized before it is sent;
  * `additives_tag` is absent because the text path refuses it. Trace tags are allergen tags, so
- * `traces_tag` resolves against the allergen vocabulary.
+ * `traces_tag` resolves against the allergen vocabulary. `allOf` marks a filter that also takes an
+ * array of values, all of which must apply (`allOfTagInput`). `ingredients_tag` is served only by
+ * the text path, so a search carrying it is always canonicalized.
  */
 const TAG_FILTERS = [
   { key: 'categories_tag', facet: 'categories', label: 'category' },
   { key: 'brands_tag', facet: 'brands', label: 'brand' },
-  { key: 'labels_tag', facet: 'labels', label: 'label' },
+  { key: 'labels_tag', facet: 'labels', label: 'label', allOf: true },
+  { key: 'ingredients_tag', facet: 'ingredients', label: 'ingredient', allOf: true },
   { key: 'allergens_tag', facet: 'allergens', label: 'allergen' },
   { key: 'traces_tag', facet: 'allergens', label: 'trace' },
   { key: 'countries_tag', facet: 'countries', label: 'country' },
-] as const satisfies readonly { key: keyof SearchParams; facet: TagFacet; label: string }[];
+] as const satisfies readonly {
+  key: keyof SearchParams;
+  facet: TagFacet;
+  label: string;
+  allOf?: true;
+}[];
+
+/**
+ * The input of a tag filter marked `allOf` in `TAG_FILTERS`: one canonical tag ID, or an array of
+ * up to 10, all of which must apply. `item` describes one ID, `list` the array.
+ */
+function allOfTagInput(item: string, list: string) {
+  return z.union([
+    z.string().describe(item),
+    z.array(z.string().describe(item)).max(10).describe(list),
+  ]);
+}
 
 /**
  * A tag filter value as supplied and as sent. `canonical` is set on the text path, and on the tag
@@ -113,6 +133,33 @@ function tagValues(value: string | readonly string[] | undefined): string[] {
     .flat()
     .map((entry) => entry.trim())
     .filter((entry) => entry !== '');
+}
+
+const NUTRITION_GRADES = ['a', 'b', 'c', 'd', 'e'] as const;
+const NOVA_GROUPS = ['1', '2', '3', '4'] as const;
+const GREEN_SCORE_GRADES = ['a-plus', 'a', 'b', 'c', 'd', 'e', 'f'] as const;
+
+/**
+ * The grade filters and the label the empty-result notice echoes each under. A product carries one
+ * grade of each, so an array of grades matches any of its values, where an array of labels must
+ * all apply.
+ */
+const GRADE_FILTERS = [
+  { key: 'nutrition_grade', label: 'nutriscore' },
+  { key: 'nova_group', label: 'nova' },
+  { key: 'ecoscore_grade', label: 'ecoscore' },
+] as const satisfies readonly { key: keyof SearchParams; label: string }[];
+
+/** A grade filter as supplied: its distinct values in the caller's order, at least one. */
+type AppliedGradeFilter = {
+  key: (typeof GRADE_FILTERS)[number]['key'];
+  label: string;
+  values: string[];
+};
+
+/** A grade input's distinct values in the caller's order: a string is one value, `[]` none. */
+function gradeValues(value: string | readonly string[] | undefined): string[] {
+  return [...new Set([value ?? []].flat())];
 }
 
 /**
@@ -298,31 +345,36 @@ const UNAVAILABLE_EXCLUSION_HINT =
 /**
  * What still reaches the live database from a search the text index answered, which depends on
  * what the search carries. Nutrient constraints exist only on the text index, so no variant of a
- * search carrying them leaves it; otherwise dropping `query` does, keeping any filters the tag path
- * applies. Returned as the two phrasings the freshness note and the empty-result notice use.
+ * search carrying them leaves it; otherwise dropping `query`, and `ingredients_tag`, which this
+ * server sends only to the text index, does, keeping any filters the tag path applies. Returned as
+ * the two phrasings the freshness note and the empty-result notice use.
  */
-function liveDatabaseRoute(
-  hasNutrientFilters: boolean,
-  hasTagPathFilters: boolean,
-): { note: string; advice: string } {
-  if (hasNutrientFilters) {
+function liveDatabaseRoute(search: {
+  nutrientFilters: boolean;
+  ingredients: boolean;
+  query: boolean;
+  tagPathFilters: boolean;
+}): { note: string; advice: string } {
+  if (search.nutrientFilters) {
     return {
       note: 'Nutrient constraints are served only by this index, so no form of this search reads the live database.',
       advice:
         'nutrient_filters are served only by this index, so no form of this search reads the live database',
     };
   }
-  if (hasTagPathFilters) {
+  const drop = search.ingredients ? `ingredients_tag${search.query ? ' and query' : ''}` : 'query';
+  const lead = search.ingredients
+    ? 'This server answers ingredients_tag only from this index. '
+    : '';
+  if (search.tagPathFilters) {
     return {
-      note: "The same tag filters without query read the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).",
-      advice:
-        "re-run the same tag filters without query to read the live database or this server's local copy of the export",
+      note: `${lead}The same tag filters without ${drop} read the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).`,
+      advice: `re-run the same tag filters without ${drop} to read the live database or this server's local copy of the export`,
     };
   }
   return {
-    note: "A search by tag filters alone, without query, reads the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).",
-    advice:
-      "a search without query reads the live database or this server's local copy of the export, so try expressing the product as tag filters instead (off_browse_taxonomy resolves them)",
+    note: `${lead}A search by tag filters alone, without ${drop}, reads the live database or this server's local copy of the export where it keeps one (source and mirror_as_of say which).`,
+    advice: `a search without ${drop} reads the live database or this server's local copy of the export, so try expressing the product as tag filters instead (off_browse_taxonomy resolves them)`,
   };
 }
 
@@ -405,7 +457,7 @@ const TEXT_INDEX_SNAPSHOT_NOTE =
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, and combine the same way, and each row then carries the indexed values the thresholds were checked against; additives_tag is the one exception, filtering only on searches carrying neither query nor nutrient_filters. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query is answered by the text index, a snapshot that lags the live database, while a tag-only search reads the live database and is current, or, where this server keeps a local copy of the Open Food Facts export, can be served from that copy, which source and mirror_as_of then report and whose default order and popularity_key or unique_scans_n sort follow the values stored with each record, so they can differ from a live search, which ranks by its current scan counts — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, Green-Score, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, and combine the same way, and each row then carries the indexed values the thresholds were checked against; ingredients_tag takes canonical ingredient IDs (e.g. "en:inulin") that must all appear among the ingredients Open Food Facts parsed from the label, and combines the same way; additives_tag is the one exception, filtering only on searches carrying none of query, nutrient_filters, or ingredients_tag. nutrition_grade, nova_group, and ecoscore_grade (Green-Score) each take one grade or an array matching any of them. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query, nutrient_filters, or ingredients_tag is answered by the text index, a snapshot that lags the live database, while a tag-only search reads the live database and is current, or, where this server keeps a local copy of the Open Food Facts export, can be served from that copy, which source and mirror_as_of then report and whose default order and popularity_key or unique_scans_n sort follow the values stored with each record, so they can differ from a live search, which ranks by its current scan counts — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -413,7 +465,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database; drop it to run the same tag filters against the live database or, where this server keeps one, its local copy of the export.`,
+        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database; drop it, and nutrient_filters and ingredients_tag, which route there too, to run the same tag filters against the live database or, where this server keeps one, its local copy of the export.`,
       ),
     categories_tag: z
       .string()
@@ -427,14 +479,10 @@ export const offSearchProductsTool = tool('off_search_products', {
       .describe(
         'Brand slug (lowercased, hyphenated). Example: "nutella", "kelloggs". A brand name is slugged the way Open Food Facts slugs it ("Ben & Jerry\'s" → "ben-jerry-s") and then matched exactly — a partial or misspelled slug matches nothing rather than falling back to a near match, so put open-ended brand wording in query instead.',
       ),
-    labels_tag: z
-      .union([
-        z.string().describe('One canonical label tag ID.'),
-        z
-          .array(z.string().describe('One canonical label tag ID.'))
-          .max(10)
-          .describe('Up to 10 canonical label tag IDs, all of which must apply.'),
-      ])
+    labels_tag: allOfTagInput(
+      'One canonical label tag ID.',
+      'Up to 10 canonical label tag IDs, all of which must apply.',
+    )
       .optional()
       .describe(
         'Canonical label/certification tag ID, or an array of up to 10 that must all apply. Example: "en:organic", or ["en:organic", "en:fair-trade"] for products carrying both. Use off_browse_taxonomy with facet="labels".',
@@ -473,23 +521,55 @@ export const offSearchProductsTool = tool('off_search_products', {
       .describe(
         'Vegan, vegetarian, or palm-oil verdict Open Food Facts computes from the parsed ingredients. Example: "en:vegan", "en:palm-oil-free". "en:maybe-vegan" and "en:may-contain-palm-oil" mean the ingredients could not settle it, and the "-unknown" values mean no verdict could be computed.',
       ),
+    ingredients_tag: allOfTagInput(
+      'One canonical ingredient tag ID.',
+      'Up to 10 canonical ingredient tag IDs, all of which must appear.',
+    )
+      .optional()
+      .describe(
+        `Canonical ingredient tag ID, or an array of up to 10 that must all appear among the ingredients Open Food Facts parsed from the label. Example: "en:inulin", or ["en:inulin", "en:oat"] for products listing both. IDs are singular ("en:oat", not "en:oats"); use off_browse_taxonomy with facet="ingredients" to resolve them, and use ingredients_analysis_tag instead for a vegan, vegetarian, or palm-oil verdict. Each parsed ingredient also carries its taxonomy parents, so "en:vegetable" matches a product listing carrot. Served only by the text index, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the ${TEXT_SEARCH_RESULT_WINDOW}-result page window, and additives_tag cannot be combined with it.`,
+      ),
     additives_tag: z
       .string()
       .optional()
       .describe(
-        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches carrying neither query nor nutrient_filters — both route to a backend with no additives field, so combining them is rejected instead of silently returning nothing.',
+        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches carrying none of query, nutrient_filters, or ingredients_tag — each routes to a backend with no additives field, so combining them is rejected instead of silently returning nothing.',
       ),
     nutrition_grade: z
-      .enum(['a', 'b', 'c', 'd', 'e'])
+      .union([
+        z.enum(NUTRITION_GRADES).describe('One Nutri-Score grade.'),
+        z
+          .array(z.enum(NUTRITION_GRADES).describe('One Nutri-Score grade.'))
+          .max(NUTRITION_GRADES.length)
+          .describe('Nutri-Score grades, any of which a product may carry.'),
+      ])
       .optional()
       .describe(
-        'Filter by Nutri-Score grade. "a" is highest nutritional quality, "e" is lowest. Products without a score are excluded.',
+        'Filter by Nutri-Score grade, or an array of grades matching any of them. "a" is highest nutritional quality, "e" is lowest. Example: "a", or ["a", "b"] for B or better. A product carries one grade, so an array matches products graded any of its values, unlike labels_tag, whose values must all apply. Products without a score are excluded.',
       ),
     nova_group: z
-      .enum(['1', '2', '3', '4'])
+      .union([
+        z.enum(NOVA_GROUPS).describe('One NOVA group.'),
+        z
+          .array(z.enum(NOVA_GROUPS).describe('One NOVA group.'))
+          .max(NOVA_GROUPS.length)
+          .describe('NOVA groups, any of which a product may be in.'),
+      ])
       .optional()
       .describe(
-        'Filter by NOVA food processing class. "1"=unprocessed/minimally processed, "4"=ultra-processed. Products without a NOVA score are excluded.',
+        'Filter by NOVA food processing class, or an array of classes matching any of them. "1"=unprocessed/minimally processed, "4"=ultra-processed. Example: "1", or ["1", "2"]. A product is in one class, so an array matches products in any of its classes, unlike labels_tag, whose values must all apply. Products without a NOVA score are excluded.',
+      ),
+    ecoscore_grade: z
+      .union([
+        z.enum(GREEN_SCORE_GRADES).describe('One Green-Score grade.'),
+        z
+          .array(z.enum(GREEN_SCORE_GRADES).describe('One Green-Score grade.'))
+          .max(GREEN_SCORE_GRADES.length)
+          .describe('Green-Score grades, any of which a product may carry.'),
+      ])
+      .optional()
+      .describe(
+        'Filter by Green-Score (environmental impact) grade, or an array of grades matching any of them: "a-plus" is the lowest impact, then "a" through "f". "a" does not include "a-plus", so ask for ["a-plus", "a"] for A or better. A product carries one grade, so an array matches products graded any of its values, unlike labels_tag, whose values must all apply. A search by tag filters alone, without ingredients_tag, matches the grade Open Food Facts files for France, while each row shows the world grade, so a row can show a different letter than the one it matched. Products without a Green-Score are excluded.',
       ),
     countries_tag: z
       .string()
@@ -539,7 +619,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .min(1)
       .default(1)
       .describe(
-        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size 80 is results 51–100). A search by tag filters alone that reads the live database is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches; where this server keeps a local copy of the export, a tag-only search whose every value it confirms (canonical IDs from off_browse_taxonomy, or a brand slug) is served from that copy through its first ${MIRROR_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${MIRROR_SEARCH_RESULT_WINDOW} there. A search carrying query or nutrient_filters serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past any of these bounds is rejected rather than sent; narrow the filters or change sort_by to bring other products forward.`,
+        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size ${2 * SEARCH_PAGE_SIZE_CAP} is results ${SEARCH_PAGE_SIZE_CAP + 1}–${2 * SEARCH_PAGE_SIZE_CAP}). A search by tag filters alone that reads the live database is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches; where this server keeps a local copy of the export, a tag-only search whose every value it confirms (canonical IDs from off_browse_taxonomy, or a brand slug) is served from that copy through its first ${MIRROR_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${MIRROR_SEARCH_RESULT_WINDOW} there. One carrying ecoscore_grade is served from that copy only once a full reload of it has indexed Green-Score. A search carrying query, nutrient_filters, or ingredients_tag serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past any of these bounds is rejected rather than sent; narrow the filters or change sort_by to bring other products forward.`,
       ),
     page_size: z
       .number()
@@ -670,7 +750,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. When a constraint falls on a whole-number nutrient (see nutrient_filters) it also says that total, total_is_lower_bound, and last_page describe the whole-number answer and that rows outside the constraints count in outside_constraints. Absent on tag-only searches, which read the live database or, when source is "off_mirror", the local copy mirror_snapshot describes.',
+        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrition_grade, nova_group, or ecoscore_grade it also says those filters were matched against the grades the index holds, which each row shows and which can differ from what off_get_product returns. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. When a constraint falls on a whole-number nutrient (see nutrient_filters) it also says that total, total_is_lower_bound, and last_page describe the whole-number answer and that rows outside the constraints count in outside_constraints. Absent on tag-only searches, which read the live database or, when source is "off_mirror", the local copy mirror_snapshot describes.',
       ),
     mirror_snapshot: z
       .string()
@@ -719,7 +799,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       when: 'No search query or filter was provided',
       severity: 'warning',
       recovery:
-        'Provide at least one of: query, categories_tag, brands_tag, labels_tag, allergens_tag, traces_tag, exclude_allergens, exclude_traces, ingredients_analysis_tag, additives_tag, nutrient_filters, nutrition_grade, nova_group, or countries_tag.',
+        'Provide at least one of: query, categories_tag, brands_tag, labels_tag, allergens_tag, traces_tag, exclude_allergens, exclude_traces, ingredients_analysis_tag, ingredients_tag, additives_tag, nutrient_filters, nutrition_grade, nova_group, ecoscore_grade, or countries_tag.',
     },
     {
       reason: 'unrecognized_exclusion',
@@ -733,11 +813,11 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'additives_filter_needs_tag_search',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'additives_tag was combined with a query or nutrient_filters, which route to a backend that cannot filter by additive',
+      when: 'additives_tag was combined with a query, nutrient_filters, or ingredients_tag, which route to a backend that cannot filter by additive',
       retryable: false,
       severity: 'warning',
       recovery:
-        'Drop query and nutrient_filters to search by tags alone and keep the additive filter, or drop additives_tag to keep them. Every other filter combines freely.',
+        'Drop query, nutrient_filters, and ingredients_tag to search by tags alone and keep the additive filter, or drop additives_tag to keep them. Every other filter combines freely.',
     },
     {
       reason: 'query_too_long',
@@ -750,7 +830,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'page_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE} and would read the live database — this server keeps no ready local copy of the export, or a tag value is one it cannot confirm — or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, or one the local copy serves beyond its ${MIRROR_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
+      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE} and would read the live database — this server keeps no ready local copy of the export, a tag value is one it cannot confirm, or the search carries ecoscore_grade before a full reload of that copy has indexed Green-Score — or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, or one the local copy serves beyond its ${MIRROR_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
       retryable: false,
       severity: 'warning',
       recovery:
@@ -797,10 +877,12 @@ export const offSearchProductsTool = tool('off_search_products', {
   async handler(input, ctx) {
     const query = input.query?.trim();
     const nutrientFilters = input.nutrient_filters ?? [];
-    // Nutrient constraints are served only by the text backend, so they carry every property of
-    // that path — the result window, the lagging index, the absent additives facet — with or
-    // without a query.
-    const servedByTextBackend = Boolean(query) || nutrientFilters.length > 0;
+    const hasIngredients = tagValues(input.ingredients_tag).length > 0;
+    // Nutrient constraints are served only by the text backend, and an ingredient filter only from
+    // it (the mirror indexes no ingredients, and the live tag path stops at page 10), so either
+    // carries every property of that path — the result window, the lagging index, the absent
+    // additives facet — with or without a query.
+    const servedByTextBackend = Boolean(query) || nutrientFilters.length > 0 || hasIngredients;
     // Every page computation below — what is sent, the page bounds, last_page, truncation — runs at
     // the size served, so a repeated over-cap page_size pages contiguously in pages of the cap.
     const pageSize = Math.min(input.page_size, SEARCH_PAGE_SIZE_CAP);
@@ -814,14 +896,17 @@ export const offSearchProductsTool = tool('off_search_products', {
         : `page_size ${pageSize}`;
     const additive = input.additives_tag?.trim();
     const hasExclusion = EXCLUSION_FILTERS.some(({ key }) => tagValues(input[key]).length > 0);
+    const grades = GRADE_FILTERS.flatMap(({ key, label }): AppliedGradeFilter[] => {
+      const values = gradeValues(input[key]);
+      return values.length > 0 ? [{ key, label, values }] : [];
+    });
     const hasFilter =
       servedByTextBackend ||
       hasExclusion ||
       TAG_FILTERS.some(({ key }) => tagValues(input[key]).length > 0) ||
       Boolean(additive) ||
       Boolean(input.ingredients_analysis_tag) ||
-      Boolean(input.nutrition_grade) ||
-      Boolean(input.nova_group);
+      grades.length > 0;
 
     if (!hasFilter) {
       throw ctx.fail('no_filters', 'At least one search parameter is required.');
@@ -833,7 +918,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (servedByTextBackend && additive) {
       throw ctx.fail(
         'additives_filter_needs_tag_search',
-        'additives_tag filters only on searches the tag backend answers — a query or a nutrient constraint moves the search to a backend with no additives field, so pairing them would match nothing regardless of the additive.',
+        'additives_tag filters only on searches the tag backend answers — a query, a nutrient constraint, or an ingredient filter moves the search to a backend with no additives field, so pairing them would match nothing regardless of the additive.',
         { additives_tag: input.additives_tag },
       );
     }
@@ -852,8 +937,15 @@ export const offSearchProductsTool = tool('off_search_products', {
     const svc = getOpenFoodFactsService();
     // Only the local mirror serves a tag-only page past TAG_SEARCH_MAX_PAGE, and only a search
     // whose every value it can match as stored, so a tag-only search asks first whether it is
-    // ready. A search the text backend answers never reads it.
-    const mirror = !servedByTextBackend && (await svc.mirrorReady(ctx));
+    // ready. A search the text backend answers never reads it. Rows built before the mirror
+    // indexed Green-Score carry no Green-Score tag, so a search carrying ecoscore_grade also asks
+    // whether its last full load did, and until one has, runs exactly as with no mirror.
+    const mirrorReady = !servedByTextBackend && (await svc.mirrorReady(ctx));
+    const greenScoreUnindexed =
+      mirrorReady &&
+      grades.some(({ key }) => key === 'ecoscore_grade') &&
+      !(await svc.mirrorIndexesGreenScore(ctx));
+    const mirror = mirrorReady && !greenScoreUnindexed;
 
     // Product Opener refuses every anonymous page past 10 with an HTTP 401, whatever the page_size
     // and however few products match. Reject such a page with the bound instead of sending a
@@ -890,8 +982,23 @@ export const offSearchProductsTool = tool('off_search_products', {
           },
         },
       );
+    // A ready mirror that has not indexed Green-Score leaves a search carrying ecoscore_grade to
+    // the live bound, so the refusal names the filter and the reload that lifts the bound.
+    const greenScorePageRefusal = () =>
+      ctx.fail(
+        'page_out_of_range',
+        `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only when it reads the live database, and page ${input.page} was requested: this server's local copy of the export serves a search carrying ecoscore_grade only once a full reload has indexed Green-Score, and that reload has not completed.`,
+        {
+          page: input.page,
+          page_size: pageSize,
+          max_page: TAG_SEARCH_MAX_PAGE,
+          recovery: {
+            hint: `Request page ${TAG_SEARCH_MAX_PAGE} or lower — at page_size ${pageSize} that reaches the first ${TAG_SEARCH_MAX_PAGE * pageSize} matches — or retry once this server's local copy of the export completes the full reload that indexes Green-Score. Without ecoscore_grade, the copy serves pages past ${TAG_SEARCH_MAX_PAGE} of a search whose every value it confirms.`,
+          },
+        },
+      );
     if (!servedByTextBackend && !mirror && input.page > TAG_SEARCH_MAX_PAGE) {
-      throw tagPageRefusal();
+      throw greenScoreUnindexed ? greenScorePageRefusal() : tagPageRefusal();
     }
 
     // The text backend refuses page * page_size beyond its result window with an HTTP 422 that no
@@ -991,8 +1098,8 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     // The mirror serves the search only when it can match every value as stored. Exclusions were
-    // confirmed above, and nutrition_grade, nova_group, and ingredients_analysis_tag are closed
-    // vocabularies the input schema enforces.
+    // confirmed above, and nutrition_grade, nova_group, ecoscore_grade, and
+    // ingredients_analysis_tag are closed vocabularies the input schema enforces.
     const allConfirmed =
       mirror &&
       resolvedTags.every(
@@ -1032,13 +1139,13 @@ export const offSearchProductsTool = tool('off_search_products', {
       page_size: pageSize,
     };
     if (query) searchParams.query = query;
-    for (const { key } of TAG_FILTERS) {
-      const sent = tagFilters.filter((filter) => filter.key === key).map((filter) => filter.sent);
+    for (const filter of TAG_FILTERS) {
+      const sent = tagFilters.filter(({ key }) => key === filter.key).map((f) => f.sent);
       const [first] = sent;
       if (first === undefined) continue;
-      // A labels array stays an array for the service, even of one; a string stays a string.
-      if (key === 'labels_tag' && Array.isArray(input.labels_tag)) searchParams.labels_tag = sent;
-      else searchParams[key] = first;
+      // An all-of array stays an array for the service, even of one; a string stays a string.
+      if ('allOf' in filter && Array.isArray(input[filter.key])) searchParams[filter.key] = sent;
+      else searchParams[filter.key] = first;
     }
     for (const { key } of EXCLUSION_FILTERS) {
       const sent = exclusions.filter((e) => e.key === key).map((e) => e.canonical.value);
@@ -1051,8 +1158,11 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (input.ingredients_analysis_tag) {
       searchParams.ingredients_analysis_tag = input.ingredients_analysis_tag;
     }
-    if (input.nutrition_grade) searchParams.nutrition_grade = input.nutrition_grade;
-    if (input.nova_group) searchParams.nova_group = input.nova_group;
+    // One distinct grade reaches the service as the string a single grade always did.
+    for (const { key, values } of grades) {
+      const [first, ...more] = values;
+      if (first !== undefined) searchParams[key] = more.length > 0 ? values : first;
+    }
     if (nutrientFilters.length > 0) searchParams.nutrient_filters = nutrientFilters;
     if (input.sort_by) searchParams.sort_by = input.sort_by;
     if (allConfirmed) searchParams.tags_confirmed = true;
@@ -1065,19 +1175,29 @@ export const offSearchProductsTool = tool('off_search_products', {
       ctx.enrich({ mirror_snapshot: mirrorSnapshotNote(response.mirrorAsOf, input.sort_by) });
     }
 
-    const liveRoute = liveDatabaseRoute(
-      nutrientFilters.length > 0,
-      tagFilters.length > 0 ||
+    const liveRoute = liveDatabaseRoute({
+      nutrientFilters: nutrientFilters.length > 0,
+      ingredients: hasIngredients,
+      query: Boolean(query),
+      tagPathFilters:
+        tagFilters.some(({ key }) => key !== 'ingredients_tag') ||
         exclusions.length > 0 ||
         Boolean(input.ingredients_analysis_tag) ||
-        Boolean(input.nutrition_grade) ||
-        Boolean(input.nova_group),
-    );
+        grades.length > 0,
+    });
     // Once each, since a range pair names its nutrient twice.
     const wholeNumber = [...new Set(nutrientFilters.map(({ nutrient }) => nutrient))].filter(
       (nutrient) => WHOLE_NUMBER_NUTRIENTS.has(nutrient),
     );
     if (servedByTextBackend) {
+      // The index's grades lag the live records as its product set does, and a grade filter
+      // matches them, so a row's grade can differ from the product's current one.
+      const gradeKeys = grades.map(({ key }) => key);
+      const gradeSubject = new Intl.ListFormat('en').format(gradeKeys);
+      const gradesMatched =
+        gradeKeys.length > 0
+          ? ` The ${gradeSubject} ${gradeKeys.length === 1 ? 'filter was' : 'filters were'} matched against the grades this index holds, which each row shows; off_get_product returns the current record, whose grades can differ.`
+          : '';
       const checkedAgainst =
         nutrientFilters.length > 0
           ? ` The nutrient constraints (${constraintEcho(nutrientFilters)}) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.`
@@ -1087,7 +1207,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           ? ` The index compares ${wholeNumber.join(', ')} as whole numbers, so total, total_is_lower_bound, and last_page describe its whole-number answer, and rows of that answer outside these constraints are left off each page and counted in outside_constraints.`
           : '';
       ctx.enrich({
-        text_index_snapshot: `${TEXT_INDEX_SNAPSHOT_NOTE} ${liveRoute.note}${checkedAgainst}${wholeNumberAnswer}`,
+        text_index_snapshot: `${TEXT_INDEX_SNAPSHOT_NOTE} ${liveRoute.note}${gradesMatched}${checkedAgainst}${wholeNumberAnswer}`,
       });
     }
     const exclusionCoverage = exclusionCoverageNote(exclusions);
@@ -1180,8 +1300,11 @@ export const offSearchProductsTool = tool('off_search_products', {
       pushEcho('trace', input.traces_tag);
       pushEcho('additive', input.additives_tag);
       pushEcho('ingredients_analysis', input.ingredients_analysis_tag);
-      pushEcho('nutriscore', input.nutrition_grade);
-      pushEcho('nova', input.nova_group);
+      pushEcho('ingredient', input.ingredients_tag);
+      // A grade filter matches any of its values: nutriscore="a" or "b".
+      for (const { label, values } of grades) {
+        filterParts.push(`${label}=${values.map((value) => `"${value}"`).join(' or ')}`);
+      }
       pushEcho('country', input.countries_tag);
       for (const { key, label } of EXCLUSION_FILTERS) pushEcho(label, input[key]);
       for (const filter of nutrientFilters) {

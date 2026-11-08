@@ -312,7 +312,8 @@ describe('off_get_product', () => {
     const text = firstText(blocks);
     expect(text).toContain('Nutella');
     expect(text).toContain('Nutri-Score'); // nutriscore_grade label
-    expect(text).toContain('Eco-Score'); // ecoscore_grade label
+    expect(text).toContain('Green-Score: c'); // ecoscore_grade label
+    expect(text).not.toContain('Eco-Score');
     expect(text).toContain('en:nutrition-completed'); // data_quality_tags
     expect(text).toContain('539'); // energy value
     expect(text).toContain('en:milk'); // allergen
@@ -2917,6 +2918,278 @@ describe('off_get_product', () => {
       );
       expect(offGetProductTool.enrichment?.mirror_snapshot?.description).toBe(
         'Present only when source is "off_mirror". States that the product comes from the local copy as of mirror_as_of, so an edit made to it since then is not reflected.',
+      );
+    });
+  });
+
+  // ── #87: the generic name and Open Food Facts' nutrient levels ─────────────────────────
+
+  describe('generic name and nutrient levels (#87)', () => {
+    /** The levels line `format()` writes, as the issue's rows read. */
+    const levelsLine = (basis: string, levels: string) =>
+      `**Nutrient levels (basis: ${basis}):** ${levels}${basis === 'prepared' ? ' — Open Food Facts computed these on the prepared figures, so they can disagree with the as-sold ones.' : ''}`;
+
+    /** Each product the issue tabulates, as the live v2 read returned it on 2026-11-08. */
+    const ISSUE_ROWS: [string, RawProduct, Record<string, string>, string][] = [
+      [
+        '7622210449283',
+        {
+          product_name: 'Prince',
+          generic_name: 'BISCUITS FOURRÉS (35%) PARFUM CHOCOLAT',
+          nutrient_levels: {
+            fat: 'moderate',
+            salt: 'moderate',
+            'saturated-fat': 'high',
+            sugars: 'high',
+          },
+          nutriments: { fat_100g: 17, 'saturated-fat_100g': 5.6, sugars_100g: 32, salt_100g: 0.49 },
+        },
+        {
+          basis: 'as_sold',
+          fat: 'moderate',
+          saturated_fat: 'high',
+          sugars: 'high',
+          salt: 'moderate',
+        },
+        'fat: moderate | saturated fat: high | sugars: high | salt: moderate',
+      ],
+      [
+        '3274080005003',
+        {
+          product_name: 'isabelle',
+          generic_name: 'Eau De Source',
+          nutrient_levels: { fat: 'low', salt: 'low', 'saturated-fat': 'low', sugars: 'low' },
+          nutriments: { salt_100g: 0.00275, salt_serving: 0.0412 },
+        },
+        { basis: 'as_sold', fat: 'low', saturated_fat: 'low', sugars: 'low', salt: 'low' },
+        'fat: low | saturated fat: low | sugars: low | salt: low',
+      ],
+      [
+        // A drink: Open Food Facts halves the thresholds, so 10.6 g of sugars per 100 ml is high.
+        '5449000000996',
+        {
+          product_name: 'Coca-Cola Original',
+          generic_name: 'Bebida refrescante aromatizada',
+          nutrient_levels: { fat: 'low', salt: 'low', 'saturated-fat': 'low', sugars: 'high' },
+          nutriments: { fat_100g: 0, 'saturated-fat_100g': 0, sugars_100g: 10.6, salt_100g: 0 },
+        },
+        { basis: 'as_sold', fat: 'low', saturated_fat: 'low', sugars: 'high', salt: 'low' },
+        'fat: low | saturated fat: low | sugars: high | salt: low',
+      ],
+    ];
+
+    it.each(ISSUE_ROWS)(
+      'returns %s’s generic name and nutrient levels on both surfaces',
+      async (barcode, raw, levels, rendered) => {
+        mockGetProduct.mockResolvedValue(liveRead(raw));
+
+        const result = await runToolContract(offGetProductTool, { barcode });
+
+        expect(result.isError).toBeFalsy();
+        const product = (result.structuredContent as { product: Record<string, unknown> }).product;
+        expect(product.generic_name).toBe(raw.generic_name);
+        expect(product.nutrient_levels).toEqual(levels);
+        const lines = contractText(result).split('\n');
+        expect(lines).toContain(`**Generic name:** ${String(raw.generic_name)}`);
+        expect(lines).toContain(levelsLine('as_sold', rendered));
+      },
+    );
+
+    it('names the prepared basis of 3664346306027’s levels beside the as-sold figures it reads', async () => {
+      // A prepared-only read: Open Food Facts computed the levels on the prepared figures, while the
+      // stored as-sold set fills nutriments, so the levels must not read as the as-sold verdict.
+      mockGetProduct.mockResolvedValue(
+        liveRead({
+          product_name: '1848',
+          generic_name: 'Cacao fortement dégraissé sucré.',
+          nutrient_levels: {
+            fat: 'moderate',
+            salt: 'low',
+            'saturated-fat': 'high',
+            sugars: 'high',
+          },
+          nutriments: {
+            fat_prepared_100g: 6.2,
+            'saturated-fat_prepared_100g': 3.8,
+            sugars_prepared_100g: 48.5,
+            salt_prepared_100g: 0.03,
+          },
+        }),
+      );
+      mockReadStoredAsSold.mockResolvedValue({
+        status: 'read',
+        nutriments: { fat_100g: 4, 'saturated-fat_100g': 2.4, sugars_100g: 17, salt_100g: 0.22 },
+      });
+
+      const result = await runToolContract(offGetProductTool, { barcode: '3664346306027' });
+
+      const product = (result.structuredContent as { product: Record<string, unknown> }).product;
+      expect(product.nutrient_levels).toEqual({
+        basis: 'prepared',
+        fat: 'moderate',
+        saturated_fat: 'high',
+        sugars: 'high',
+        salt: 'low',
+      });
+      expect(product.nutriments).toMatchObject({ fat_100g: 4, stored_as_sold: { status: 'read' } });
+      expect(contractText(result).split('\n')).toContain(
+        levelsLine('prepared', 'fat: moderate | saturated fat: high | sugars: high | salt: low'),
+      );
+    });
+
+    it('keeps the as_sold basis for a read holding both preparation states', async () => {
+      mockGetProduct.mockResolvedValue(
+        liveRead({
+          nutrient_levels: { fat: 'high' },
+          nutriments: { fat_100g: 30, fat_prepared_100g: 2 },
+        }),
+      );
+
+      const result = await offGetProductTool.handler({ barcode: '3017620422003' }, ctx);
+
+      expect(mockReadStoredAsSold).not.toHaveBeenCalled();
+      expect(result.product.nutrient_levels).toEqual({ basis: 'as_sold', fat: 'high' });
+    });
+
+    it('returns no generic name for an empty main-language one, whatever a translation holds', async () => {
+      // 4000417025005: the v2 read answers generic_name "" for a record whose English one is set.
+      mockGetProduct.mockResolvedValue(
+        liveRead({ product_name: 'RITTER SPORT marsepein', generic_name: '' }),
+      );
+
+      const result = await runToolContract(offGetProductTool, { barcode: '4000417025005' });
+
+      const product = (result.structuredContent as { product: Record<string, unknown> }).product;
+      expect(product).not.toHaveProperty('generic_name');
+      expect(contractText(result)).not.toContain('Generic name');
+    });
+
+    it('keeps only the levels a partial verdict carries', async () => {
+      // 0000460938714 as the live read returns it: a protein powder with a fat figure alone.
+      mockGetProduct.mockResolvedValue(
+        liveRead({
+          generic_name: '100% Soja Protein Haselnuss Geschmack',
+          nutrient_levels: { fat: 'low' },
+          nutriments: { fat_100g: 0.5, proteins_100g: 88.5 },
+        }),
+      );
+
+      const result = await runToolContract(offGetProductTool, { barcode: '0000460938714' });
+
+      const product = (result.structuredContent as { product: Record<string, unknown> }).product;
+      expect(product.nutrient_levels).toEqual({ basis: 'as_sold', fat: 'low' });
+      expect(contractText(result).split('\n')).toContain(levelsLine('as_sold', 'fat: low'));
+    });
+
+    it.each<[string, unknown]>([
+      ['an empty verdict, as for an exempt category', {}],
+      ['no verdict at all', undefined],
+      ['only a key Open Food Facts never computes', { sodium: 'low' }],
+      ['levels that are not strings', { fat: 3, sugars: null, salt: '' }],
+    ])('returns no nutrient levels for %s, on either surface', async (_label, levels) => {
+      mockGetProduct.mockResolvedValue(
+        liveRead({
+          product_name: 'Green tea',
+          ...(levels !== undefined && { nutrient_levels: levels as Record<string, string> }),
+          nutriments: { 'energy-kcal_100g': 1 },
+        }),
+      );
+
+      const result = await runToolContract(offGetProductTool, { barcode: '0070177248499' });
+
+      expect(result.isError).toBeFalsy();
+      const product = (result.structuredContent as { product: Record<string, unknown> }).product;
+      expect(product).not.toHaveProperty('nutrient_levels');
+      expect(contractText(result)).not.toContain('Nutrient levels');
+    });
+
+    it('fetches nutriments and its serving fields with nutrient_levels, and names them', async () => {
+      mockGetProductFields.mockResolvedValue(
+        liveRead({ nutrient_levels: { fat: 'low' }, nutriments: { fat_100g: 0.5 } }),
+      );
+
+      const result = await offGetProductTool.handler(
+        { barcode: '0000460938714', fields: ['nutrient_levels'] },
+        ctx,
+      );
+
+      const fetched = [
+        'nutrient_levels',
+        'nutriments',
+        'serving_size',
+        'serving_quantity',
+        'serving_quantity_unit',
+      ];
+      expect(mockGetProductFields.mock.calls[0]?.[1]).toBe(fetched.join(','));
+      expect(result.requested_fields).toEqual(fetched);
+      expect(result.product.nutrient_levels).toEqual({ basis: 'as_sold', fat: 'low' });
+    });
+
+    it('fetches generic_name on its own', async () => {
+      mockGetProductFields.mockResolvedValue(liveRead({ generic_name: 'Rolled oats' }));
+
+      const result = await runToolContract(offGetProductTool, {
+        barcode: '0030000010402',
+        fields: ['generic_name'],
+      });
+
+      expect(mockGetProductFields.mock.calls[0]?.[1]).toBe('generic_name');
+      expect(result.structuredContent).toEqual({
+        barcode: '0030000010402',
+        product: { generic_name: 'Rolled oats' },
+        requested_fields: ['generic_name'],
+        source: 'off_api',
+      });
+      expect(contractText(result).split('\n')).toContain('**Generic name:** Rolled oats');
+    });
+
+    it('renders a subset leaving both out as not requested, never as missing', async () => {
+      mockGetProductFields.mockResolvedValue(liveRead({ product_name: 'Prince' }));
+
+      const result = await runToolContract(offGetProductTool, {
+        barcode: '7622210449283',
+        fields: ['product_name'],
+      });
+
+      const text = contractText(result);
+      expect(text).toContain(
+        '**Requested fields:** product_name — sections outside this subset were not requested (not missing from Open Food Facts).',
+      );
+      expect(text).not.toContain('Generic name');
+      expect(text).not.toContain('Nutrient levels');
+    });
+
+    it('offers both fields in the fields enum, in the order a full read requests them', () => {
+      expect(offGetProductTool.input.shape.fields.unwrap().element.options).toEqual([
+        'product_name',
+        'generic_name',
+        'brands',
+        'quantity',
+        'ingredients_text',
+        'ingredients',
+        'allergens_tags',
+        'traces_tags',
+        'additives_tags',
+        'ingredients_analysis_tags',
+        'nutriscore_grade',
+        'nova_group',
+        'ecoscore_grade',
+        'nutrient_levels',
+        'nutriments',
+        'serving_size',
+        'serving_quantity',
+        'serving_quantity_unit',
+        'categories_tags',
+        'labels_tags',
+        'packaging_tags',
+        'origins_tags',
+        'countries_tags',
+        'image_url',
+        'completeness',
+        'data_quality_tags',
+      ]);
+      expect(offGetProductTool.input.shape.fields.description).toContain(
+        'nutrient_levels brings nutriments and the same serving fields',
       );
     });
   });

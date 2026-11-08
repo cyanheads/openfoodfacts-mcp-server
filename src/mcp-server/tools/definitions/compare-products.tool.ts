@@ -752,8 +752,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
 
     // Scores table — includes all products with found status
     lines.push('### Scores');
-    lines.push('| Product | Barcode | Found | Nutri-Score | NOVA | Eco-Score | Completeness |');
-    lines.push('|:--------|:--------|:------|:------------|:-----|:----------|:-------------|');
+    lines.push('| Product | Barcode | Found | Nutri-Score | NOVA | Green-Score | Completeness |');
+    lines.push('|:--------|:--------|:------|:------------|:-----|:------------|:-------------|');
     for (const p of result.products) {
       const name = rowLabel(p);
       // The exact scalar rides alongside the rounded percentage: 0.7875 and 0.79 both render as
