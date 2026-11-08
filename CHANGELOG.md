@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-11-08
+
+Grade filters take one value or a list and gain a Green-Score filter, off_search_products filters by ingredient, off_get_product returns generic_name and nutrient_levels, pages hold up to 100 results, and off_browse_taxonomy lists the tag a term names first.
+
 ## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-11-02
 
 Fixes the local mirror citing a `mirror_as_of` newer than rows a full reload had already rewritten to an older export, and refuses a full load that stamped no product instead of sweeping the whole store.
