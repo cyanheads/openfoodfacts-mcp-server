@@ -3400,7 +3400,7 @@ describe('off_get_product', () => {
       '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. Missing fields = not yet entered.*';
     const LIVE_SOURCE = '**Source:** off_api (Open Food Facts)';
     const MIRROR_SOURCE = `**Source:** off_mirror (this server's local copy of the Open Food Facts export, as of ${MIRROR_AS_OF})`;
-    const MIRROR_NOTE = `This product comes from this server's local copy of the Open Food Facts export, current as of ${MIRROR_AS_OF}, not the live database, so an edit made to it since then is not reflected.`;
+    const MIRROR_NOTE = `This product comes from this server's local copy of the Open Food Facts export, not the live database: the copy reflects contributor edits through ${MIRROR_AS_OF}, so a later one is not; computed values (Nutri-Score, NOVA group, Green-Score, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; and a product removed since that reload can still be shown.`;
 
     it('marks a live read off_api on both surfaces, with no as-of time or freshness note', async () => {
       mockGetProduct.mockResolvedValue(liveRead(NUTELLA));
@@ -3413,7 +3413,9 @@ describe('off_get_product', () => {
       expect(structured).not.toHaveProperty('mirror_snapshot');
       const text = contractText(result);
       expect(text.split('\n').slice(-2)).toEqual([LIVE_SOURCE, FOOTER]);
-      expect(text).not.toMatch(/off_mirror|local copy|Mirror freshness/);
+      expect(text).not.toMatch(
+        /off_mirror|local copy|Mirror freshness|computed values|full reload/,
+      );
     });
 
     it('marks a mirror read off_mirror with its as-of time and note on both surfaces, the rest as live', async () => {
@@ -3514,7 +3516,7 @@ describe('off_get_product', () => {
         'ISO 8601 time up to which the local copy reflects every product contributed or edited on Open Food Facts. Present only when source is "off_mirror".',
       );
       expect(offGetProductTool.enrichment?.mirror_snapshot?.description).toBe(
-        'Present only when source is "off_mirror". States that the product comes from the local copy as of mirror_as_of, so an edit made to it since then is not reflected.',
+        'Present only when source is "off_mirror". States that the product comes from the local copy, which reflects contributor edits through mirror_as_of, so a later one is not; that computed values (grades, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record\'s last edit or the copy\'s last full reload (about every 30 days), whichever is later; and that a product removed since that reload can still be shown.',
       );
     });
   });

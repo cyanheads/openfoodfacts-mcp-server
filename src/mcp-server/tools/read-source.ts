@@ -46,10 +46,15 @@ export function sourcesLine([first, ...rest]: readonly [SourceGroup, ...SourceGr
 
 /**
  * The freshness note of an answer the local copy served. `read` names what came from it ("These
- * results come"), and `missed` what the copy cannot show of a change made after `mirrorAsOf`.
+ * results come"), and `missed` what the copy cannot show of an edit made after `mirrorAsOf`.
+ *
+ * Contributor edits reach the copy through `mirrorAsOf` because each daily delta selects records
+ * by `last_modified_t`. Open Food Facts also recomputes derived values in batch runs that move only
+ * `last_updated_t`, which no delta selects, and a removed product is in no delta at all, so both
+ * reach the copy only with a full reload: the note bounds the computed values by that instead.
  */
 export function mirrorCopyNote(read: string, mirrorAsOf: string, missed: string): string {
-  return `${read} from ${SOURCE_LABELS.off_mirror}, current as of ${mirrorAsOf}, not the live database, so ${missed}.`;
+  return `${read} from ${SOURCE_LABELS.off_mirror}, not the live database: the copy reflects contributor edits through ${mirrorAsOf}, so ${missed}; computed values (Nutri-Score, NOVA group, Green-Score, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; and a product removed since that reload can still be shown.`;
 }
 
 /**
@@ -60,11 +65,16 @@ export function mirrorSnapshotTrailer(note: string | undefined): string {
   return `**Mirror freshness:** ${mdInline(String(note))}`;
 }
 
-/** How the live read for fields a mirror row predates ended, or that none was sent. */
+/**
+ * How the live read for fields a mirror row predates ended, or that none was sent. A removal
+ * reaches the copy only with a full reload (see `mirrorCopyNote`), so a product the copy holds that
+ * the live read does not find may have been removed at any time since that reload, however recent
+ * `mirrorAsOf` is.
+ */
 function unreadOutcome(unread: UnreadFields, them: string, mirrorAsOf: string): string {
   switch (unread.outcome) {
     case 'not_found':
-      return `the live read for ${them} found no product under this barcode, which Open Food Facts may have removed since ${mirrorAsOf}.`;
+      return `the live read for ${them} found no product under this barcode, which Open Food Facts may have removed at any time since the copy's last full reload (about every 30 days): only a full reload brings a removal, so the copy's edits through ${mirrorAsOf} do not bound it.`;
     case 'failed': {
       const { reason } = unread.error.data ?? {};
       const quoted = `"${unread.error.message}"`;

@@ -2,7 +2,8 @@
  * @fileoverview The Open Food Facts export feeds the mirror reads: newline-delimited JSON (the full
  * export and each daily delta, one product document per line) and the delta index
  * (`data/delta/index.txt`, one `openfoodfacts_products_<start>_<end>.json.gz` name per line, where
- * start and end are the epoch seconds of the first and last change the file holds).
+ * start and end are the epoch seconds of the previous and the current export run: the file holds
+ * every product whose `last_modified_t` is after start and at or before end).
  * @module services/mirror/mirror-feeds
  */
 
@@ -59,11 +60,11 @@ export async function* readLines(
 
 /** One daily delta file the index lists. */
 export interface DeltaFile {
-  /** Epoch seconds of the last change the file holds. */
+  /** Epoch seconds of the export run that wrote the file: its window's inclusive end. */
   endSeconds: number;
   /** File name under `data/delta/`. */
   name: string;
-  /** Epoch seconds of the first change the file holds. */
+  /** Epoch seconds of the export run before it: its window's exclusive start. */
   startSeconds: number;
 }
 

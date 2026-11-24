@@ -2896,7 +2896,10 @@ describe('off_compare_products', () => {
     const LIVE_LABEL = 'off_api (Open Food Facts)';
     const mirrorLabel = (asOf: string) =>
       `off_mirror (this server's local copy of the Open Food Facts export, as of ${asOf})`;
-    const NOTE = `The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, current as of ${MIRROR_AS_OF}, not the live database, so an edit made to them since then is not reflected.`;
+    /** The mirrored rows' freshness note, citing `asOf` as the time edits are reflected through. */
+    const noteThrough = (asOf: string) =>
+      `The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, not the live database: the copy reflects contributor edits through ${asOf}, so a later one is not; computed values (Nutri-Score, NOVA group, Green-Score, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; and a product removed since that reload can still be shown.`;
+    const NOTE = noteThrough(MIRROR_AS_OF);
     const LINGUINE_CODE = '7310100605412';
     const SPAGHETTI_CODE = '8076809545440';
 
@@ -2935,7 +2938,9 @@ describe('off_compare_products', () => {
       expect(structured).not.toHaveProperty('mirror_snapshot');
       expect(sourceLines).toEqual([`**Source:** ${LIVE_LABEL}`]);
       expect(text.split('\n').slice(-2)).toEqual([`**Source:** ${LIVE_LABEL}`, FOOTER]);
-      expect(text).not.toMatch(/off_mirror|local copy|Mirror freshness/);
+      expect(text).not.toMatch(
+        /off_mirror|local copy|Mirror freshness|computed values|full reload/,
+      );
     });
 
     it('marks every row the mirror served in one source line with its as-of time, and one note', async () => {
@@ -3001,7 +3006,7 @@ describe('off_compare_products', () => {
     });
 
     it('cites each as-of time when a refresh lands between two rows the mirror served', async () => {
-      const { structured, sourceLines } = await compareReads([
+      const { structured, text, sourceLines } = await compareReads([
         [LINGUINE_CODE, mirrorRead(LINGUINE)],
         [SPAGHETTI_CODE, mirrorRead(SPAGHETTI, LATER)],
       ]);
@@ -3009,9 +3014,9 @@ describe('off_compare_products', () => {
       expect(sourceLines).toEqual([
         `**Source:** ${mirrorLabel(MIRROR_AS_OF)} for ${LINGUINE_CODE}; ${mirrorLabel(LATER)} for ${SPAGHETTI_CODE}`,
       ]);
-      expect(structured.mirror_snapshot).toBe(
-        "The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, current as of the mirror_as_of each one carries, not the live database, so an edit made to them since then is not reflected.",
-      );
+      const note = noteThrough('the mirror_as_of each row carries');
+      expect(structured.mirror_snapshot).toBe(note);
+      expect(text.split('\n').at(-1)).toBe(`**Mirror freshness:** ${note}`);
     });
 
     it('gives a comparison in which no barcode resolved no source line and no note', async () => {
@@ -3035,7 +3040,7 @@ describe('off_compare_products', () => {
         'ISO 8601 time up to which the local copy reflects every product contributed or edited on Open Food Facts. Present only when source is "off_mirror".',
       );
       expect(offCompareProductsTool.enrichment?.mirror_snapshot?.description).toBe(
-        'Present only when a row\'s source is "off_mirror". States that those rows come from the local copy as of their mirror_as_of, so an edit made to them since then is not reflected.',
+        "Present only when a row's source is \"off_mirror\". States that those rows come from the local copy, which reflects contributor edits through their mirror_as_of, so a later one is not; that computed values (grades, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; and that a product removed since that reload can still be shown.",
       );
     });
   });

@@ -833,7 +833,7 @@ export const offGetProductTool = tool('off_get_product', {
       .string()
       .optional()
       .describe(
-        'Present only when source is "off_mirror". States that the product comes from the local copy as of mirror_as_of, so an edit made to it since then is not reflected.',
+        'Present only when source is "off_mirror". States that the product comes from the local copy, which reflects contributor edits through mirror_as_of, so a later one is not; that computed values (grades, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record\'s last edit or the copy\'s last full reload (about every 30 days), whichever is later; and that a product removed since that reload can still be shown.',
       ),
   },
 
@@ -929,7 +929,7 @@ export const offGetProductTool = tool('off_get_product', {
         mirror_snapshot: mirrorCopyNote(
           'This product comes',
           read.mirrorAsOf,
-          'an edit made to it since then is not reflected',
+          'a later one is not',
         ),
       });
     }

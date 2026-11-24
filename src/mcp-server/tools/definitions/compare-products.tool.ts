@@ -614,7 +614,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       .string()
       .optional()
       .describe(
-        'Present only when a row\'s source is "off_mirror". States that those rows come from the local copy as of their mirror_as_of, so an edit made to them since then is not reflected.',
+        "Present only when a row's source is \"off_mirror\". States that those rows come from the local copy, which reflects contributor edits through their mirror_as_of, so a later one is not; that computed values (grades, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; and that a product removed since that reload can still be shown.",
       ),
   },
 
@@ -746,8 +746,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
       ctx.enrich({
         mirror_snapshot: mirrorCopyNote(
           'The rows whose source is off_mirror come',
-          otherTimes.length === 0 ? mirrorAsOf : 'the mirror_as_of each one carries',
-          'an edit made to them since then is not reflected',
+          otherTimes.length === 0 ? mirrorAsOf : 'the mirror_as_of each row carries',
+          'a later one is not',
         ),
       });
     }
