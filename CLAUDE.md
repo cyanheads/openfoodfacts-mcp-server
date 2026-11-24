@@ -218,8 +218,10 @@ src/
       taxonomy-service.ts               # Tag vocabulary — live resolution, offline sample, merge/fallback policy, tag-value canonicalization
   utils/
     markdown.ts                         # Contextual Markdown escaping for crowd-sourced values in content[]
+    until-cancelled.ts                  # Wait on shared work as one caller: its answer, or that caller's own cancellation
   mcp-server/
     tools/read-source.ts                # How tool text names an answer's source (off_api / off_mirror) and the mirror freshness note
+    tools/record-metadata.ts            # Completeness label and the created / last-modified lines every product tool renders
     tools/definitions/
       get-product.tool.ts               # off_get_product
       search-products.tool.ts           # off_search_products

@@ -17,6 +17,7 @@ import type { MirrorStore, SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { TagIds } from '@/services/mirror/mirror-ingester.js';
 import {
+  firstHeldTag,
   getByCodes,
   type MirrorTagFilter,
   type MirrorTagSearch,
@@ -96,6 +97,9 @@ function line(code: string, fields: Line = {}): Line {
   return { code, schema_version: 1004, lc: 'en', product_name: `Product ${code}`, ...fields };
 }
 
+/** The join only the statement cutting a tag search page runs: its page's rows to their documents. */
+const PAGE_JOIN = 'JOIN products p ON p.rowid = page.rid';
+
 /** A reader whose handle records every statement prepared through it. */
 async function recordingReader(): Promise<{
   reader: { raw: () => Promise<SqliteHandle> };
@@ -136,13 +140,20 @@ describe('getByCodes', () => {
     ]);
   });
 
-  it('returns the stored document of a barcode the store holds, with its row’s record version', async () => {
+  it('returns the stored document of a barcode the store holds, with its row’s dates and record version', async () => {
+    const record = buildMirrorRecord(fixtureLine('3175681026650'));
     const docs = await getByCodes(store, ['3175681026650']);
     expect([...docs.keys()]).toEqual(['3175681026650']);
     expect(docs.get('3175681026650')).toEqual({
-      doc: buildMirrorRecord(fixtureLine('3175681026650'))?.doc,
+      doc: {
+        ...record?.doc,
+        created_t: record?.createdT,
+        last_modified_t: record?.lastModifiedT,
+      },
       recordVersion: 1,
     });
+    expect(record?.createdT).toEqual(expect.any(Number));
+    expect(record?.lastModifiedT).toEqual(expect.any(Number));
   });
 
   it('reads each row’s own record version, as a reload leaves rows of two versions side by side', async () => {
@@ -593,7 +604,7 @@ describe('searchByTags order and paging', () => {
     ]);
   });
 
-  it('returns each document as the builder projected it', async () => {
+  it('returns each document as the builder projected it, with the date its row’s column holds', async () => {
     const page = await searchByTags(store, {
       include: sortland,
       exclude: [],
@@ -601,15 +612,98 @@ describe('searchByTags order and paging', () => {
       pageSize: 1,
     });
     expect(page.docs).toEqual([
-      buildMirrorRecord(
-        line('3000000000002', {
-          countries_tags: ['en:sortland'],
-          popularity_key: 90,
-          unique_scans_n: 2,
-          created_t: 100,
-        }),
-      )?.doc,
+      {
+        ...buildMirrorRecord(
+          line('3000000000002', {
+            countries_tags: ['en:sortland'],
+            popularity_key: 90,
+            unique_scans_n: 2,
+            created_t: 100,
+          }),
+        )?.doc,
+        created_t: 100,
+      },
     ]);
+  });
+});
+
+describe('record dates from the row’s columns (#96)', () => {
+  const ORGANIC = [{ facet: 'labels', value: 'en:organic' }] satisfies MirrorTagFilter[];
+
+  beforeEach(async () => {
+    await write([
+      line('3000000000001', {
+        labels_tags: ['en:organic'],
+        popularity_key: 3,
+        created_t: 1_415_566_933,
+        last_modified_t: 1_689_265_890,
+      }),
+      line('3000000000002', {
+        labels_tags: ['en:organic'],
+        popularity_key: 2,
+        created_t: 1_532_452_519,
+      }),
+      line('3000000000003', { labels_tags: ['en:organic'], popularity_key: 1 }),
+    ]);
+  });
+
+  it('never stores a date in the doc, so the column is the only place a read can take one from', () => {
+    const record = buildMirrorRecord(
+      line('3000000000001', { created_t: 1_415_566_933, last_modified_t: 1_689_265_890 }),
+    );
+    expect(record).toMatchObject({ createdT: 1_415_566_933, lastModifiedT: 1_689_265_890 });
+    expect(record?.doc).not.toHaveProperty('created_t');
+    expect(record?.doc).not.toHaveProperty('last_modified_t');
+  });
+
+  it('gives a barcode lookup each date its row’s column holds, under the v2 field name', async () => {
+    const docs = await getByCodes(store, ['3000000000001', '3000000000002', '3000000000003']);
+
+    expect(docs.get('3000000000001')?.doc).toMatchObject({
+      created_t: 1_415_566_933,
+      last_modified_t: 1_689_265_890,
+    });
+    expect(docs.get('3000000000002')?.doc).toMatchObject({ created_t: 1_532_452_519 });
+    // A null column is a date the record lacks: no key, never 0.
+    expect(docs.get('3000000000002')?.doc).not.toHaveProperty('last_modified_t');
+    expect(docs.get('3000000000003')?.doc).not.toHaveProperty('created_t');
+    expect(docs.get('3000000000003')?.doc).not.toHaveProperty('last_modified_t');
+  });
+
+  it('dates a row of any record version alike', async () => {
+    await write([line('3000000000002', { created_t: 1_532_452_519 })], 2);
+
+    const docs = await getByCodes(store, ['3000000000001', '3000000000002']);
+
+    expect(docs.get('3000000000001')).toMatchObject({
+      recordVersion: 1,
+      doc: { created_t: 1_415_566_933, last_modified_t: 1_689_265_890 },
+    });
+    expect(docs.get('3000000000002')).toMatchObject({
+      recordVersion: 2,
+      doc: { created_t: 1_532_452_519 },
+    });
+  });
+
+  it('gives every document on a tag search page its row’s dates, the cut from either end alike', async () => {
+    const dates = (docs: Record<string, unknown>[]) =>
+      docs.map((doc) => [doc.code, doc.created_t, doc.last_modified_t]);
+    const first = await searchByTags(store, {
+      include: ORGANIC,
+      exclude: [],
+      page: 1,
+      pageSize: 2,
+    });
+    // The last page is cut from the end of the order.
+    const last = await searchByTags(store, { include: ORGANIC, exclude: [], page: 3, pageSize: 1 });
+
+    expect(dates(first.docs)).toEqual([
+      ['3000000000001', 1_415_566_933, 1_689_265_890],
+      ['3000000000002', 1_532_452_519, undefined],
+    ]);
+    expect(first.docs[1]).not.toHaveProperty('last_modified_t');
+    expect(dates(last.docs)).toEqual([['3000000000003', undefined, undefined]]);
+    expect(Object.keys(last.docs[0] ?? {})).not.toContain('created_t');
   });
 });
 
@@ -751,7 +845,7 @@ describe('searchByTags cuts', () => {
 
   /** The statement that cut the page: the one reading documents. */
   const pageStatement = (statements: string[]) =>
-    statements.find((sql) => sql.includes('SELECT p.doc FROM')) ?? '';
+    statements.find((sql) => sql.includes(PAGE_JOIN)) ?? '';
 
   /** The statements that counted matches: every count but one tag's postings and every product. */
   const matchCounts = (statements: string[]) =>
@@ -1083,7 +1177,7 @@ describe('searchByTags cuts', () => {
         order.slice((pageNumber - 1) * pageSize, pageNumber * pageSize),
       );
     }
-    const cuts = statements.filter((sql) => sql.includes('SELECT p.doc FROM'));
+    const cuts = statements.filter((sql) => sql.includes(PAGE_JOIN));
     return { cuts, statements, total: order.length };
   }
 
@@ -1248,7 +1342,7 @@ describe('searchByTags cuts', () => {
         }
       }
       // Each cut ran: the loop covers every side of the plan choice it can reach.
-      const cuts = statements.filter((sql) => sql.includes('SELECT p.doc FROM'));
+      const cuts = statements.filter((sql) => sql.includes(PAGE_JOIN));
       const ran = (fragment: string) => cuts.some((sql) => sql.includes(fragment));
       expect(ran('CROSS JOIN')).toBe(true);
       expect(ran('INDEXED BY')).toBe(!drop);
@@ -1262,4 +1356,77 @@ describe('searchByTags cuts', () => {
       expect(counted('NOT EXISTS')).toBe(true);
     },
   );
+});
+
+describe('firstHeldTag (#94)', () => {
+  /** One product stored under each brand tag given. */
+  const brandLine = (code: string, ...brands: string[]) => line(code, { brands_tags: brands });
+
+  beforeEach(async () => {
+    await write([
+      brandLine('80000001', 'xx:nestle'),
+      brandLine('80000002', 'xx:café-bar'),
+      brandLine('80000003', 'xx:gone'),
+      // A brand stored under both keys, as records written either side of a slug change can be.
+      brandLine('80000004', 'xx:haagen-dazs', 'xx:häagen-dazs'),
+    ]);
+    // The ingester keeps the tags row of a brand whose last product has left the store.
+    await store.applyBatch([], ['80000003']);
+  });
+
+  it('answers the folded slug when the store holds it', async () => {
+    await expect(firstHeldTag(store, 'brands', ['nestle', 'nestlé'])).resolves.toBe('nestle');
+  });
+
+  it('answers the accent-keeping slug when only it is held', async () => {
+    await expect(firstHeldTag(store, 'brands', ['cafe-bar', 'café-bar'])).resolves.toBe('café-bar');
+  });
+
+  it('answers the first value held when both are, in the order given', async () => {
+    await expect(firstHeldTag(store, 'brands', ['haagen-dazs', 'häagen-dazs'])).resolves.toBe(
+      'haagen-dazs',
+    );
+    await expect(firstHeldTag(store, 'brands', ['häagen-dazs', 'haagen-dazs'])).resolves.toBe(
+      'häagen-dazs',
+    );
+  });
+
+  it('counts a tags row no product carries any more as not held', async () => {
+    const handle = await store.raw();
+    expect(
+      handle.prepare<{ id: number }>('SELECT id FROM tags WHERE key = ?').get('brands:xx:gone'),
+    ).toBeTruthy();
+
+    await expect(firstHeldTag(store, 'brands', ['gone'])).resolves.toBeUndefined();
+    await expect(firstHeldTag(store, 'brands', ['gone', 'nestle'])).resolves.toBe('nestle');
+  });
+
+  it('answers undefined when no value is held, or none is given', async () => {
+    await expect(firstHeldTag(store, 'brands', ['kelloggs', 'kellogg'])).resolves.toBeUndefined();
+    await expect(firstHeldTag(store, 'brands', [])).resolves.toBeUndefined();
+  });
+
+  it('matches a value under the facet it is asked for alone', async () => {
+    await expect(firstHeldTag(store, 'labels', ['nestle'])).resolves.toBeUndefined();
+  });
+
+  it('seeks the tag and one posting by index, scanning neither table', async () => {
+    const { reader, statements } = await recordingReader();
+    await firstHeldTag(reader, 'brands', ['nestle']);
+    const [sql = ''] = statements;
+    const handle = await store.raw();
+
+    const plan = handle
+      .prepare<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`)
+      .all('brands:xx:nestle')
+      .map((row) => row.detail);
+
+    expect(statements).toHaveLength(1);
+    // The outer SELECT has no FROM, which SQLite reports as a scan of one constant row.
+    expect(plan.filter((detail) => /\bSCAN\b/.test(detail))).toEqual(['SCAN CONSTANT ROW']);
+    expect(plan).toContainEqual(expect.stringMatching(/^SEARCH tags USING .*INDEX .*\(key=\?\)$/));
+    expect(plan).toContainEqual(
+      expect.stringMatching(/^SEARCH product_tags USING PRIMARY KEY \(tag_id=\?\)$/),
+    );
+  });
 });

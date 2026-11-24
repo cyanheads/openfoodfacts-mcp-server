@@ -6,7 +6,7 @@
  *
  * | Object | Shape | Maintained by |
  * |---|---|---|
- * | `products` | `code TEXT PRIMARY KEY` (normalized barcode); `popularity_key`, `unique_scans_n`, `created_t`, `last_modified_t` INTEGER (the `sort_by` keys, null when the record lacks one); `generation` INTEGER (full load that last stamped the row); `record_version` INTEGER (`MIRROR_RECORD_VERSION` the row was built with); `tag_ids` TEXT (sorted JSON array of `tags.id`); `doc` TEXT (the builder's projected v2 JSON) | the framework's per-page upsert and tombstone delete |
+ * | `products` | `code TEXT PRIMARY KEY` (normalized barcode); `popularity_key`, `unique_scans_n`, `created_t`, `last_modified_t` INTEGER (the `sort_by` keys, null when the record lacks one; the two dates are also the only place reads take a record's dates from, since `doc` never holds them); `generation` INTEGER (full load that last stamped the row); `record_version` INTEGER (`MIRROR_RECORD_VERSION` the row was built with); `tag_ids` TEXT (sorted JSON array of `tags.id`); `doc` TEXT (the builder's projected v2 JSON) | the framework's per-page upsert and tombstone delete |
  * | `tags` | `id INTEGER PRIMARY KEY`, `key TEXT UNIQUE` (a `mirrorTagKey(facet, storedTag)`) | the ingester, before each page |
  * | `product_tags` | `PRIMARY KEY (tag_id, code) WITHOUT ROWID` — one posting per product per tag | triggers on `products` insert, `tag_ids` change, and delete |
  * | `mirror_load` | one row: `generation`, `loaded_at` (ISO), `record_version`, `etag` (the strong ETag of the export it read; null in a row written before migration 2 added it), and `skipped_lines` (export lines it skipped as malformed or past 16 MiB) of the last completed full load | the ingester, after a full load's sweep |

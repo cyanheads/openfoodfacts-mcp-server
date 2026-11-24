@@ -2,8 +2,8 @@
   "schema": "1001",
   "shape": "per_serving",
   "code": "0011110135056",
-  "capturedAt": "2026-11-08T17:00:38.872Z",
-  "request": "/api/v2/product/0011110135056.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:45:32.000Z",
+  "request": "/api/v2/product/0011110135056.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0011110135056",
@@ -1275,6 +1275,7 @@
       "code": "0011110135056",
       "completeness": 0.675,
       "countries_tags": ["en:united-states"],
+      "created_t": 1489077825,
       "data_quality_tags": [
         "en:no-packaging-data",
         "en:ingredients-percent-analysis-ok",
@@ -1289,6 +1290,8 @@
       ],
       "ecoscore_grade": "unknown",
       "generic_name": "",
+      "image_ingredients_url": "https://images.openfoodfacts.org/images/products/001/111/013/5056/ingredients_en.6.400.jpg",
+      "image_nutrition_url": "https://images.openfoodfacts.org/images/products/001/111/013/5056/nutrition_en.8.400.jpg",
       "ingredients": [
         {
           "ciqual_proxy_food_code": "12999",
@@ -1505,7 +1508,11 @@
         "en:vegetarian-status-unknown"
       ],
       "ingredients_text": "CREAM CHEESE (MILK, CREAM, CHEESE CULTURE, SALT, CAROB BEAN GUM), SUGAR, SOUR CREAM (CULTURED PASTEURIZED LIGHT CREAM AND NONFAT MILK, ENZYME), SKIM MILK, EGGS, ENRICHED BLEACHED FLOUR (WHEAT FLOUR, NIACIN, REDUCED IRON, THIAMINE MONONITRATE, RIBOFLAVIN,",
+      "ingredients_text_languages": {
+        "en": "CREAM CHEESE (MILK, CREAM, CHEESE CULTURE, SALT, CAROB BEAN GUM), SUGAR, SOUR CREAM (CULTURED PASTEURIZED LIGHT CREAM AND NONFAT MILK, ENZYME), SKIM MILK, EGGS, ENRICHED BLEACHED FLOUR (WHEAT FLOUR, NIACIN, REDUCED IRON, THIAMINE MONONITRATE, RIBOFLAVIN,"
+      },
       "labels_tags": [],
+      "lang": "en",
       "last_modified_t": 1747138085,
       "nova_group": 4,
       "nutrient_levels": {
@@ -1602,6 +1609,7 @@
         "vitamin-c_value": 0
       },
       "nutriscore_grade": "e",
+      "nutriscore_score": 23,
       "nutrition_data": "on",
       "nutrition_data_per": "100g",
       "nutrition_data_prepared_per": "100g",

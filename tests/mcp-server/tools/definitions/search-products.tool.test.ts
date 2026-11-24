@@ -7,7 +7,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from '@cyanheads/mcp-ts-core';
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  getEnrichment,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Partial mock: only the service accessor is stubbed. TEXT_SEARCH_RESULT_WINDOW comes through from
@@ -49,6 +54,8 @@ const mockSuggestTaxonomy = vi.fn();
 const mockMirrorReady = vi.fn();
 /** Whether the ready mirror's last full load indexed Green-Score. False by default. */
 const mockMirrorIndexesGreenScore = vi.fn();
+/** The brand slug the ready mirror holds products under. The first slug tried, by default. */
+const mockMirrorHeldBrand = vi.fn();
 
 /** Create the contract-bearing context wired by the production handler factory. */
 function createToolContext() {
@@ -112,6 +119,19 @@ function contractHint(result: { structuredContent?: unknown }): string {
   return error?.data?.recovery?.hint ?? '';
 }
 
+/** A node of the advertised output JSON Schema, narrowed to what these tests read. */
+type SchemaNode = {
+  description?: string;
+  properties?: Record<string, SchemaNode>;
+  items?: SchemaNode;
+};
+
+/** The advertised schema of one `products` row's fields. */
+function rowSchema(): Record<string, SchemaNode> {
+  const root = z.toJSONSchema(offSearchProductsTool.output) as SchemaNode;
+  return root.properties?.products?.items?.properties ?? {};
+}
+
 /** Reads a field's rendered `.describe()` text off the tool's advertised input schema. */
 function inputDescription(field: string): string {
   const { shape } = offSearchProductsTool.input as unknown as {
@@ -131,9 +151,12 @@ describe('off_search_products', () => {
     mockMirrorReady.mockResolvedValue(false);
     mockMirrorIndexesGreenScore.mockReset();
     mockMirrorIndexesGreenScore.mockResolvedValue(false);
+    mockMirrorHeldBrand.mockReset();
+    mockMirrorHeldBrand.mockImplementation(async (slugs: readonly string[]) => slugs[0]);
     vi.mocked(getOpenFoodFactsService).mockReturnValue({
       mirrorReady: mockMirrorReady,
       mirrorIndexesGreenScore: mockMirrorIndexesGreenScore,
+      mirrorHeldBrand: mockMirrorHeldBrand,
       searchProducts: mockSearchProducts,
       suggestTaxonomy: mockSuggestTaxonomy,
     } as never);
@@ -881,7 +904,9 @@ describe('off_search_products', () => {
       expect(enrichment.truncated).toBeUndefined();
     });
 
-    it('renders the zero-match formatter text unchanged', () => {
+    it('renders the zero-match formatter text as the result alone, the advice left to the notice (#94)', () => {
+      // format() never sees the filters, so its own advice reached a brand-only zero pointing at
+      // off_browse_taxonomy, which holds no brands, beside a notice saying otherwise.
       const text = firstText(
         offSearchProductsTool.format!({
           total: 0,
@@ -894,8 +919,27 @@ describe('off_search_products', () => {
         }),
       );
 
-      expect(text).toContain('**No products found**');
-      expect(text).toContain('off_browse_taxonomy');
+      expect(text).toBe(
+        '**No products found** (total: 0)\n\n**Source:** off_api (Open Food Facts)',
+      );
+    });
+
+    it('sends no brand-only zero to off_browse_taxonomy on either surface (#94)', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        brands_tag: 'nutell',
+        page: 1,
+        page_size: 20,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      const notice =
+        'No products found for brand="nutell". Try broader terms, put brand wording in query to match it as words, or remove some filters.';
+      expect(structured.notice).toBe(notice);
+      expect(contractText(result)).toBe(
+        `**No products found** (total: 0)\n\n**Source:** off_api (Open Food Facts)\n\n\n> ${notice}`,
+      );
     });
 
     // The defect: a page past the end of a large result set reported as a zero-match search.
@@ -1192,6 +1236,84 @@ describe('off_search_products', () => {
 
       expect(result.total_is_lower_bound).toBe(false);
     });
+
+    // ── the index's date (GH issue #95) ──
+
+    const INDEX_AS_OF = '2024-12-18T04:27:01.000Z';
+
+    it('dates the disclosure and carries text_index_as_of on both surfaces when the service holds the date', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001', product_name: 'Hummus' }],
+        textIndexAsOf: INDEX_AS_OF,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'hummus' });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.text_index_as_of).toBe(INDEX_AS_OF);
+      expect(String(structured.text_index_snapshot)).toMatch(
+        /^These results come from the text-search index, whose newest record is dated 2024-12-18T04:27:01\.000Z, so a product contributed since is missing from them and one edited since is matched and shown as it was then\. A search by tag filters alone/,
+      );
+      const text = contractText(result);
+      expect(text).toContain(
+        `**Source:** off_api (Open Food Facts)\n**Text index as of:** ${INDEX_AS_OF}`,
+      );
+      expect(text).toContain(`whose newest record is dated ${INDEX_AS_OF}`);
+    });
+
+    it('keeps text_index_as_of off and the disclosure undated without a date', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001', product_name: 'Hummus' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'hummus' });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).not.toHaveProperty('text_index_as_of');
+      expect(String(structured.text_index_snapshot)).toMatch(
+        /^These results come from the text-search index, a snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them\. /,
+      );
+      expect(contractText(result)).not.toContain('Text index as of');
+    });
+
+    it('carries the date on an empty text answer too', async () => {
+      mockSearch({
+        count: 0,
+        page: 1,
+        page_count: 0,
+        page_size: 20,
+        products: [],
+        textIndexAsOf: INDEX_AS_OF,
+      });
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'zwarte knoflook' });
+
+      expect((result.structuredContent as Record<string, unknown>).text_index_as_of).toBe(
+        INDEX_AS_OF,
+      );
+      expect(contractText(result)).toContain(`**Text index as of:** ${INDEX_AS_OF}`);
+    });
+
+    it('names text_index_as_of in the output schema, the tool description, and the query description', () => {
+      const root = z.toJSONSchema(offSearchProductsTool.output) as SchemaNode;
+      expect(root.properties?.text_index_as_of?.description).toMatch(
+        /^ISO 8601 time of the newest record in the text index/,
+      );
+      expect(offSearchProductsTool.description).toContain(
+        'a snapshot that lags the live database and whose newest record text_index_as_of dates',
+      );
+      expect(inputDescription('query')).toContain(
+        'a snapshot that lags the live Open Food Facts database and whose newest record text_index_as_of dates',
+      );
+    });
   });
 
   // ── ecoscore_grade in search results ──────────────────────────────────────
@@ -1305,6 +1427,18 @@ describe('off_search_products', () => {
       expect(description).toMatch(/\bquery\b/);
       expect(description).not.toMatch(/fuzzy/i);
       expect(description).not.toMatch(/partial matches may work/i);
+    });
+
+    it('gives a stored slug as its example and slugs accents as Open Food Facts does (#94)', () => {
+      const description = inputDescription('brands_tag');
+
+      // "kelloggs" is a synonym only the live tag search resolves; "kellogg-s" is what products store.
+      expect(description).toContain('Example: "nutella", "kellogg-s".');
+      expect(description).not.toContain('"kelloggs"');
+      expect(description).toContain('"Nestlé" → "nestle"');
+      expect(description).toContain(
+        'a search by tag filters alone that reads the live database also resolves brand synonyms',
+      );
     });
   });
 
@@ -1536,6 +1670,41 @@ describe('off_search_products', () => {
       expect(text).toContain('**42 total products**');
       expect(text).not.toContain('+ total products');
       expect(text).not.toContain('At least');
+    });
+
+    it.each([
+      [
+        'a listed page',
+        { page_count: 1, products: [{ barcode: '1234567890001' }] },
+        '**1 total product** (page 1 of 1, 20 per page, showing 1)',
+      ],
+      [
+        'a listed whole-number answer',
+        {
+          page_count: 1,
+          products: [{ barcode: '1234567890001', indexed_nutriments: { sugars_100g: 2 } }],
+        },
+        '**1 whole-number match** (page 1 of 1, 20 per page, showing 1)',
+      ],
+      [
+        'a page every row left',
+        { page_count: 0, outside_constraints: 1, products: [] },
+        '**Page 1 of 1 lists no products** (1 whole-number match, 20 per page)',
+      ],
+    ])('renders a total of one in the singular on %s', (_label, page, heading) => {
+      const text = firstText(
+        offSearchProductsTool.format!({
+          total: 1,
+          total_is_lower_bound: false,
+          page: 1,
+          page_size: 20,
+          last_page: 1,
+          source: 'off_api',
+          ...page,
+        }),
+      );
+
+      expect(text).toContain(heading);
     });
 
     it('renders every category tag per row, not the first 3', () => {
@@ -1827,10 +1996,193 @@ describe('off_search_products', () => {
       expect(notice).toContain('No products found');
       expect(notice).toMatch(/every word of query must match/i);
       expect(notice).toMatch(/matched exactly/i);
-      expect(notice).toContain('brand="Nutell" was sent as "nutell"');
-      expect(notice).toContain('off_browse_taxonomy');
+      expect(notice).toContain(
+        'brand="Nutell" was sent as "nutell" (brand synonyms are not resolved on this path)',
+      );
+      // off_browse_taxonomy holds no brands, so a brand-only zero is never pointed there (#94).
+      expect(notice).not.toContain('off_browse_taxonomy');
       expect(notice).toMatch(/same tag filters without query/i);
       expect(notice).toMatch(/recently contributed/i);
+    });
+
+    it('sends a brand as Product Opener stores it, naming the slug sent on a zero (#94)', async () => {
+      mockSearch(empty);
+
+      await offSearchProductsTool.handler(
+        { query: 'chocolat', brands_tag: 'Nestlé', page: 1, page_size: 20 },
+        ctx,
+      );
+
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({ brands_tag: 'nestle' });
+      expect(String(getEnrichment(ctx).notice ?? '')).toContain(
+        'Tag values are matched exactly on this path: brand="Nestlé" was sent as "nestle" (brand synonyms are not resolved on this path).',
+      );
+    });
+
+    it('sends an all-caps brand ending in Σ under both of its slugs, naming both on a zero', async () => {
+      mockSearch(empty);
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'γιαούρτι',
+        brands_tag: 'ΌΛΥΜΠΟΣ',
+      });
+
+      expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+        brands_tag: ['όλυμποσ', 'όλυμπος'],
+      });
+      const sent =
+        'brand="ΌΛΥΜΠΟΣ" was sent as "όλυμποσ" or "όλυμπος" (brand synonyms are not resolved on this path)';
+      expect(String((result.structuredContent as { notice?: string }).notice)).toContain(sent);
+      expect(contractText(result)).toContain(sent);
+    });
+
+    /**
+     * A taxonomy value nothing confirmed goes to the text index under the ID Product Opener would
+     * normalize it to, and an all-caps one ending in Σ also under the final-ς ID a record typed in
+     * lowercase carries, as a brand does.
+     */
+    describe('an unconfirmed taxonomy value ending in Σ', () => {
+      it('sends a category under both of its IDs, naming both on a zero', async () => {
+        mockSearch(empty);
+
+        const result = await runToolContract(offSearchProductsTool, {
+          categories_tag: 'EL:ΣΑΛΑΤΕΣ',
+          nutrient_filters: [{ nutrient: 'energy-kcal', operator: 'gte', value: 0 }],
+        });
+
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+          categories_tag: ['el:σαλατεσ', 'el:σαλατες'],
+        });
+        const sent =
+          'category="EL:ΣΑΛΑΤΕΣ" was sent as "el:σαλατεσ" or "el:σαλατες" (no matching Open Food Facts tag was found)';
+        expect(String((result.structuredContent as { notice?: string }).notice)).toContain(sent);
+        expect(contractText(result)).toContain(sent);
+      });
+
+      it.each([
+        [{ allergens_tag: 'EL:ΓΑΛΑΚΤΟΣ' }, { allergens_tag: ['el:γαλακτοσ', 'el:γαλακτος'] }],
+        [{ traces_tag: 'EL:ΚΑΡΥΔΙΑΣ' }, { traces_tag: ['el:καρυδιασ', 'el:καρυδιας'] }],
+        [{ countries_tag: 'EL:ΕΛΛΑΣ' }, { countries_tag: ['el:ελλασ', 'el:ελλας'] }],
+      ])('sends %j under both of its IDs', async (filter, sent) => {
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          { query: 'γιαούρτι', ...filter, page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject(sent);
+      });
+
+      it('sends each member of an all-of list as its own value, a Σ-final one under both IDs', async () => {
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          {
+            query: 'γιαούρτι',
+            labels_tag: ['EL:ΒΙΟΛΟΓΙΚΟΣ', 'en:vegan'],
+            page: 1,
+            page_size: 20,
+          },
+          ctx,
+        );
+
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+          labels_tag: [['el:βιολογικοσ', 'el:βιολογικος'], 'en:vegan'],
+        });
+      });
+
+      // Two IDs as an all-of list would require both; one value's IDs are any of it.
+      it.each([
+        [{ labels_tag: 'EL:ΒΙΟΛΟΓΙΚΟΣ' }, { labels_tag: [['el:βιολογικοσ', 'el:βιολογικος']] }],
+        [{ ingredients_tag: 'EL:ΖΑΧΑΡΗΣ' }, { ingredients_tag: [['el:ζαχαρησ', 'el:ζαχαρης']] }],
+      ])('sends %j to an all-of field as one member holding both IDs', async (filter, sent) => {
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          { query: 'γιαούρτι', ...filter, page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject(sent);
+      });
+
+      it.each([
+        ['typed in lowercase', 'el:σαλάτες', 'el:σαλάτες'],
+        ['whose capital sigma is inside a word', 'EL:ΜΑΣΤΙΧΑ', 'el:μαστιχα'],
+      ])('sends a category %s under its one ID', async (_shape, given, id) => {
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          { query: 'γιαούρτι', categories_tag: given, page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({ categories_tag: id });
+      });
+
+      it('sends a confirmed one under its entry ID alone', async () => {
+        mockSuggestTaxonomy.mockResolvedValue([{ id: 'el:σαλατες', name: 'Σαλάτες' }]);
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          { query: 'γιαούρτι', categories_tag: 'EL:ΣΑΛΑΤΕΣ', page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toMatchObject({
+          categories_tag: 'el:σαλατες',
+        });
+      });
+
+      it.each([
+        ['no mirror', false],
+        ['a ready mirror', true],
+      ])('sends one as given on a search by tag filters alone with %s', async (_mirror, ready) => {
+        mockMirrorReady.mockResolvedValue(ready);
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          { categories_tag: 'EL:ΣΑΛΑΤΕΣ', page: 1, page_size: 20 },
+          ctx,
+        );
+
+        const sent = mockSearchProducts.mock.calls[0]?.[0];
+        expect(sent).toMatchObject({ categories_tag: 'EL:ΣΑΛΑΤΕΣ' });
+        expect(sent).not.toHaveProperty('tags_confirmed');
+      });
+
+      it('refuses one as an exclusion, sending nothing', async () => {
+        const error = await captureError(
+          offSearchProductsTool.handler(
+            { query: 'γιαούρτι', exclude_allergens: ['EL:ΓΑΛΑΚΤΟΣ'], page: 1, page_size: 20 },
+            ctx,
+          ),
+        );
+
+        expect(error).toMatchObject({ data: { reason: 'unrecognized_exclusion' } });
+        expect(mockSearchProducts).not.toHaveBeenCalled();
+      });
+    });
+
+    it('points only the other tag IDs at off_browse_taxonomy beside a brand on a text-path zero (#94)', async () => {
+      mockSearch(empty);
+
+      await offSearchProductsTool.handler(
+        {
+          query: 'chocolat',
+          brands_tag: 'Nestlé',
+          categories_tag: 'en:chocolates',
+          page: 1,
+          page_size: 20,
+        },
+        ctx,
+      );
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toContain(
+        'brand="Nestlé" was sent as "nestle" (brand synonyms are not resolved on this path). Check the other tag IDs via off_browse_taxonomy.',
+      );
     });
 
     it('names a taxonomy value no tag confirmed, and one the vocabulary could not check', async () => {
@@ -1937,16 +2289,68 @@ describe('off_search_products', () => {
       expect(String(getEnrichment(ctx).notice ?? '')).not.toMatch(/had to match as a word/);
     });
 
-    it('keeps the tag-only zero notice as it was', async () => {
-      // Characterization: the tag path answers from the live database with canonicalized values.
+    it('points a brand-only tag-path zero at query, never at off_browse_taxonomy (#94)', async () => {
+      // off_browse_taxonomy holds no brands, so open-ended brand wording belongs in query.
       mockSearch(empty);
 
       await offSearchProductsTool.handler({ brands_tag: 'nutell', page: 1, page_size: 20 }, ctx);
 
       expect(String(getEnrichment(ctx).notice ?? '')).toBe(
-        'No products found for brand="nutell". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+        'No products found for brand="nutell". Try broader terms, put brand wording in query to match it as words, or remove some filters.',
       );
     });
+
+    it.each([
+      [
+        'a category, a tag ID it can hold wrong',
+        { categories_tag: 'en:spreads' },
+        'category="en:spreads", brand="nutell"',
+        'check the other tag IDs via off_browse_taxonomy, put brand wording in query to match it as words',
+      ],
+      [
+        'an additive, a tag ID it can hold wrong',
+        { additives_tag: 'en:e322' },
+        'brand="nutell", additive="en:e322"',
+        'check the other tag IDs via off_browse_taxonomy, put brand wording in query to match it as words',
+      ],
+      [
+        'a grade, which sends no tag ID',
+        { nutrition_grade: 'a' },
+        'brand="nutell", nutriscore="a"',
+        'put brand wording in query to match it as words',
+      ],
+      [
+        'an ingredients analysis, from a closed list',
+        { ingredients_analysis_tag: 'en:vegan' },
+        'brand="nutell", ingredients_analysis="en:vegan"',
+        'put brand wording in query to match it as words',
+      ],
+      [
+        'an exclusion, confirmed before the search',
+        { exclude_allergens: ['en:milk'] },
+        'brand="nutell", excluded_allergen="en:milk"',
+        'put brand wording in query to match it as words',
+      ],
+    ])(
+      'points only other tag IDs at off_browse_taxonomy on a tag-path zero of a brand beside %s (#94)',
+      async (_label, filters, echo, advice) => {
+        mockSearch(empty);
+
+        await offSearchProductsTool.handler(
+          offSearchProductsTool.input.parse({
+            brands_tag: 'nutell',
+            ...filters,
+            page: 1,
+            page_size: 20,
+          }),
+          ctx,
+        );
+
+        expect(String(getEnrichment(ctx).notice ?? '')).toBe(
+          `No products found for ${echo}. Try broader terms, ${advice}, or remove some filters.`,
+        );
+      },
+    );
 
     it('does not tell a nutrient-only search that dropping query reads the live database', async () => {
       mockSearch(found);
@@ -2966,13 +3370,17 @@ describe('off_search_products', () => {
     describe('a value the mirror cannot match', () => {
       const LEAD =
         "A search by tag filters alone is served through page 10 only when it reads the live database, and page 11 was requested: this server's local copy of the export serves deeper pages only when it confirms every value, and ";
-      const REPLACE_HINT =
-        "Replace the value with a canonical tag ID from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page 11, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.";
+      /**
+       * The hint for a value no tag matches, which no canonical ID can replace: correct or drop it.
+       * No brand slug is offered: the copy serves a brand only under a key it holds products for.
+       */
+      const noMatchHint = ({ field, value }: Record<string, unknown>) =>
+        `No Open Food Facts tag matches ${String(field)} "${String(value)}": correct or drop it so this server's local copy of the export can serve page 11, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.`;
       /** The page-11 refusal naming one unconfirmed value. */
       const unconfirmedRefusal = (
         listed: string,
         entry: Record<string, unknown>,
-        hint = REPLACE_HINT,
+        hint = noMatchHint(entry),
         retry: { retryable: boolean; retryAfter?: number } = { retryable: false },
       ) => ({
         message: `${LEAD}${listed}.`,
@@ -3050,14 +3458,6 @@ describe('off_search_products', () => {
             { field: 'additives_tag', value: 'E9999', reason: 'no_match' },
           ),
         },
-        {
-          name: 'a brand whose slug is empty',
-          input: { brands_tag: '™' },
-          refusal: unconfirmedRefusal(
-            'brands_tag "™" went unconfirmed (it slugs to no brand tag)',
-            { field: 'brands_tag', value: '™', reason: 'no_vocabulary' },
-          ),
-        },
       ];
 
       for (const { name, input, arrange, refusal: expected } of cases) {
@@ -3129,6 +3529,428 @@ describe('off_search_products', () => {
         expect(contractHint(result)).toBe(expected?.data.recovery.hint);
         expect(contractText(result)).toContain(String(expected?.message));
       });
+
+      it('names every value no tag matches in one hint', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+
+        const refused = await refusal({
+          countries_tag: 'Narnia',
+          additives_tag: 'E9999',
+          page: 11,
+          page_size: 50,
+        });
+
+        expect(refused.data).toMatchObject({
+          retryable: false,
+          recovery: {
+            hint: 'No Open Food Facts tag matches countries_tag "Narnia" or additives_tag "E9999": correct or drop them so this server\'s local copy of the export can serve page 11, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.',
+          },
+        });
+      });
+
+      it('words the hint by each reason when one value matched no tag and another went unchecked', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockSuggestTaxonomy.mockImplementation(async (taxonomy: string) => {
+          if (taxonomy === 'country') return [];
+          throw new BudgetExhaustedError('budget spent', {
+            endpoint: 'taxonomy',
+            limit: 10,
+            retryAfter: 42,
+          });
+        });
+
+        const refused = await refusal({
+          countries_tag: 'Narnia',
+          labels_tag: 'Organicx',
+          page: 11,
+          page_size: 50,
+        });
+
+        expect(refused.data).toMatchObject({
+          unconfirmed: [
+            {
+              field: 'labels_tag',
+              value: 'Organicx',
+              reason: 'lookup_failed',
+              cause: 'budget_spent',
+            },
+            { field: 'countries_tag', value: 'Narnia', reason: 'no_match' },
+          ],
+          retryable: false,
+          recovery: {
+            hint: 'No Open Food Facts tag matches countries_tag "Narnia": correct or drop it, and retry after 42 s once labels_tag "Organicx" can be confirmed, so this server\'s local copy of the export can serve page 11, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.',
+          },
+        });
+        expect(refused.data).not.toHaveProperty('retryAfter');
+      });
+    });
+
+    describe('a brand the mirror holds no product under (#94)', () => {
+      /** The ready mirror holds products under none of the brand's slugs. */
+      const holdNothing = () => mockMirrorHeldBrand.mockResolvedValue(undefined);
+      /** The live count read an unheld brand's page past 10 sends: the same filters, one row. */
+      const countRead = (brand: string) => ({ page: 1, page_size: 1, brands_tag: brand });
+
+      it('serves a brand under its folded slug, asking the mirror for both slugs in order', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockMirrorPage({ count: 600, page: 11, page_count: 1, page_size: 50, products: [] });
+
+        const result = await offSearchProductsTool.handler(
+          offSearchProductsTool.input.parse({ brands_tag: 'Nestlé', page: 11, page_size: 50 }),
+          ctx,
+        );
+
+        expect(mockMirrorHeldBrand).toHaveBeenCalledExactlyOnceWith(['nestle', 'nestlé'], ctx);
+        expect(mockSearchProducts).toHaveBeenCalledExactlyOnceWith(
+          { page: 11, page_size: 50, brands_tag: 'nestle', tags_confirmed: true },
+          ctx,
+        );
+        expect(result).toMatchObject({ total: 600, page: 11, source: 'off_mirror' });
+      });
+
+      it('serves a brand under its accent-keeping slug when only that one is held', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockMirrorHeldBrand.mockImplementation(async (slugs: readonly string[]) => slugs[1]);
+        mockMirrorPage({ count: 3, page: 1, page_count: 3, page_size: 20, products: [] });
+
+        await offSearchProductsTool.handler(
+          { brands_tag: 'Café Bar', page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockMirrorHeldBrand).toHaveBeenCalledExactlyOnceWith(['cafe-bar', 'café-bar'], ctx);
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual({
+          page: 1,
+          page_size: 20,
+          brands_tag: 'café-bar',
+          tags_confirmed: true,
+        });
+      });
+
+      it.each([
+        ['a brand Open Food Facts resolves as a synonym', 'kelloggs'],
+        ['a brand stored with marks the fold keeps', 'Vĩnh Hảo'],
+        ['a brand whose slug is empty', '™'],
+      ])('reads %s live, as given', async (_label, brand) => {
+        mockMirrorReady.mockResolvedValue(true);
+        holdNothing();
+        mockSearch({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] });
+
+        const result = await offSearchProductsTool.handler(
+          { brands_tag: brand, page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockSearchProducts).toHaveBeenCalledExactlyOnceWith(
+          { page: 1, page_size: 20, brands_tag: brand },
+          ctx,
+        );
+        expect(result.source).toBe('off_api');
+        expect(getEnrichment(ctx).mirror_snapshot).toBeUndefined();
+      });
+
+      it('asks about the brand only on a tag-only search over a ready mirror', async () => {
+        mockSearch({ count: 1, page: 1, page_count: 1, page_size: 20, products: [] });
+
+        await offSearchProductsTool.handler({ brands_tag: 'Nestlé', page: 1, page_size: 20 }, ctx);
+        mockMirrorReady.mockResolvedValue(true);
+        await offSearchProductsTool.handler(
+          { query: 'chocolat', brands_tag: 'Nestlé', page: 1, page_size: 20 },
+          ctx,
+        );
+
+        expect(mockMirrorHeldBrand).not.toHaveBeenCalled();
+        expect(mockSearchProducts.mock.calls.map(([params]) => params.brands_tag)).toEqual([
+          'Nestlé',
+          'nestle',
+        ]);
+      });
+
+      it('answers page 11 empty, as total 0, when the live count finds nothing, on both surfaces', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        holdNothing();
+        mockSearch({ count: 0, page: 1, page_count: 0, page_size: 1, products: [] });
+
+        const result = await runToolContract(offSearchProductsTool, {
+          brands_tag: 'kelloggs',
+          page: 11,
+          page_size: 50,
+        });
+
+        expect(mockSearchProducts).toHaveBeenCalledOnce();
+        expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual(countRead('kelloggs'));
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toEqual({
+          total: 0,
+          total_is_lower_bound: false,
+          page: 11,
+          page_size: 50,
+          page_count: 0,
+          source: 'off_api',
+          products: [],
+          notice:
+            'No products found for brand="kelloggs". Try broader terms, put brand wording in query to match it as words, or remove some filters.',
+        });
+        const text = contractText(result);
+        expect(text).toContain('**No products found** (total: 0)');
+        expect(text).toContain('put brand wording in query to match it as words');
+        expect(text).not.toContain('off_browse_taxonomy');
+      });
+
+      it.each([
+        // [page, live total, last page, bound in the notice, bound in the text]: pages 1–10 at
+        // page_size 50 hold the first 500 matches.
+        [
+          11,
+          2,
+          1,
+          'Request page 1 or lower to reach them.',
+          'Request page 1 or lower to reach the matching products.',
+        ],
+        // Exactly the matches pages 1–10 hold, so page 11 starts past the last of them.
+        [
+          11,
+          500,
+          10,
+          'Request page 10 or lower to reach them.',
+          'Request page 10 or lower to reach the matching products.',
+        ],
+        // Matches on pages 11 and past are refused, so page 10 reaches only the first 500.
+        [
+          12,
+          550,
+          10,
+          'Request page 10 or lower — at page_size 50 that reaches the first 500 of the 550 matches — or narrow the filters or change sort_by to bring the products you need forward.',
+          'Request page 10 or lower — at page_size 50 that reaches the first 500 of the 550 matches.',
+        ],
+        [
+          12,
+          520,
+          10,
+          'Request page 10 or lower — at page_size 50 that reaches the first 500 of the 520 matches — or narrow the filters or change sort_by to bring the products you need forward.',
+          'Request page 10 or lower — at page_size 50 that reaches the first 500 of the 520 matches.',
+        ],
+      ] as const)(
+        'answers page %i empty, with the total, when the live count of %i ends before it starts, on both surfaces',
+        async (page, liveTotal, lastPage, noticeBound, textBound) => {
+          mockMirrorReady.mockResolvedValue(true);
+          holdNothing();
+          // The count read's one row is page 1's, never the requested page's.
+          mockSearch({
+            count: liveTotal,
+            page: 1,
+            page_count: 1,
+            page_size: 1,
+            products: [{ code: '1234567890001', product_name: 'First match' }],
+          });
+          const notice = `Page ${page} is past the end of this result set — ${liveTotal} matching products exist, but no page this deep holds any. ${noticeBound}`;
+
+          const result = await runToolContract(offSearchProductsTool, {
+            brands_tag: 'Vĩnh Hảo',
+            page,
+            page_size: 50,
+          });
+
+          expect(mockSearchProducts).toHaveBeenCalledOnce();
+          expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual(countRead('Vĩnh Hảo'));
+          expect(result.isError).toBeFalsy();
+          expect(result.structuredContent).toEqual({
+            total: liveTotal,
+            total_is_lower_bound: false,
+            page,
+            page_size: 50,
+            page_count: 0,
+            last_page: lastPage,
+            source: 'off_api',
+            products: [],
+            notice,
+          });
+          const text = contractText(result);
+          expect(text).toContain(
+            `**Page ${page} is past the end of this result set** (${liveTotal} total products)`,
+          );
+          expect(text).toContain(textBound);
+          expect(text).toContain(notice);
+          expect(text).not.toContain('First match');
+          expect(text).not.toContain('off_browse_taxonomy');
+        },
+      );
+
+      it('names a one-match brand past page 10 in the singular, on both surfaces', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        holdNothing();
+        mockSearch({
+          count: 1,
+          page: 1,
+          page_count: 1,
+          page_size: 1,
+          products: [{ code: '1234567890001', product_name: 'First match' }],
+        });
+        const notice =
+          'Page 11 is past the end of this result set — 1 matching product exists, but no page this deep holds any. Request page 1 or lower to reach it.';
+
+        const result = await runToolContract(offSearchProductsTool, {
+          brands_tag: 'Vĩnh Hảo',
+          page: 11,
+          page_size: 50,
+        });
+
+        expect(result.structuredContent).toEqual({
+          total: 1,
+          total_is_lower_bound: false,
+          page: 11,
+          page_size: 50,
+          page_count: 0,
+          last_page: 1,
+          source: 'off_api',
+          products: [],
+          notice,
+        });
+        const text = contractText(result);
+        expect(text).toContain('**Page 11 is past the end of this result set** (1 total product)');
+        expect(text).toContain('Request page 1 or lower to reach the matching product.');
+        expect(text).toContain(notice);
+      });
+
+      it('never reports the live count read’s own row as left off the page it answers empty', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        holdNothing();
+        // Page 1's one row carried a code Open Food Facts cannot serve, so the count read dropped it.
+        mockSearch({ count: 1, page: 1, page_count: 0, page_size: 1, products: [], dropped: 1 });
+
+        const result = await runToolContract(offSearchProductsTool, {
+          brands_tag: 'Vĩnh Hảo',
+          page: 11,
+          page_size: 50,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).not.toHaveProperty('omitted');
+        expect(result.structuredContent).toMatchObject({ total: 1, page: 11, page_count: 0 });
+        expect(contractText(result)).toContain('**Page 11 is past the end of this result set**');
+      });
+
+      it.each([
+        [11, 3583],
+        // One past the matches pages 1–10 hold at page_size 50, so page 11 would hold it.
+        [11, 501],
+        [12, 551],
+      ])(
+        'refuses page %i when the live count of %i reaches into it, naming the brand and that total, on both surfaces',
+        async (page, liveTotal) => {
+          mockMirrorReady.mockResolvedValue(true);
+          holdNothing();
+          mockSearch({
+            count: liveTotal,
+            page: 1,
+            page_count: 1,
+            page_size: 1,
+            products: [{ code: '1234567890001' }],
+          });
+          const message = `A search by tag filters alone is served through page 10 only when it reads the live database, and page ${page} was requested: this server's local copy of the export holds no product under brands_tag "Vĩnh Hảo", so the search reads the live database, where it matches ${liveTotal} products.`;
+          const hint = `Request page 10 or lower — at page_size 50 that reaches the first 500 of the ${liveTotal} matches — or narrow the filters or change sort_by to bring the products you need forward.`;
+
+          const result = await runToolContract(offSearchProductsTool, {
+            brands_tag: 'Vĩnh Hảo',
+            page,
+            page_size: 50,
+          });
+
+          expect(mockSearchProducts).toHaveBeenCalledOnce();
+          expect(mockSearchProducts.mock.calls[0]?.[0]).toEqual(countRead('Vĩnh Hảo'));
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toMatchObject({
+            error: {
+              message,
+              data: {
+                reason: 'page_out_of_range',
+                page,
+                page_size: 50,
+                max_page: 10,
+                brand: 'Vĩnh Hảo',
+                live_total: liveTotal,
+                retryable: false,
+                recovery: { hint },
+              },
+            },
+          });
+          expect(contractHint(result)).toBe(hint);
+          const text = contractText(result);
+          expect(text).toContain(message);
+          expect(text).toContain(hint);
+          expect(text).not.toContain('off_browse_taxonomy');
+        },
+      );
+
+      it('serves page 11 of a held brand from the mirror, with no live count', async () => {
+        mockMirrorReady.mockResolvedValue(true);
+        mockMirrorPage({ count: 600, page: 11, page_count: 1, page_size: 50, products: [] });
+
+        await offSearchProductsTool.handler(
+          offSearchProductsTool.input.parse({ brands_tag: 'kellogg-s', page: 11, page_size: 50 }),
+          ctx,
+        );
+
+        expect(mockSearchProducts).toHaveBeenCalledExactlyOnceWith(
+          { page: 11, page_size: 50, brands_tag: 'kellogg-s', tags_confirmed: true },
+          ctx,
+        );
+      });
+
+      it.each([
+        [
+          'nothing confirms',
+          () => undefined,
+          'no matching Open Food Facts tag was found',
+          { reason: 'no_match' },
+        ],
+        [
+          'the taxonomy budget refused the lookup of',
+          () =>
+            mockSuggestTaxonomy.mockRejectedValue(
+              new BudgetExhaustedError('budget spent', {
+                endpoint: 'taxonomy',
+                limit: 10,
+                retryAfter: 42,
+              }),
+            ),
+          "this server's own per-minute taxonomy budget was spent, so it went unchecked; a lookup slot frees in about 42 s",
+          { reason: 'lookup_failed', cause: 'budget_spent' },
+        ],
+      ])(
+        'refuses page 11 naming the unheld brand beside a country %s, not retryable, sending nothing',
+        async (_label, arrange, why, entry) => {
+          mockMirrorReady.mockResolvedValue(true);
+          holdNothing();
+          arrange();
+
+          expect(
+            await refusal({
+              brands_tag: 'kelloggs',
+              countries_tag: 'Narnia',
+              page: 11,
+              page_size: 50,
+            }),
+          ).toEqual({
+            message: `A search by tag filters alone is served through page 10 only when it reads the live database, and page 11 was requested: this server's local copy of the export serves deeper pages only when it confirms every value, and countries_tag "Narnia" went unconfirmed (${why}); brands_tag "kelloggs" names no brand it holds a product under.`,
+            data: {
+              reason: 'page_out_of_range',
+              page: 11,
+              page_size: 50,
+              max_page: 10,
+              unconfirmed: [
+                { field: 'countries_tag', value: 'Narnia', ...entry },
+                { field: 'brands_tag', value: 'kelloggs', reason: 'not_held' },
+              ],
+              retryable: false,
+              recovery: {
+                hint: 'Request page 10 or lower — at page_size 50 that reaches the first 500 matches — or narrow the filters or change sort_by to bring the products you need forward.',
+              },
+            },
+          });
+          expect(mockSearchProducts).not.toHaveBeenCalled();
+        },
+      );
     });
 
     it('refuses with the live refusal when the service could not serve a confirmed page past 10', async () => {
@@ -3357,7 +4179,7 @@ describe('off_search_products', () => {
             unconfirmed: [{ field: 'countries_tag', value: 'Narnia', reason: 'no_match' }],
             retryable: false,
             recovery: {
-              hint: "Replace the value with a canonical tag ID from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page 201, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.",
+              hint: 'No Open Food Facts tag matches countries_tag "Narnia": correct or drop it so this server\'s local copy of the export can serve page 201, or request page 10 or lower — at page_size 50 that reaches the first 500 matches.',
             },
           },
         });
@@ -3469,15 +4291,18 @@ describe('off_search_products', () => {
       mockMirrorReady.mockResolvedValue(true);
       mockMirrorPage({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
 
+      // A held brand beside a category none of its products carries (#94: the brand is pointed at
+      // query, only the other tag IDs at off_browse_taxonomy).
       const result = await runToolContract(offSearchProductsTool, {
-        brands_tag: 'nutell',
+        brands_tag: 'nutella',
+        categories_tag: 'en:spreads',
         page: 1,
         page_size: 20,
       });
 
       const structured = result.structuredContent as Record<string, unknown>;
       expect(structured.notice).toBe(
-        'No products found for brand="nutell". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+        'No products found for category="en:spreads", brand="nutella". Try broader terms, check the other tag IDs via off_browse_taxonomy, put brand wording in query to match it as words, or remove some filters.',
       );
       expect(structured).not.toHaveProperty('last_page');
       expect(String(structured.mirror_snapshot)).toContain(MIRROR_NOTE);
@@ -3624,6 +4449,15 @@ describe('off_search_products', () => {
       );
       expect(inputDescription('page')).toContain('A request past any of these bounds is rejected');
       expect(inputDescription('page')).not.toMatch(/no page limit/);
+      // A brand reaches the copy only under a key it holds products for (#94), not as any slug.
+      expect(inputDescription('page')).toContain(
+        'a tag-only search whose every value it confirms (canonical IDs from off_browse_taxonomy, and a brand it holds products under) is served from that copy',
+      );
+      expect(inputDescription('page')).not.toContain('or a brand slug');
+      // The one page past the live bound that is sent, not rejected: a brand the copy holds nothing under.
+      expect(inputDescription('page')).toContain(
+        'A brand the local copy holds no product under is the exception on a page past 10: one live count answers it empty, with that total, when the live matches end before the page, and rejects it when they reach into it.',
+      );
       expect(offSearchProductsTool.output.shape.last_page.description).toContain(
         'capped at page 10 on a search by tag filters alone that read the live database',
       );
@@ -3634,7 +4468,7 @@ describe('off_search_products', () => {
         (e) => e.reason === 'page_out_of_range',
       );
       expect(pageBound?.when).toContain(
-        'asks for a page past 10 and would read the live database — this server keeps no ready local copy of the export, a tag value is one it cannot confirm, or the search carries ecoscore_grade before a full reload of that copy has indexed Green-Score',
+        'asks for a page past 10 and would read the live database — this server keeps no ready local copy of the export, a tag value is one it cannot confirm, the brand is one it holds no product under and the live database matches enough products to reach into the requested page, or the search carries ecoscore_grade before a full reload of that copy has indexed Green-Score',
       );
       expect(pageBound?.when).toContain(
         'or one the local copy serves beyond its 10000-result window',
@@ -4678,6 +5512,25 @@ describe('off_search_products', () => {
       expect(text).toContain('**Page 5 is past the end of this result set** (163 total products)');
     });
 
+    it('names one whole-number match past the end in the singular', async () => {
+      mockSearch({ count: 1, page: 2, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: SUGARS_LTE_3,
+        page: 2,
+        page_size: 50,
+      });
+
+      const { notice } = result.structuredContent as { notice?: string };
+      expect(notice).toBe(
+        'Page 2 is past the end of this result set — 1 whole-number match exists, but no page this deep holds any. Request page 1 or lower to reach it.',
+      );
+      const text = contractText(result);
+      expect(text).toContain(`> ${notice}`);
+      expect(text).toContain('**Page 2 is past the end of this result set** (1 total product)');
+      expect(text).toContain('Request page 1 or lower to reach the matching product.');
+    });
+
     it('keeps the matching-products claim past the end of a search on a float nutrient', async () => {
       mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
 
@@ -4916,7 +5769,7 @@ describe('off_search_products', () => {
           notice: TAG_ONLY_EMPTY_NOTICE,
         });
         expect(text).toBe(
-          `**No products found** (total: 0)\n\nTry broadening the search terms or checking tag IDs via off_browse_taxonomy.\n\n**Source:** off_api (Open Food Facts)\n\n\n> ${TAG_ONLY_EMPTY_NOTICE}`,
+          `**No products found** (total: 0)\n\n**Source:** off_api (Open Food Facts)\n\n\n> ${TAG_ONLY_EMPTY_NOTICE}`,
         );
       });
 
@@ -5613,6 +6466,174 @@ describe('off_search_products', () => {
       expect(offSearchProductsTool.description).toContain('ingredients_tag');
     });
   });
+
+  describe('quantity and completeness on each row (#92)', () => {
+    /**
+     * Rows as the service hands them on: two Nutella pack sizes as Open Food Facts reports them,
+     * a record scoring above 1, an empty quantity, a record holding neither field, one whose
+     * values are not the types Open Food Facts sends, and a score sent as a numeric string, as
+     * /api/v2/search sends some (5053990161669 as "0.65", 2026-11-24).
+     */
+    const ROWS = [
+      { code: '3017620422003', product_name: 'Nutella', quantity: '400 g e', completeness: 0.9 },
+      { code: '3017620425035', product_name: 'Nutella', quantity: '1 kg', completeness: 0.9 },
+      { code: '20534585', product_name: 'Parmentier', quantity: '300 g', completeness: 1.1 },
+      { code: '0006423460193', product_name: 'Blank quantity', quantity: '', completeness: 0.5 },
+      { code: '0011126007200', product_name: 'Sparse' },
+      { code: '0011110135056', product_name: 'Mistyped', quantity: 400, completeness: 'high' },
+      { code: '5053990161669', product_name: 'String score', completeness: '0.65' },
+    ];
+
+    it('carries each row’s quantity and completeness, omitting an empty, absent, or mistyped one', async () => {
+      mockSearch({ count: 7, page: 1, page_count: 7, page_size: 20, products: ROWS });
+
+      const result = await offSearchProductsTool.handler(
+        offSearchProductsTool.input.parse({ query: 'nutella' }),
+        ctx,
+      );
+
+      expect(result.products).toStrictEqual([
+        {
+          barcode: '3017620422003',
+          product_name: 'Nutella',
+          quantity: '400 g e',
+          completeness: 0.9,
+        },
+        { barcode: '3017620425035', product_name: 'Nutella', quantity: '1 kg', completeness: 0.9 },
+        { barcode: '20534585', product_name: 'Parmentier', quantity: '300 g', completeness: 1.1 },
+        { barcode: '0006423460193', product_name: 'Blank quantity', completeness: 0.5 },
+        { barcode: '0011126007200', product_name: 'Sparse' },
+        { barcode: '0011110135056', product_name: 'Mistyped' },
+        { barcode: '5053990161669', product_name: 'String score', completeness: 0.65 },
+      ]);
+    });
+
+    it('renders each row’s quantity and labelled completeness as structuredContent carries them', async () => {
+      mockSearch({ count: 7, page: 1, page_count: 7, page_size: 20, products: ROWS });
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'nutella' });
+      const text = contractText(result);
+      const rows = text.split('### ').slice(1);
+      const { products } = result.structuredContent as {
+        products: { quantity?: string; completeness?: number }[];
+      };
+
+      expect(rows).toHaveLength(7);
+      expect(rows[0]).toContain('**Quantity:** 400 g e');
+      expect(rows[0]).toContain('**Data completeness:** 90% (exact 0.9, high)');
+      expect(rows[1]).toContain('**Quantity:** 1 kg');
+      expect(rows[2]).toContain('**Data completeness:** 110% (exact 1.1, high)');
+      expect(rows[3]).toContain('**Data completeness:** 50% (exact 0.5, moderate)');
+      expect(rows[6]).toContain('**Data completeness:** 65% (exact 0.65, moderate)');
+      for (const row of rows.slice(3)) expect(row).not.toContain('**Quantity:**');
+      for (const row of rows.slice(4, 6)) expect(row).not.toContain('**Data completeness:**');
+      // Each rendered value is the structured one, row for row.
+      products.forEach((product, i) => {
+        if (product.quantity !== undefined) {
+          expect(rows[i]).toContain(`**Quantity:** ${product.quantity}`);
+        }
+        if (product.completeness !== undefined) {
+          expect(rows[i]).toContain(`(exact ${product.completeness},`);
+        }
+      });
+    });
+
+    it('escapes a quantity’s Markdown on the text surface only', async () => {
+      mockSearch({
+        count: 1,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '3017620422003', quantity: '2 x *200* g' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'nutella' });
+
+      expect(
+        (result.structuredContent as { products: { quantity?: string }[] }).products[0]?.quantity,
+      ).toBe('2 x *200* g');
+      expect(contractText(result)).toContain('**Quantity:** 2 x \\*200\\* g');
+    });
+
+    it('names quantity and completeness in the row schema without a 0–1 range', () => {
+      const row = rowSchema();
+
+      expect(row.quantity?.description).toContain('pack sizes');
+      expect(row.completeness?.description).toContain('can exceed 1');
+      expect(offSearchProductsTool.description).toContain('quantity');
+      expect(offSearchProductsTool.description).toContain('data completeness');
+    });
+  });
+
+  describe('record dates on each row (#96)', () => {
+    /**
+     * Rows as the service hands them on, in epoch seconds: the text index's revision of 50457250,
+     * a record holding only its creation time, and one whose times are not numbers.
+     */
+    const ROWS = [
+      {
+        code: '50457250',
+        product_name: 'Tomato Ketchup',
+        last_modified_t: 1_689_265_890,
+        created_t: 1_415_566_933,
+      },
+      { code: '3017620422003', product_name: 'Nutella', created_t: 1_457_680_652 },
+      {
+        code: '0011126007200',
+        product_name: 'Untimed',
+        last_modified_t: '1689265890',
+        created_t: null,
+      },
+    ];
+
+    it('returns each row’s times as ISO 8601, leaving out a time the record does not hold as a number', async () => {
+      mockSearch({ count: 3, page: 1, page_count: 3, page_size: 20, products: ROWS });
+
+      const result = await offSearchProductsTool.handler(
+        offSearchProductsTool.input.parse({ query: 'ketchup' }),
+        ctx,
+      );
+
+      expect(result.products).toStrictEqual([
+        {
+          barcode: '50457250',
+          product_name: 'Tomato Ketchup',
+          last_modified: '2023-07-13T16:31:30.000Z',
+          created: '2014-11-09T21:02:13.000Z',
+        },
+        { barcode: '3017620422003', product_name: 'Nutella', created: '2016-03-11T07:17:32.000Z' },
+        { barcode: '0011126007200', product_name: 'Untimed' },
+      ]);
+    });
+
+    it('renders each row’s times exactly as structuredContent carries them', async () => {
+      mockSearch({ count: 3, page: 1, page_count: 3, page_size: 20, products: ROWS });
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'ketchup' });
+      const rows = contractText(result).split('### ').slice(1);
+      const { products } = result.structuredContent as {
+        products: { last_modified?: string; created?: string }[];
+      };
+
+      expect(rows[0]).toContain(
+        `**Last modified:** ${products[0]?.last_modified} | **Created:** ${products[0]?.created}`,
+      );
+      expect(rows[0]).toContain('**Last modified:** 2023-07-13T16:31:30.000Z');
+      expect(rows[1]).toContain(`**Created:** ${products[1]?.created}`);
+      expect(rows[1]).not.toContain('Last modified');
+      expect(rows[2]).not.toMatch(/Last modified|Created/);
+    });
+
+    it('describes the times, ties the date sorts to them, and names them in the description', () => {
+      const row = rowSchema();
+
+      expect(row.last_modified?.description).toContain('ISO 8601');
+      expect(row.last_modified?.description).toContain('text index');
+      expect(row.created?.description).toContain('ISO 8601');
+      expect(inputDescription('sort_by')).toContain('last_modified');
+      expect(offSearchProductsTool.description).toContain('last modified');
+    });
+  });
 });
 
 // ── #79: the local mirror end to end ─────────────────────────────────────────
@@ -5774,9 +6795,15 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
     service.initOpenFoodFactsService();
     taxonomy.initTaxonomyService();
     requests = [];
-    global.fetch = vi.fn(async (input: unknown) => {
+    global.fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
       const url = new URL(String(input));
-      requests.push(`${url.hostname}${url.pathname}`);
+      // The text index date probe (a text-endpoint POST with no `q`) is not one of the requests
+      // these cases count; it fails on the hits below, which carry no last_modified_t.
+      const probe =
+        url.pathname === '/search' &&
+        typeof init?.body === 'string' &&
+        !('q' in JSON.parse(init.body));
+      if (!probe) requests.push(`${url.hostname}${url.pathname}`);
       if (url.pathname === '/autocomplete') {
         const q = url.searchParams.get('q');
         const options =
@@ -6021,7 +7048,7 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
             { field: 'categories_tag', value: 'en:not-a-category', reason: 'no_match' },
           ],
           recovery: {
-            hint: "Replace the value with a canonical tag ID from off_browse_taxonomy, or a brand slug, so this server's local copy of the export can serve page 11, or request page 10 or lower — at page_size 1 that reaches the first 10 matches.",
+            hint: 'No Open Food Facts tag matches categories_tag "en:not-a-category": correct or drop it so this server\'s local copy of the export can serve page 11, or request page 10 or lower — at page_size 1 that reaches the first 10 matches.',
           },
         },
       });
@@ -6046,6 +7073,17 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
       );
     });
 
+    it('sends no text index date probe on a search the store serves, which carries neither field (#95)', async () => {
+      const { structured, text } = await call({ brands_tag: 'Nutella', page: 1, page_size: 2 });
+
+      expect(structured).toMatchObject({ source: 'off_mirror', mirror_as_of: AS_OF });
+      expect(structured).not.toHaveProperty('text_index_as_of');
+      expect(structured).not.toHaveProperty('text_index_snapshot');
+      expect(text).not.toContain('Text index as of');
+      // Not even the probe, which `requests` leaves out: nothing at all was sent.
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
     it('serves an ingredient search from the text index, never the store, past page 10 too (#88)', async () => {
       const { result, structured } = await call({
         ingredients_tag: 'en:inulin',
@@ -6066,6 +7104,207 @@ describe('off_search_products on a local mirror, end to end (#79)', () => {
         page: 11,
         page_size: 2,
       });
+    });
+  });
+
+  describe('brands by the key the store holds them under (#94)', () => {
+    /** A schema 1004 export line of one product stored under `brandTag`. */
+    const branded = (code: string, brandTag: string) => ({
+      code,
+      schema_version: 1004,
+      lc: 'en',
+      product_name: `Product ${code}`,
+      brands_tags: [brandTag],
+    });
+    /** Twelve products stored under the folded slug, one under an accent-keeping key, one more. */
+    const BRAND_LINES = [
+      ...Array.from({ length: 12 }, (_, i) =>
+        branded(`6000000000${String(i + 1).padStart(3, '0')}`, 'xx:nestle'),
+      ),
+      branded('7000000000001', 'xx:café-bar'),
+      branded('7000000000002', 'xx:løgismose'),
+      branded('7000000000003', 'xx:όλυμπος'),
+    ];
+    let path: string;
+
+    beforeEach(async () => {
+      path = join(dir, 'store.sqlite');
+      await writeStore(path, BRAND_LINES, true);
+      await serve(path);
+    });
+
+    /** The query of the one live tag search sent. */
+    const liveSearch = () => {
+      const url = vi
+        .mocked(global.fetch)
+        .mock.calls.map(([input]) => new URL(String(input)))
+        .find((candidate) => candidate.pathname === '/api/v2/search');
+      return url && Object.fromEntries(url.searchParams);
+    };
+
+    it('serves "Nestlé" from the store under nestle, page 11 included, sending nothing', async () => {
+      const first = await call({ brands_tag: 'Nestlé', page: 1, page_size: 50 });
+      const deep = await call({ brands_tag: 'Nestlé', page: 11, page_size: 1 });
+
+      expect(first.structured).toMatchObject({ total: 12, source: 'off_mirror' });
+      expect(deep.structured).toMatchObject({ total: 12, page: 11, source: 'off_mirror' });
+      expect(deep.barcodes).toHaveLength(1);
+      expect(requests).toEqual([]);
+    });
+
+    it.each([
+      ['under its accent-keeping key alone', 'café-bar'],
+      ['under a key the fold leaves alone', 'Løgismose'],
+      ['under the final-ς key a lowercase-typed name keeps, given all caps', 'ΌΛΥΜΠΟΣ'],
+    ])('serves a brand the store holds %s', async (_label, brand) => {
+      const { structured } = await call({ brands_tag: brand, page: 1, page_size: 50 });
+
+      expect(structured).toMatchObject({ total: 1, source: 'off_mirror' });
+      expect(requests).toEqual([]);
+    });
+
+    it('reads a brand the store holds under no key live, as given', async () => {
+      const { structured } = await call({ brands_tag: 'kelloggs', page: 1, page_size: 2 });
+
+      expect(structured).toMatchObject({ total: 4581, source: 'off_api' });
+      expect(paths()).toEqual(['/api/v2/search']);
+      expect(liveSearch()).toMatchObject({ brands_tags: 'kelloggs', page: '1', page_size: '2' });
+    });
+
+    it('refuses page 11 of an unheld brand after one live count read, naming its total', async () => {
+      const refusal = await refusalOf({ brands_tag: 'kelloggs', page: 11, page_size: 1 });
+
+      expect(refusal.data).toMatchObject({
+        reason: 'page_out_of_range',
+        brand: 'kelloggs',
+        live_total: 4581,
+        retryable: false,
+      });
+      expect(paths()).toEqual(['/api/v2/search']);
+      expect(liveSearch()).toMatchObject({ brands_tags: 'kelloggs', page: '1', page_size: '1' });
+    });
+
+    it('answers page 11 of an unheld brand empty, total 0, when the live count finds nothing', async () => {
+      global.fetch = vi.fn(async (input: unknown) => {
+        const url = new URL(String(input));
+        requests.push(`${url.hostname}${url.pathname}`);
+        return Response.json(TAG_SEARCH_EMPTY);
+      }) as typeof fetch;
+
+      const { result, structured } = await call({
+        brands_tag: 'kelloggs',
+        page: 11,
+        page_size: 1,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(structured).toMatchObject({
+        total: 0,
+        page: 11,
+        page_size: 1,
+        products: [],
+        source: 'off_api',
+      });
+      expect(paths()).toEqual(['/api/v2/search']);
+    });
+
+    it('reads a brand live, as given, when the brand check meets a store error, logging it', async () => {
+      const writer = openMirrorStore(path);
+      try {
+        (await writer.raw()).exec('DROP TABLE tags');
+      } finally {
+        await writer.close();
+      }
+      const ctx = createMockContext({ errors: tool.errors });
+
+      const result = await tool.handler(
+        tool.input.parse({ brands_tag: 'Nestlé', page: 1, page_size: 2 }),
+        ctx,
+      );
+
+      expect(result.source).toBe('off_api');
+      expect(liveSearch()).toMatchObject({ brands_tags: 'Nestlé' });
+      expect(
+        (ctx.log as MockContextLogger).calls.filter(({ level }) => level === 'warning'),
+      ).toEqual([
+        {
+          level: 'warning',
+          msg: 'Mirror read failed — reading Open Food Facts live instead',
+          data: expect.objectContaining({ operation: 'brand check' }),
+        },
+      ]);
+    });
+  });
+
+  describe('row fields from the local copy (#92, #96)', () => {
+    /**
+     * Two Nutella pack sizes with the values and times Open Food Facts reported for them, a record
+     * scoring above 1 with only a creation time, and one with an empty quantity, no score, and no
+     * times. Rows are stamped record version 1.
+     */
+    const ROW_LINES = [
+      jar(1, {
+        popularity_key: 40,
+        quantity: '400 g e',
+        completeness: 0.9,
+        created_t: 1_457_680_652,
+        last_modified_t: 1_795_447_208,
+      }),
+      jar(2, {
+        popularity_key: 30,
+        quantity: '1 kg',
+        completeness: 0.9,
+        created_t: 1_532_452_519,
+        last_modified_t: 1_794_902_892,
+      }),
+      jar(3, { popularity_key: 20, quantity: '300 g', completeness: 1.0875, created_t: 1 }),
+      jar(4, { popularity_key: 10, quantity: '' }),
+    ];
+
+    beforeEach(async () => {
+      const path = join(dir, 'store.sqlite');
+      await writeStore(path, ROW_LINES, true);
+      await serve(path);
+    });
+
+    it('serves each row’s quantity and completeness from record-version-1 rows, on both surfaces', async () => {
+      const { structured, text } = await call({ brands_tag: 'Nutella' });
+      const rows = (structured.products ?? []) as Record<string, unknown>[];
+
+      expect(structured.source).toBe('off_mirror');
+      expect(requests).toEqual([]);
+      expect(rows.map((row) => [row.barcode, row.quantity, row.completeness])).toEqual([
+        [code(1), '400 g e', 0.9],
+        [code(2), '1 kg', 0.9],
+        [code(3), '300 g', 1.0875],
+        [code(4), undefined, undefined],
+      ]);
+      expect(Object.keys(rows[3] ?? {})).not.toContain('quantity');
+      expect(Object.keys(rows[3] ?? {})).not.toContain('completeness');
+      expect(text).toContain('**Quantity:** 400 g e');
+      expect(text).toContain('**Quantity:** 1 kg');
+      expect(text).toContain('**Data completeness:** 109% (exact 1.0875, high)');
+      expect(text.match(/\*\*Data completeness:\*\*/g)).toHaveLength(3);
+    });
+
+    it('dates each row from its row’s columns, record version 1 included, on both surfaces', async () => {
+      const { structured, text } = await call({ brands_tag: 'Nutella' });
+      const rows = (structured.products ?? []) as Record<string, unknown>[];
+
+      expect(requests).toEqual([]);
+      expect(rows.map((row) => [row.barcode, row.last_modified, row.created])).toEqual([
+        [code(1), '2026-11-23T15:20:08.000Z', '2016-03-11T07:17:32.000Z'],
+        [code(2), '2026-11-17T08:08:12.000Z', '2018-07-24T17:15:19.000Z'],
+        [code(3), undefined, '1970-01-01T00:00:01.000Z'],
+        [code(4), undefined, undefined],
+      ]);
+      expect(Object.keys(rows[2] ?? {})).not.toContain('last_modified');
+      expect(Object.keys(rows[3] ?? {})).not.toContain('created');
+      expect(text).toContain(
+        '**Last modified:** 2026-11-23T15:20:08.000Z | **Created:** 2016-03-11T07:17:32.000Z',
+      );
+      expect(text).toContain('**Created:** 1970-01-01T00:00:01.000Z');
+      expect(text.match(/\*\*Created:\*\*/g)).toHaveLength(3);
     });
   });
 

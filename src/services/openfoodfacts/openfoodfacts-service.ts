@@ -14,12 +14,14 @@ import type { MirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import {
   defaultIsTransient,
   fetchWithTimeout,
+  logger,
   type RetryAttempt,
   withExtra,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import {
+  firstHeldTag,
   getByCodes,
   type MirrorDoc,
   type MirrorTagFilter,
@@ -33,6 +35,7 @@ import {
   mirrorAsOf,
 } from '@/services/mirror/mirror-store.js';
 import { fieldsNewerThan } from '@/services/mirror/record-builder.js';
+import { untilCancelled } from '@/utils/until-cancelled.js';
 import { ANALYZER_STOP_WORDS, STOP_WORD_LANGS } from './analyzer-stop-words.js';
 import {
   type AsSoldSelection,
@@ -60,6 +63,7 @@ import {
   type SearchParams,
   type SearchResult,
   type SearchRow,
+  type TagValue,
   WHOLE_NUMBER_NUTRIENTS,
 } from './types.js';
 import { USER_AGENT } from './user-agent.js';
@@ -446,19 +450,29 @@ export type ReadSource = { source: 'off_api' } | { source: 'off_mirror'; mirrorA
 
 /**
  * Requested fields a mirror row predates, which a read answered from that row lacks: the live read
- * that tries them first either failed with `error` or found no product under the barcode.
+ * that tries them first either failed with `error` or found no product under the barcode, or, for
+ * a read that serves such a row as it is (`PredatedFields` `serve_row`), was `skipped`.
  */
 export type UnreadFields = { fields: readonly string[] } & (
   | { outcome: 'failed'; error: McpError }
   | { outcome: 'not_found' }
+  | { outcome: 'skipped' }
 );
+
+/**
+ * What a product read does with requested fields the mirror row it finds predates. `read_live`
+ * reads the product live for them, and serves the row without them only when that read fails or
+ * finds nothing. `serve_row` serves the row without them and sends nothing, for a read that must
+ * not spend a request on fields the copy will hold once a reload rewrites the row.
+ */
+export type PredatedFields = 'read_live' | 'serve_row';
 
 /**
  * A found product and where it was read. `product` holds only the v2 fields the read asked for,
  * as the live API returns them. A mirror read also carries `storedSets`, the record's stored
  * nutrition sets from the same stored revision as `product` (`undefined` when it stores none),
  * which `readStoredAsSold` selects the as-sold figures from without a request, and `unread` when
- * its row predates requested fields the live read could not supply.
+ * its row predates requested fields the read did not supply.
  */
 export type ProductRead =
   | { source: 'off_api'; product: RawProduct }
@@ -479,8 +493,8 @@ type MirroredProduct = {
 /**
  * A search as the search tool hands it over. `tags_confirmed` marks a search by tag filters alone
  * whose every value is canonical and confirmed: each tag value is the `value` the taxonomy
- * service's `canonicalizeTag` returned with `resolution: 'vocabulary'`, or a brand's slug
- * (`no_vocabulary`, the form Product Opener stores a brand under `xx:`); exclusions are confirmed
+ * service's `canonicalizeTag` returned with `resolution: 'vocabulary'`, or a brand slug the mirror
+ * holds products under (`mirrorHeldBrand`, matched under `xx:`); exclusions are confirmed
  * before they are sent at all; `nutrition_grade`, `nova_group`, `ecoscore_grade`, and
  * `ingredients_analysis_tag` are closed vocabularies the tool's input schema enforces. Only such a
  * search is served from the mirror, which matches stored tags exactly, and one carrying
@@ -489,8 +503,23 @@ type MirroredProduct = {
  */
 export type ProductSearch = SearchParams & { tags_confirmed?: boolean };
 
-/** A search's answer, and where it was read. */
-type SearchRead = SearchResult & ReadSource;
+/**
+ * A search's answer, and where it was read. `textIndexAsOf`, set only on an answer the text index
+ * served and only while this service holds it, is the newest `last_modified_t` in that index as
+ * an ISO 8601 time: a product contributed or edited since is missing from the answer or matched
+ * as it was then.
+ */
+type SearchRead = SearchResult & ReadSource & { textIndexAsOf?: string };
+
+/**
+ * What the service holds of the text index's date: nothing yet, the one probe in flight, the date
+ * and when it was read, or when the last probe failed.
+ */
+type TextIndexDate =
+  | { status: 'unprobed' }
+  | { status: 'probing'; probe: Promise<string | undefined> }
+  | { status: 'known'; asOf: string; readAt: number }
+  | { status: 'failed'; failedAt: number };
 
 /**
  * How a search settled: served, or refused with nothing sent and no search run, naming the bound
@@ -581,9 +610,10 @@ function toContractError(error: unknown, data: Record<string, unknown>): unknown
 const PRODUCT_FIELDS = PRODUCT_FIELD_NAMES.join(',');
 
 /**
- * The fields a mirror doc holds for a product read: every field `PRODUCT_FIELDS` requests, and no
- * other. A field read naming anything else is read live, and so, first, is one naming a field the
- * row's record version predates (`fieldsNewerThan`).
+ * The fields a mirror read answers a product read with: every field `PRODUCT_FIELDS` requests, the
+ * doc's and the dates its row's columns hold, and no other. A field read naming anything else is
+ * read live, and so, first, is one naming a field the row's record version predates
+ * (`fieldsNewerThan`, which no date is), unless it serves such a row as it is (`serve_row`).
  */
 const MIRROR_PRODUCT_FIELDS: ReadonlySet<string> = new Set(PRODUCT_FIELD_NAMES);
 
@@ -592,13 +622,17 @@ const SEARCH_FIELDS = [
   'code',
   'product_name',
   'brands',
+  'quantity',
   'nutriscore_grade',
   'nova_group',
   'ecoscore_grade',
   'categories_tags',
+  'completeness',
+  'last_modified_t',
+  'created_t',
 ];
 
-/** `SEARCH_FIELDS`, as the mirror projects a stored doc to a search row. */
+/** `SEARCH_FIELDS`, as the mirror projects a stored doc, dated from its row, to a search row. */
 const SEARCH_FIELD_SET: ReadonlySet<string> = new Set(SEARCH_FIELDS);
 
 /**
@@ -610,9 +644,34 @@ const SEARCH_FIELD_SET: ReadonlySet<string> = new Set(SEARCH_FIELDS);
  * the same filters differently — live-verified with a category filter counting more products on
  * /api/v2/search than here, and a barcode contributed after the cutoff absent from this index
  * entirely. The endpoint publishes no index timestamp (`/health` reports only Redis and
- * Elasticsearch connectivity), so the lag is disclosed to the caller rather than dated.
+ * Elasticsearch connectivity), so the service dates the lag itself: the newest `last_modified_t`
+ * the index holds, read by a cached probe sent beside a text search (`textIndexDate`).
  */
 const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
+
+/**
+ * The text index date probe's request: no `q`, which matches the whole index (`q=*` matches
+ * nothing), newest edit first, one hit carrying `last_modified_t` alone.
+ */
+const TEXT_INDEX_PROBE_BODY = {
+  sort_by: '-last_modified_t',
+  page_size: 1,
+  fields: ['last_modified_t'],
+};
+
+/**
+ * The probe's whole budget, request and body read together, on its own timer rather than any
+ * caller's signal. A text search waits on the probe only once its own answer is in, so this is the
+ * most that wait can add; live, the probe answered in about 0.5 s, inside the 0.6–0.7 s of a
+ * typical text search it runs beside.
+ */
+const TEXT_INDEX_PROBE_TIMEOUT_MS = 3_000;
+
+/** How long a probed index date is reused before a text search probes again. */
+const TEXT_INDEX_DATE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** How long after a failed probe no text search sends another. */
+const TEXT_INDEX_PROBE_BACKOFF_MS = 15 * 60 * 1000;
 
 /**
  * Every language the text index analyzes, sent as `langs` on each text search. The backend
@@ -858,9 +917,10 @@ function withBarcodes<T extends { code?: string }>(
 
 /**
  * A stored doc cut to `fields`, as a v2 read returns only the fields it asks for, in the doc's key
- * order (Product Opener's canonical order, which the record builder keeps). The doc is the
- * builder's projection of a live v2 read, so the fields are already in the shape the live path
- * hands on; its `code` and `_input_sets` leave unless `fields` names them.
+ * order (Product Opener's canonical order, which the record builder keeps, then the dates its row
+ * adds). The doc is the builder's projection of a live v2 read, dated from its row's columns, so the
+ * fields are already in the shape the live path hands on; its `code` and `_input_sets` leave unless
+ * `fields` names them.
  */
 function projectDoc(doc: MirrorDoc, fields: ReadonlySet<string>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(doc).filter(([field]) => fields.has(field)));
@@ -869,11 +929,12 @@ function projectDoc(doc: MirrorDoc, fields: ReadonlySet<string>): Record<string,
 /**
  * A search by tag filters alone as the mirror matches it. Every value is canonical
  * (`ProductSearch.tags_confirmed`); the query module turns each into the key the store indexes.
- * Labels are one filter each, all required; a grade input's values form one any-of filter.
+ * Labels are one filter each, all required; a grade input's values, like a tag value's IDs, form
+ * one any-of filter.
  */
 function mirrorTagSearch(params: SearchParams): MirrorTagSearch {
   const include: MirrorTagFilter[] = [];
-  const add = (facet: MirrorTagFilter['facet'], value: string | string[] | undefined) => {
+  const add = (facet: MirrorTagFilter['facet'], value: TagValue | undefined) => {
     if (value?.length) include.push({ facet, value });
   };
   add('categories', params.categories_tag);
@@ -1075,11 +1136,7 @@ class RateLimiter {
    */
   check(endpoint: string): void {
     const now = Date.now();
-    const windowStart = now - this.windowMs;
-    // Evict timestamps outside the window
-    while (this.timestamps.length > 0 && (this.timestamps[0] ?? 0) < windowStart) {
-      this.timestamps.shift();
-    }
+    this.evict(now);
     if (this.timestamps.length >= this.maxRequests) {
       const retryAfter = Math.max(
         1,
@@ -1094,6 +1151,27 @@ class RateLimiter {
     }
     this.timestamps.push(now);
   }
+
+  /**
+   * Records one best-effort request only while two or more slots are free, so it never takes the
+   * last one and a caller's own request can still follow it. Returns whether it took a slot; a
+   * request that finds none spare is simply not sent, so nothing is thrown.
+   */
+  tryAcquireSpare(): boolean {
+    const now = Date.now();
+    this.evict(now);
+    if (this.maxRequests - this.timestamps.length < 2) return false;
+    this.timestamps.push(now);
+    return true;
+  }
+
+  /** Drops the timestamps that have left the window. */
+  private evict(now: number): void {
+    const windowStart = now - this.windowMs;
+    while (this.timestamps.length > 0 && (this.timestamps[0] ?? 0) < windowStart) {
+      this.timestamps.shift();
+    }
+  }
 }
 
 export class OpenFoodFactsService {
@@ -1101,6 +1179,7 @@ export class OpenFoodFactsService {
   private readonly productLimiter: RateLimiter;
   private readonly searchLimiter: RateLimiter;
   private readonly taxonomyLimiter: RateLimiter;
+  private textIndex: TextIndexDate = { status: 'unprobed' };
 
   constructor(config: ServerConfig) {
     this.baseUrl = config.baseUrl;
@@ -1140,6 +1219,22 @@ export class OpenFoodFactsService {
   }
 
   /**
+   * The first of a brand's `slugs` (the taxonomy service's `brandSlugs`, in order) that some
+   * product the ready mirror holds carries, which a search by tag filters alone then sends to it.
+   * `undefined` when none is held, with no mirror, a store not ready, or a store error (logged), so
+   * the search reads live, where Product Opener resolves the brand as given. The caller's
+   * cancellation is rethrown.
+   */
+  async mirrorHeldBrand(slugs: readonly string[], ctx: Context): Promise<string | undefined> {
+    const held = await this.readMirror(
+      'brand check',
+      (store) => firstHeldTag(store, 'brands', slugs),
+      ctx,
+    );
+    return held?.value;
+  }
+
+  /**
    * Fetch a product by barcode: from the mirror when it is ready and holds the barcode, sending no
    * request and spending no budget slot, otherwise live (see `readLiveOver` for a row that
    * predates requested fields).
@@ -1171,18 +1266,24 @@ export class OpenFoodFactsService {
   /**
    * Fetch a product by barcode with a specific field subset.
    * Used when the caller only needs a subset of fields (e.g., off_compare_products). Served from the
-   * mirror as `getProduct` is, when every field is one the mirror holds.
+   * mirror as `getProduct` is, when every field is one the mirror holds. A row that predates
+   * requested fields is read live for them (`read_live`, as `getProduct` reads it), or served as it
+   * is with `unread` naming them `skipped` (`serve_row`), sending nothing.
    */
   async getProductFields(
     barcode: string,
     fields: string,
     ctx: Context,
+    predated: PredatedFields = 'read_live',
   ): Promise<ProductRead | null> {
     const requested = new Set(fields.split(','));
     const mirrored = [...requested].every((field) => MIRROR_PRODUCT_FIELDS.has(field))
       ? await this.readProductFromMirror(barcode, requested, ctx)
       : undefined;
     if (mirrored?.predates.length === 0) return mirrored.read;
+    if (mirrored && predated === 'serve_row') {
+      return { ...mirrored.read, unread: { fields: mirrored.predates, outcome: 'skipped' } };
+    }
     return this.readLiveOver(mirrored, ctx, () =>
       retryRead(
         ({ signal }) => {
@@ -1271,7 +1372,7 @@ export class OpenFoodFactsService {
     ctx.log.debug(
       predates.length === 0
         ? 'Product served from the mirror'
-        : 'Mirror row predates a requested field — reading live',
+        : 'Mirror row predates a requested field',
       { barcode, ...(predates.length > 0 && { predates }) },
     );
     return {
@@ -1531,9 +1632,10 @@ export class OpenFoodFactsService {
    * - Tag filters only: /api/v2/search (structured facet filtering).
    *
    * The backends differ in freshness as well as in envelope: the text index is a snapshot that
-   * lags the live database, /api/v2/search reads it directly, and the mirror reflects it as of its
-   * `mirrorAsOf`. Every answer carries its `source` so the tool discloses which one answered rather
-   * than presenting them as interchangeable.
+   * lags the live database, dated by `textIndexAsOf` when the service holds its date,
+   * /api/v2/search reads the database directly, and the mirror reflects it as of its `mirrorAsOf`.
+   * Every answer carries its `source` so the tool discloses which one answered rather than
+   * presenting them as interchangeable.
    */
   async searchProducts(params: ProductSearch, ctx: Context): Promise<SearchOutcome> {
     // `ingredients_tag` is a string or an array; either one empty is no filter.
@@ -1626,15 +1728,27 @@ export class OpenFoodFactsService {
    * stay the backend's: they describe its whole-number answer, and a page keeps its offset however
    * many rows it lost. Nothing else can do this upstream: no indexed field holds the fraction, and
    * `sort_by` on a nutrient answers HTTP 422.
+   *
+   * The answer carries `textIndexAsOf` when the service holds the index's date or reads it beside
+   * this search (`textIndexDate`), asked on the first attempt only: a probe ends within its 3 s of
+   * that attempt's start, so waiting on it never carries the call past the read's own deadline.
+   * That read is awaited only once the search has answered, so a failed or cancelled search ends
+   * without it, and a caller cancelled while waiting on it ends at once while the read runs on for
+   * the others.
    */
-  private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
+  private async searchProductsByText(
+    params: SearchParams,
+    ctx: Context,
+  ): Promise<SearchResult & { textIndexAsOf?: string }> {
     const nutrientFilters = params.nutrient_filters ?? [];
     // The nutrients a filter constrains, once each: a range pair names its nutrient twice.
     const constrained = [...new Set(nutrientFilters.map((f) => f.nutrient))];
     const page = params.page ?? 1;
     const pageSize = params.page_size ?? 20;
     const pageData = { page, page_size: pageSize };
-    return await retryRead(
+    let asked = false;
+    let indexDate: Promise<string | undefined> | undefined;
+    const result = await retryRead(
       async ({ signal }) => {
         this.searchLimiter.check('search');
         const body = {
@@ -1654,7 +1768,7 @@ export class OpenFoodFactsService {
 
         ctx.log.debug('Text-searching products', { query: params.query, q: body.q });
 
-        const response = await this.fetchSearch(
+        const searching = this.fetchSearch(
           `${TEXT_SEARCH_BASE_URL}/search`,
           ctx,
           signal,
@@ -1662,6 +1776,12 @@ export class OpenFoodFactsService {
           pageData,
           body,
         );
+        // Beside the search and after it: the search holds its own slot and sends first.
+        if (!asked) {
+          asked = true;
+          indexDate = this.textIndexDate(ctx);
+        }
+        const response = await searching;
 
         const parsed = await parseJsonBody<unknown>(response, pageData);
         // Every field is still checked below; the cast only names the keys to read.
@@ -1704,10 +1824,14 @@ export class OpenFoodFactsService {
             code: hit.code,
             ...(hit.product_name !== undefined && { product_name: hit.product_name }),
             ...(brands !== undefined && { brands }),
+            ...(hit.quantity !== undefined && { quantity: hit.quantity }),
             ...(hit.nutriscore_grade !== undefined && { nutriscore_grade: hit.nutriscore_grade }),
             ...(hit.nova_group !== undefined && { nova_group: hit.nova_group }),
             ...(hit.ecoscore_grade !== undefined && { ecoscore_grade: hit.ecoscore_grade }),
             ...(hit.categories_tags !== undefined && { categories_tags: hit.categories_tags }),
+            ...(hit.completeness !== undefined && { completeness: hit.completeness }),
+            ...(hit.last_modified_t !== undefined && { last_modified_t: hit.last_modified_t }),
+            ...(hit.created_t !== undefined && { created_t: hit.created_t }),
             ...(constrained.length > 0 && {
               indexed_nutriments: pickIndexedNutriments(hit.nutriments, constrained),
             }),
@@ -1744,6 +1868,89 @@ export class OpenFoodFactsService {
       },
       ctx,
     );
+    const textIndexAsOf = indexDate && (await untilCancelled(indexDate, ctx.signal));
+    return textIndexAsOf === undefined ? result : { ...result, textIndexAsOf };
+  }
+
+  /**
+   * The text index's date as one text search reads it, asked once that search's request is sent:
+   * the date this service holds while it is under `TEXT_INDEX_DATE_TTL_MS` old, the probe in
+   * flight, or a probe this search starts. `undefined`, so the answer goes out undated, within
+   * `TEXT_INDEX_PROBE_BACKOFF_MS` of a failed probe, or when the search budget has fewer than two
+   * slots free, since the probe never takes the last one. One probe runs at a time, however many
+   * searches wait on it.
+   */
+  private textIndexDate(ctx: Context): Promise<string | undefined> | undefined {
+    const held = this.textIndex;
+    switch (held.status) {
+      case 'probing':
+        return held.probe;
+      case 'known':
+        if (Date.now() - held.readAt < TEXT_INDEX_DATE_TTL_MS) return Promise.resolve(held.asOf);
+        break;
+      case 'failed':
+        if (Date.now() - held.failedAt < TEXT_INDEX_PROBE_BACKOFF_MS) return undefined;
+        break;
+      case 'unprobed':
+        break;
+    }
+    return this.searchLimiter.tryAcquireSpare() ? this.startTextIndexProbe(ctx) : undefined;
+  }
+
+  /**
+   * Starts the one probe of the text index's date and records how it ended: the date and when it
+   * was read, or when it failed (logged). The promise never rejects — a failed probe resolves
+   * `undefined` — since every text search waiting on it is served either way.
+   */
+  private startTextIndexProbe(ctx: Context): Promise<string | undefined> {
+    const probe = this.readTextIndexDate(ctx).then(
+      (asOf) => {
+        this.textIndex = { status: 'known', asOf, readAt: Date.now() };
+        return asOf;
+      },
+      (error: unknown): undefined => {
+        this.textIndex = { status: 'failed', failedAt: Date.now() };
+        logger.warning(
+          'Could not read the text index date; text search answers go undated until a later probe reads it.',
+          withExtra(ctx, {
+            upstreamOperation: 'OFF:textIndexDate',
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      },
+    );
+    this.textIndex = { status: 'probing', probe };
+    return probe;
+  }
+
+  /**
+   * One read of the newest `last_modified_t` the text index holds, as an ISO 8601 time. Bounded by
+   * `TEXT_INDEX_PROBE_TIMEOUT_MS` across the request and its body, and by no caller's signal, since
+   * every text search waiting on it shares it. Throws on any failure: an HTTP error, a body that is
+   * not JSON, the timeout, an answer flagged `timed_out`, no hit, or a `last_modified_t` that is
+   * not a number.
+   */
+  private async readTextIndexDate(ctx: Context): Promise<string> {
+    const response = await fetchWithTimeout(
+      `${TEXT_SEARCH_BASE_URL}/search`,
+      TEXT_INDEX_PROBE_TIMEOUT_MS,
+      withExtra(ctx, { upstreamOperation: 'OFF:textIndexDate' }),
+      {
+        method: 'POST',
+        headers: { ...REQUEST_HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify(TEXT_INDEX_PROBE_BODY),
+      },
+    );
+    const body = await parseJsonBody<unknown>(response, {});
+    const hit =
+      isRecord(body) && body.timed_out !== true && Array.isArray(body.hits)
+        ? body.hits[0]
+        : undefined;
+    const modified = isRecord(hit) ? hit.last_modified_t : undefined;
+    if (typeof modified !== 'number' || !Number.isFinite(modified)) {
+      throw malformedEnvelope('text index date read', 'a hit with a numeric last_modified_t', {});
+    }
+    return new Date(modified * 1000).toISOString();
   }
 
   /**
@@ -1876,7 +2083,11 @@ export class OpenFoodFactsService {
    * `*_tags` fields are exact-match keywords, so the caller hands in canonical values (the tool runs
    * each through the taxonomy service's canonicalizer first). A grade stays unquoted unless it
    * carries punctuation (`a-plus`), and several grades of one input form an `(a OR b)` group, since
-   * a product carries one grade (live: `nutriscore_grade:(a OR b)` counts `a` and `b` summed).
+   * a product carries one grade (live: `nutriscore_grade:(a OR b)` counts `a` and `b` summed). The
+   * several IDs one tag value can be stored under (`TagValue`) form a quoted group the same way, in
+   * every tag field, and each member of a list that must all apply is its own clause (live
+   * 2026-11-24: `brands_tags:("όλυμποσ" OR "όλυμπος")` counts the 29 that `"όλυμπος"` alone counts
+   * and `"όλυμποσ"` adds none).
    *
    * The deployed backend (search-a-licious v1.4.0) joins top-level bare words into one relevance
    * match that ORs them, so on their own they count products matching any word. Each required
@@ -1902,29 +2113,33 @@ export class OpenFoodFactsService {
    */
   private buildTextSearchQuery(params: SearchParams): string {
     const clauses: string[] = [];
-    if (params.categories_tag) clauses.push(`categories_tags:"${params.categories_tag}"`);
-    if (params.brands_tag) clauses.push(`brands_tags:"${params.brands_tag}"`);
-    for (const label of [params.labels_tag ?? []].flat()) clauses.push(`labels_tags:"${label}"`);
-    if (params.allergens_tag) clauses.push(`allergens_tags:"${params.allergens_tag}"`);
-    if (params.traces_tag) clauses.push(`traces_tags:"${params.traces_tag}"`);
-    if (params.ingredients_analysis_tag) {
-      clauses.push(`ingredients_analysis_tags:"${params.ingredients_analysis_tag}"`);
-    }
-    for (const ingredient of [params.ingredients_tag ?? []].flat()) {
-      clauses.push(`ingredients_tags:"${ingredient}"`);
-    }
-    /** One grade input's clause: a lone grade, or an OR group of several. */
-    const gradeClause = (field: string, value: string | string[] | undefined) => {
-      const terms = [value ?? []]
-        .flat()
-        .map((grade) => (/^[a-z0-9]+$/.test(grade) ? grade : `"${grade}"`));
+    /** Adds `field:term`, or `field:(a OR b)` for several terms any of which matches; none adds nothing. */
+    const addClause = (field: string, terms: readonly string[]) => {
       if (terms.length === 0) return;
       clauses.push(`${field}:${terms.length === 1 ? terms[0] : `(${terms.join(' OR ')})`}`);
     };
-    gradeClause('nutriscore_grade', params.nutrition_grade);
-    gradeClause('nova_group', params.nova_group);
-    gradeClause('ecoscore_grade', params.ecoscore_grade);
-    if (params.countries_tag) clauses.push(`countries_tags:"${params.countries_tag}"`);
+    /** One tag value's IDs, each quoted, an empty one left out. */
+    const tagTerms = (value: TagValue | undefined) =>
+      [value ?? []]
+        .flat()
+        .filter(Boolean)
+        .map((id) => `"${id}"`);
+    /** One grade input's grades, bare unless punctuated (`a-plus`). */
+    const gradeTerms = (value: string | string[] | undefined) =>
+      [value ?? []].flat().map((grade) => (/^[a-z0-9]+$/.test(grade) ? grade : `"${grade}"`));
+    addClause('categories_tags', tagTerms(params.categories_tag));
+    addClause('brands_tags', tagTerms(params.brands_tag));
+    for (const label of [params.labels_tag ?? []].flat()) addClause('labels_tags', tagTerms(label));
+    addClause('allergens_tags', tagTerms(params.allergens_tag));
+    addClause('traces_tags', tagTerms(params.traces_tag));
+    addClause('ingredients_analysis_tags', tagTerms(params.ingredients_analysis_tag));
+    for (const ingredient of [params.ingredients_tag ?? []].flat()) {
+      addClause('ingredients_tags', tagTerms(ingredient));
+    }
+    addClause('nutriscore_grade', gradeTerms(params.nutrition_grade));
+    addClause('nova_group', gradeTerms(params.nova_group));
+    addClause('ecoscore_grade', gradeTerms(params.ecoscore_grade));
+    addClause('countries_tags', tagTerms(params.countries_tag));
     for (const allergen of params.exclude_allergens ?? []) {
       clauses.push(`-allergens_tags:"${allergen}"`);
     }
@@ -1941,7 +2156,8 @@ export class OpenFoodFactsService {
    * Build the `/api/v2/search` URL. Product Opener reads a `*_tags` value as a comma-separated AND
    * list in which a `-` prefix negates, and a `|`-separated one as any of its values
    * (`add_params_to_query` in `lib/ProductOpener/Display.pm`), so several labels, an allergen or
-   * trace inclusion with its exclusions, and several grades each travel as one parameter (live:
+   * trace inclusion with its exclusions, several grades, and a tag value's several IDs each travel
+   * as one parameter (live:
    * `allergens_tags=en:nuts,-en:milk` narrows `en:nuts` to the products without milk). A parameter
    * is set only when a value for it is, so a request without the newer filters is the one this path
    * always sent.
@@ -1951,16 +2167,18 @@ export class OpenFoodFactsService {
     /** One `*_tags` value: the inclusions, then each exclusion negated. */
     const tagList = (include: (string | undefined)[], exclude: string[] = []) =>
       [...include.filter(Boolean), ...exclude.map((value) => `-${value}`)].join(',');
+    /** One `*_tags` value matching any of several: a tag value's IDs, a grade input's grades. */
+    const anyOf = (value: TagValue | undefined) => [value ?? []].flat().join('|');
     const setTags = (param: string, value: string) => {
       if (value) url.searchParams.set(param, value);
     };
 
     url.searchParams.set('fields', SEARCH_FIELDS.join(','));
-    if (params.categories_tag) url.searchParams.set('categories_tags', params.categories_tag);
-    if (params.brands_tag) url.searchParams.set('brands_tags', params.brands_tag);
-    setTags('labels_tags', tagList([params.labels_tag ?? []].flat()));
-    setTags('allergens_tags', tagList([params.allergens_tag], params.exclude_allergens));
-    setTags('traces_tags', tagList([params.traces_tag], params.exclude_traces));
+    setTags('categories_tags', anyOf(params.categories_tag));
+    setTags('brands_tags', anyOf(params.brands_tag));
+    setTags('labels_tags', tagList([params.labels_tag ?? []].flat().map(anyOf)));
+    setTags('allergens_tags', tagList([anyOf(params.allergens_tag)], params.exclude_allergens));
+    setTags('traces_tags', tagList([anyOf(params.traces_tag)], params.exclude_traces));
     if (params.ingredients_analysis_tag) {
       url.searchParams.set('ingredients_analysis_tags', params.ingredients_analysis_tag);
     }
@@ -1971,11 +2189,10 @@ export class OpenFoodFactsService {
     // Several grades travel as one `|` list, which Product Opener reads as any of them (live:
     // `nutrition_grades_tags=a|b` counts the `a` and `b` matches summed). Green-Score filters on
     // environmental_score_tags, the field Product Opener computes; ecoscore_tags is a transition copy.
-    const anyOf = (value: string | string[] | undefined) => [value ?? []].flat().join('|');
     setTags('nutrition_grades_tags', anyOf(params.nutrition_grade));
     setTags('nova_groups_tags', anyOf(params.nova_group));
     setTags('environmental_score_tags', anyOf(params.ecoscore_grade));
-    if (params.countries_tag) url.searchParams.set('countries_tags', params.countries_tag);
+    setTags('countries_tags', anyOf(params.countries_tag));
     if (params.sort_by) url.searchParams.set('sort_by', params.sort_by);
     url.searchParams.set('page', String(params.page ?? 1));
     url.searchParams.set('page_size', String(params.page_size ?? 20));

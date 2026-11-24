@@ -2,8 +2,8 @@
   "schema": "le1000",
   "shape": "per_100ml",
   "code": "0008295661012",
-  "capturedAt": "2026-11-08T17:02:06.528Z",
-  "request": "/api/v2/product/0008295661012.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:49:21.000Z",
+  "request": "/api/v2/product/0008295661012.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0008295661012",
@@ -1103,6 +1103,7 @@
       "code": "0008295661012",
       "completeness": 0.675,
       "countries_tags": ["en:united-states", "en:world"],
+      "created_t": 1489071226,
       "data_quality_tags": [
         "en:no-packaging-data",
         "en:ingredients-percent-analysis-ok",
@@ -1117,7 +1118,9 @@
         "en:energy-value-in-kcal-does-not-match-value-computed-from-other-nutrients"
       ],
       "ecoscore_grade": "a",
+      "ecoscore_score": 78,
       "ecoscore_tags": ["a"],
+      "image_nutrition_url": "https://images.openfoodfacts.org/images/products/000/829/566/1012/nutrition_en.7.400.jpg",
       "image_url": "https://images.openfoodfacts.org/images/products/000/829/566/1012/front_en.5.400.jpg",
       "ingredients": [
         {
@@ -1154,15 +1157,12 @@
       ],
       "ingredients_analysis_tags": ["en:palm-oil-free", "en:vegan", "en:vegetarian"],
       "ingredients_text": "Wine vinegar, concentrated grape must, caramel.",
+      "ingredients_text_languages": { "en": "Wine vinegar, concentrated grape must, caramel." },
       "labels_tags": ["en:no-gmos", "en:non-gmo-project"],
+      "lang": "en",
       "last_modified_t": 1718833836,
       "nova_group": 2,
-      "nutrient_levels": {
-        "fat": "low",
-        "salt": "low",
-        "saturated-fat": "low",
-        "sugars": "high"
-      },
+      "nutrient_levels": { "fat": "low", "salt": "low", "saturated-fat": "low", "sugars": "high" },
       "nutriments": {
         "calcium": 0,
         "calcium_100g": 0,

@@ -2,8 +2,8 @@
   "schema": "1004",
   "shape": "per_serving",
   "code": "0009300000482",
-  "capturedAt": "2026-11-08T17:01:40.962Z",
-  "request": "/api/v2/product/0009300000482.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:48:14.000Z",
+  "request": "/api/v2/product/0009300000482.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0009300000482",
@@ -1043,6 +1043,7 @@
       "code": "0009300000482",
       "completeness": 0.6625,
       "countries_tags": ["en:united-states"],
+      "created_t": 1489061053,
       "data_quality_tags": [
         "en:no-packaging-data",
         "en:ingredients-percent-analysis-ok",
@@ -1190,13 +1191,13 @@
         "en:vegetarian-status-unknown"
       ],
       "ingredients_text": "CUCUMBERS, HIGH FRUCTOSE CORN SYRUP, VINEGAR, WATER, SALT, CALCIUM CHLORIDE, ALUM, 0.1% SODIUM BENZOATE (PRESERVATIVE), NATURAL FLAVORS, POLYSORBATE 80, AND YELLOW 5.",
+      "ingredients_text_languages": {
+        "en": "CUCUMBERS, HIGH FRUCTOSE CORN SYRUP, VINEGAR, WATER, SALT, CALCIUM CHLORIDE, ALUM, 0.1% SODIUM BENZOATE (PRESERVATIVE), NATURAL FLAVORS, POLYSORBATE 80, AND YELLOW 5."
+      },
+      "lang": "en",
       "last_modified_t": 1759711595,
       "nova_group": 4,
-      "nutrient_levels": {
-        "fat": "low",
-        "salt": "high",
-        "sugars": "high"
-      },
+      "nutrient_levels": { "fat": "low", "salt": "high", "sugars": "high" },
       "nutriments": {
         "added-sugars": 32.1428571428571,
         "added-sugars_100g": 32.1428571428571,
@@ -1250,6 +1251,7 @@
         "sugars_value": 32.1428571428571
       },
       "nutriscore_grade": "d",
+      "nutriscore_score": 16,
       "nutrition_data": "on",
       "nutrition_data_per": "100g",
       "nutrition_data_prepared_per": "100g",

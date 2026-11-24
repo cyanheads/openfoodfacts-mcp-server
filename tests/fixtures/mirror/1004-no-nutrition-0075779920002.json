@@ -2,8 +2,8 @@
   "schema": "1004",
   "shape": "no_nutrition",
   "code": "0075779920002",
-  "capturedAt": "2026-11-08T17:01:33.663Z",
-  "request": "/api/v2/product/0075779920002.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:47:55.000Z",
+  "request": "/api/v2/product/0075779920002.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0075779920002",
@@ -1127,6 +1127,7 @@
       "code": "0075779920002",
       "completeness": 0.8875,
       "countries_tags": ["en:united-states", "en:world"],
+      "created_t": 1489061942,
       "data_quality_tags": [
         "en:photo-and-data-to-be-checked-by-an-experienced-contributor",
         "en:ingredients-en-photo-to-be-selected",
@@ -1156,7 +1157,10 @@
         "en:environmental-score-production-system-no-label"
       ],
       "ecoscore_grade": "c",
+      "ecoscore_score": 56,
       "generic_name": "Brown SUGAR,",
+      "image_ingredients_url": "https://images.openfoodfacts.org/images/products/007/577/992/0002/ingredients_en.5.400.jpg",
+      "image_nutrition_url": "https://images.openfoodfacts.org/images/products/007/577/992/0002/nutrition_en.7.400.jpg",
       "image_url": "https://images.openfoodfacts.org/images/products/007/577/992/0002/front_en.16.400.jpg",
       "ingredients": [
         {
@@ -1170,6 +1174,7 @@
       ],
       "ingredients_analysis_tags": ["en:palm-oil-content-unknown", "en:vegan", "en:vegetarian"],
       "ingredients_text": "Demerara cane sugar.",
+      "ingredients_text_languages": { "en": "Demerara cane sugar." },
       "labels_tags": [
         "en:vegetarian",
         "en:no-gmos",
@@ -1177,6 +1182,7 @@
         "en:non-gmo-project",
         "en:vegan-action"
       ],
+      "lang": "en",
       "last_modified_t": 1763929339,
       "no_nutrition_data": "on",
       "nutrient_levels": {},

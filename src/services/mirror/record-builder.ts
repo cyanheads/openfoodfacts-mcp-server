@@ -5,10 +5,13 @@
  * `GET /api/v2/product/{code}` read returns for the fields this server requests.
  *
  * A v2 read is not the stored document. Product Opener (openfoodfacts-server bd90d81) upgrades the
- * record to schema 1004 (`retrieve_product` → `convert_product_schema`), builds `image_url`
- * (`add_images_urls_to_product`), copies the requested fields (`customize_response_for_product`),
- * and downgrades the copy to schema 998 (API v2). Each step this module ports names its upstream
- * sub; the nutrients and units taxonomies it needs are carried as tables. Two steps consult larger
+ * record to schema 1004 (`retrieve_product` → `convert_product_schema`), builds the selected-image
+ * URLs (`add_images_urls_to_product`), copies the requested fields
+ * (`customize_response_for_product`, which localizes the Green-Score and builds
+ * `ingredients_text_languages`), and downgrades the copy to schema 998 (API v2). Each step this module ports names its upstream
+ * sub; the nutrients and units taxonomies it needs are carried as tables, the serving-size parse
+ * and the units table as of d53c21be, which reads a mass or volume before a household measure. Two
+ * steps consult larger
  * taxonomies an export line does not carry and are approximated from the stored document: the tag
  * regeneration a pre-1004 record gets (`convert_schema_1003_to_1004_refactor_tags`, which
  * re-expands `*_hierarchy` with the current taxonomy's parents and display names) and synonym
@@ -33,15 +36,23 @@ import {
 import { BARCODE_PATTERN } from '@/services/openfoodfacts/types.js';
 
 /** Bumped whenever the projection or tag set changes; the store re-ingests every row stamped with an older version. */
-export const MIRROR_RECORD_VERSION = 2;
+export const MIRROR_RECORD_VERSION = 3;
 
 /**
  * The record version that added each doc field a version-1 row lacks: 2 added `generic_name` and
- * `nutrient_levels`. A `Map`, since the fields it is asked about come from a read's request.
+ * `nutrient_levels`; 3 added `lang`, `ingredients_text_languages`, `nutriscore_score`,
+ * `ecoscore_score`, `image_ingredients_url`, and `image_nutrition_url`. A `Map`, since the fields
+ * it is asked about come from a read's request.
  */
 const FIELD_SINCE: ReadonlyMap<string, number> = new Map([
   ['generic_name', 2],
   ['nutrient_levels', 2],
+  ['lang', 3],
+  ['ingredients_text_languages', 3],
+  ['nutriscore_score', 3],
+  ['ecoscore_score', 3],
+  ['image_ingredients_url', 3],
+  ['image_nutrition_url', 3],
 ]);
 
 /**
@@ -215,38 +226,64 @@ function splitCode(code: string): string {
   return `${padded.slice(0, 3)}/${padded.slice(3, 6)}/${padded.slice(6, 9)}/${padded.slice(9)}`;
 }
 
+/** The selected-image types the tools read a URL of: `image_url` is the front one's. */
+type SelectedImageType = 'front' | 'ingredients' | 'nutrition';
+
 /**
- * The front image URL (`add_images_urls_to_product` → `get_image_in_best_language` →
+ * A selected image's URL (`add_images_urls_to_product` → `get_image_in_best_language` →
  * `get_image_url`, display size 400). Schema ≤1001 records keep selected images as top-level
- * `front_<lc>` keys, which `convert_schema_1001_to_1002_refactor_images_object` moves under
+ * `<type>_<lc>` keys, which `convert_schema_1001_to_1002_refactor_images_object` moves under
  * `images.selected`. The language is the request's, the product's, English, then the first in
  * alphabetical order; a selected image without a `rev` yields no URL rather than another language.
  */
-function frontImageUrl(p: Raw, from: number, lc: string, code: string): string | undefined {
+function selectedImageUrl(
+  p: Raw,
+  from: number,
+  lc: string,
+  code: string,
+  type: SelectedImageType,
+): string | undefined {
   const images = p.images;
   if (!isRecord(images)) return;
-  let front: Raw | undefined;
+  let byLanguage: Raw | undefined;
   if (from <= 1001) {
     for (const [key, image] of Object.entries(images)) {
       const match = /^(\w+)_(\w\w)$/.exec(key);
-      if (match?.[1] === 'front' && match[2]) {
-        front ??= {};
-        front[match[2]] = image;
+      if (match?.[1] === type && match[2]) {
+        byLanguage ??= {};
+        byLanguage[match[2]] = image;
       }
     }
-  } else if (isRecord(images.selected) && isRecord(images.selected.front)) {
-    front = images.selected.front;
+  } else if (isRecord(images.selected) && isRecord(images.selected[type])) {
+    byLanguage = images.selected[type];
   }
-  if (!front) return;
+  if (!byLanguage) return;
+  const selected = byLanguage;
   let imageLc = [TARGET_LC, lc, 'en'].find(
-    (language) => Object.hasOwn(front, language) && defined(front[language]),
+    (language) => Object.hasOwn(selected, language) && defined(selected[language]),
   );
-  imageLc ??= Object.keys(front).sort()[0];
+  imageLc ??= Object.keys(selected).sort()[0];
   if (imageLc === undefined) return;
-  const image = front[imageLc];
+  const image = selected[imageLc];
   const rev = isRecord(image) ? image.rev : undefined;
   if (!defined(rev)) return;
-  return `https://images.openfoodfacts.org/images/products/${splitCode(code)}/front_${imageLc}.${String(rev)}.400.jpg`;
+  return `https://images.openfoodfacts.org/images/products/${splitCode(code)}/${type}_${imageLc}.${String(rev)}.400.jpg`;
+}
+
+/**
+ * A `<field>_languages` read (`customize_response_for_product`): `<field>_<lc>` for each language
+ * code `languages_codes` lists, wherever it is defined, even empty; `{}` when the record lists no
+ * languages. Keyed by stored language codes, so built on a null-prototype object.
+ */
+function languagesMap(p: Raw, field: string): Raw {
+  const out: Raw = Object.create(null);
+  const codes = p.languages_codes;
+  if (!isRecord(codes)) return out;
+  for (const language of Object.keys(codes)) {
+    const value = p[`${field}_${language}`];
+    if (defined(value)) out[language] = value;
+  }
+  return out;
 }
 
 /** Display name of a brand tag with no taxonomy entry: the text after its `xx:` (or request-language) prefix. */
@@ -304,18 +341,26 @@ function v2Tags(p: Raw, field: string, from: number): unknown {
   return Array.isArray(hierarchy) && hierarchy.length > 0 ? hierarchy : p[field];
 }
 
-/** `environmental_score_grade` after the read's upgrade and its localization to the request country. */
-function v2EcoscoreGrade(p: Raw, from: number): unknown {
+/**
+ * `environmental_score_grade` and `environmental_score_score` after the read's upgrade and their
+ * localization to the request country: the `ecoscore_grade` and `ecoscore_score` a v2 read returns.
+ * The export stores France's score (`01723380`: 46) where a world read localizes to 35.
+ */
+function v2Ecoscore(p: Raw, from: number): { grade: unknown; score: unknown } {
   // convert_schema_999_to_1000_rename_ecoscore_fields_to_environmental_score: environmental wins.
-  const data =
-    from < 1000 ? (p.environmental_score_data ?? p.ecoscore_data) : p.environmental_score_data;
-  const grade =
-    from < 1000 ? (p.environmental_score_grade ?? p.ecoscore_grade) : p.environmental_score_grade;
+  const field = (subfield: 'data' | 'grade' | 'score') =>
+    from < 1000
+      ? (p[`environmental_score_${subfield}`] ?? p[`ecoscore_${subfield}`])
+      : p[`environmental_score_${subfield}`];
+  const data = field('data');
   // localize_environmental_score: world.openfoodfacts.org requests carry cc "world".
   if (isRecord(data) && isRecord(data.scores) && defined(data.scores.world)) {
-    return isRecord(data.grades) ? data.grades.world : undefined;
+    return {
+      grade: isRecord(data.grades) ? data.grades.world : undefined,
+      score: data.scores.world,
+    };
   }
-  return grade;
+  return { grade: field('grade'), score: field('score') };
 }
 
 /** Ingredient keys the tools read. */
@@ -593,12 +638,19 @@ function v2Nutriments(
 /* --- Serving size ------------------------------------------------------------------------ */
 
 /**
- * The units taxonomy (`taxonomies/units.txt` at openfoodfacts-server bd90d81) as `init_units_names`
+ * The units taxonomy (`taxonomies/units.txt` at openfoodfacts-server d53c21be) as `init_units_names`
  * in `lib/ProductOpener/Units.pm` reads it: per entry, its `standard_unit:en`, its
- * `conversion_factor:en`, and its names (the `symbol:en` and every synonym in every language,
- * lowercased, `|`-separated). No name belongs to two entries.
+ * `conversion_factor:en`, its names (the `symbol:en` and every synonym in every language,
+ * lowercased, `|`-separated), and `household` for a `household_measure:en: yes` entry (spoons,
+ * glasses, cups, pinches). Entries whose standard unit is `count` (packet, bunch, handful) are
+ * skipped, as `init_units_names` skips them. No name belongs to two entries.
  */
-const UNIT_ENTRIES: readonly (readonly [standard: string, factor: number, names: string])[] = [
+const UNIT_ENTRIES: readonly (readonly [
+  standard: string,
+  factor: number,
+  names: string,
+  household?: 'household',
+])[] = [
   [
     'g',
     1,
@@ -650,11 +702,32 @@ const UNIT_ENTRIES: readonly (readonly [standard: string, factor: number, names:
     1,
     'ml|mls|milliliter|milliliters|ملليلتر|ملليلترات|мл|милилитър|милилитри|милилитра|মিলিলিটার|mililitr|mililitry|millilitrau|millilitre|χιλιοστόλιτρο|χιλιοστόλιτρα|millilitro|millilitros|milliliiter|milliliitrit|میلی لیتر|میلی لیترها|millilitra|millilitraa|millilitres|מיליליטר|מיליליטרים|मिलीलीटर|mililitra|mililitri|millilítill|millilitri|ミリリットル|მილილიტრი|მილილიტრები|миллилитр|миллилитрлер|មិល្លីឡីត្រ|밀리리터|millilitras|millilitrai|mililitrs|миллилитар|миллилитри|മില്ലിലീറ്റർ|മില്ലിലീറ്റർകൾ|မီလီလီတာ|မီလီလီတာများ|मिलिलिटर|मिलिलिटरहरू|mililitrów|mililitru|миллилитры|милилитар|millilita|மில்லிலிட்டர்|மில்லிலிட்டர்கள்|మిల్లీలిటర్|మిల్లీలిటర్లు|มิลลิลิตร์|mililitre|mililitreler|мілілітр|мілілітри|ملی لیٹر|ملی لیٹرز|millilit|毫升',
   ],
-  ['ml', 5, 'metric teaspoon|cucchiaino metrico'],
-  ['ml', 240, 'cup|cups|kop|kopper|taza|tazas|tasse|tasses|tazza|tazze|kopp|koppar'],
-  ['g', 10, 'bit|beetje'],
-  ['ml', 1, 'pinch|pinches|drys|pincée|pincées|kryddmått|krm'],
-  ['ml', 30, 'splash|dash|scheutje'],
+  ['ml', 5, 'metric teaspoon|cucchiaino metrico', 'household'],
+  [
+    'ml',
+    15,
+    'tablespoon|tablespoons|tbsp|tbsps|cuillère à soupe|cuillères à soupe|cuiller à soupe|cuillers à soupe|cuillerée à soupe|cuillerées à soupe|cuillère à table|cuillères à table|c. à s.|c. à s|c.à.s.|c.à.s|c.s.|c.s|càs|c. à soupe|c. soupe|c. à table',
+    'household',
+  ],
+  [
+    'ml',
+    10,
+    'dessert spoon|dessert spoons|dessertspoon|dessertspoons|cuillère à dessert|cuillères à dessert|cuiller à dessert|cuillers à dessert|cuillerée à dessert|cuillerées à dessert|c. à dessert',
+    'household',
+  ],
+  [
+    'ml',
+    5,
+    'teaspoon|teaspoons|tsp|tsps|cuillère à café|cuillères à café|cuiller à café|cuillers à café|cuillerée à café|cuillerées à café|cuillère à thé|cuillères à thé|c. à c.|c. à c|c.à.c.|c.à.c|c.c.|c.c|càc|c. à café|c. café|c. à thé|c. thé',
+    'household',
+  ],
+  ['ml', 200, 'glass|glasses|verre|verres', 'household'],
+  ['ml', 50, 'small glass|small glasses|petit verre|petits verres', 'household'],
+  ['ml', 250, 'large glass|large glasses|grand verre|grands verres', 'household'],
+  ['ml', 240, 'cup|cups|kop|kopper|taza|tazas|tasse|tasses|tazza|tazze|kopp|koppar', 'household'],
+  ['g', 10, 'bit|beetje', 'household'],
+  ['ml', 1, 'pinch|pinches|drys|pincée|pincées|kryddmått|krm', 'household'],
+  ['ml', 30, 'splash|dash|scheutje', 'household'],
   [
     'ml',
     29.5735,
@@ -741,23 +814,53 @@ const UNIT_ENTRIES: readonly (readonly [standard: string, factor: number, names:
   ],
 ];
 
-/** A unit name's entry: the unit it standardizes to and the factor to it. */
-type UnitEntry = { readonly name: string; readonly standard: string; readonly factor: number };
+/** A unit name's entry: the unit it standardizes to, the factor to it, and whether it is a household measure. */
+type UnitEntry = {
+  readonly name: string;
+  readonly standard: string;
+  readonly factor: number;
+  readonly household: boolean;
+};
 
 /** Every unit name, lowercased, to its entry (`%units_names`). */
 const UNIT_NAMES: ReadonlyMap<string, UnitEntry> = new Map(
-  UNIT_ENTRIES.flatMap(([standard, factor, names]) =>
-    names.split('|').map((name) => [name, { name, standard, factor }] as const),
+  UNIT_ENTRIES.flatMap(([standard, factor, names, household]) =>
+    names
+      .split('|')
+      .map(
+        (name) => [name, { name, standard, factor, household: household === 'household' }] as const,
+      ),
   ),
 );
 
-/** The longest unit name, in UTF-16 code units: the regexp alternation tries longer names first. */
-const LONGEST_UNIT_NAME = Math.max(...[...UNIT_NAMES.keys()].map((name) => name.length));
+/**
+ * The unit names one `$units_regexp` alternation matches, with what `unitAt` needs to try them:
+ * the longest name in UTF-16 code units (the alternation tries longer names first) and each name's
+ * first character, a cheap test before the length-by-length lookup.
+ */
+type UnitAlternation = {
+  readonly names: ReadonlyMap<string, UnitEntry>;
+  readonly longest: number;
+  readonly firstCharacters: ReadonlySet<string>;
+};
 
-/** The first character of each unit name, a cheap test before the length-by-length lookup. */
-const UNIT_FIRST_CHARACTERS: ReadonlySet<string> = new Set(
-  [...UNIT_NAMES.keys()].map((name) => name.charAt(0)),
-);
+function unitAlternation(entries: readonly UnitEntry[]): UnitAlternation {
+  return {
+    names: new Map(entries.map((entry) => [entry.name, entry])),
+    longest: Math.max(...entries.map((entry) => entry.name.length)),
+    firstCharacters: new Set(entries.map((entry) => entry.name.charAt(0))),
+  };
+}
+
+/**
+ * The alternations `parse_serving_size` and `parse_quantity_unit` try in turn: every unit but the
+ * household measures (`$units_regexp_without_household_measures`), then every unit, so a mass or
+ * volume wins over a spoon or cup anywhere in the text: `2 tbsp (32 g)` is 32 g.
+ */
+const UNIT_PASSES: readonly UnitAlternation[] = [
+  unitAlternation([...UNIT_NAMES.values()].filter((entry) => !entry.household)),
+  unitAlternation([...UNIT_NAMES.values()]),
+];
 
 /* Perl's Unicode character classes, one character at a time; an index past either end is none of them. */
 const DIGIT = /\p{Nd}/u;
@@ -804,17 +907,18 @@ function numberEnd(text: string, start: number): number | undefined {
 }
 
 /**
- * The unit `$units_regexp` matches at `start` in lowercased `text`: the longest name there for
- * which `accepts` holds where it ends, as the alternation backtracks from longer names to shorter.
+ * The unit `units` matches at `start` in lowercased `text`: the longest name there for which
+ * `accepts` holds where it ends, as the alternation backtracks from longer names to shorter.
  */
 function unitAt(
   text: string,
   start: number,
   accepts: (end: number) => boolean,
+  units: UnitAlternation,
 ): UnitEntry | undefined {
-  if (!UNIT_FIRST_CHARACTERS.has(text.charAt(start))) return;
-  for (let length = Math.min(LONGEST_UNIT_NAME, text.length - start); length > 0; length--) {
-    const entry = UNIT_NAMES.get(text.slice(start, start + length));
+  if (!units.firstCharacters.has(text.charAt(start))) return;
+  for (let length = Math.min(units.longest, text.length - start); length > 0; length--) {
+    const entry = units.names.get(text.slice(start, start + length));
     if (entry && accepts(start + length)) return entry;
   }
   return undefined;
@@ -826,38 +930,45 @@ function numberAndUnitAt(
   start: number,
   space: (text: string, at: number) => boolean,
   accepts: (end: number) => boolean,
+  units: UnitAlternation,
 ): { quantity: string; unit: UnitEntry } | undefined {
   const end = numberEnd(text, start);
   if (end === undefined) return;
   for (const unitStart of afterOptionalSpace(text, end, space)) {
-    const unit = unitAt(text, unitStart, accepts);
+    const unit = unitAt(text, unitStart, accepts, units);
     if (unit) return { quantity: text.slice(start, end), unit };
   }
   return undefined;
 }
 
 /**
- * `normalize_serving_size`'s match, `/^(.*[ (])?(NUMBER)( )?(UNIT)\b/i`: the last number and unit
- * on the first line that follow a space or an opening parenthesis, else the ones at its start.
+ * `parse_serving_size`'s match, `/^(.*[ (])?(NUMBER)( )?(UNIT)\b/i` under each of `UNIT_PASSES`
+ * in turn: the last number and unit on the first line that follow a space or an opening
+ * parenthesis, else the ones at its start.
  */
 function servingNumberAndUnit(text: string): { quantity: string; unit: UnitEntry } | undefined {
   const accepts = (end: number) => isBoundary(text, end);
   const literalSpace = (value: string, at: number) => value.charAt(at) === ' ';
   const lineBreak = text.indexOf('\n');
-  for (let at = (lineBreak === -1 ? text.length : lineBreak) - 1; at >= 0; at--) {
-    const character = text.charAt(at);
-    if (character !== ' ' && character !== '(') continue;
-    const match = numberAndUnitAt(text, at + 1, literalSpace, accepts);
+  for (const units of UNIT_PASSES) {
+    for (let at = (lineBreak === -1 ? text.length : lineBreak) - 1; at >= 0; at--) {
+      const character = text.charAt(at);
+      if (character !== ' ' && character !== '(') continue;
+      const match = numberAndUnitAt(text, at + 1, literalSpace, accepts, units);
+      if (match) return match;
+    }
+    const match = numberAndUnitAt(text, 0, literalSpace, accepts, units);
     if (match) return match;
   }
-  return numberAndUnitAt(text, 0, literalSpace, accepts);
+  return undefined;
 }
 
 /** The separators of `parse_quantity_unit`'s multiplier form, in alternation order. */
 const MULTIPLIER_SEPARATORS = [' de ', ' of ', 'x', '*'] as const;
 
 /**
- * The unit `parse_quantity_unit` finds (`lib/ProductOpener/Units.pm`): the multiplier form,
+ * The unit `parse_quantity_unit` finds (`lib/ProductOpener/Units.pm`), under each of `UNIT_PASSES`
+ * in turn: the multiplier form,
  * `/(\d+)(\s(\p{Letter}| )+)?(\s)?( de | of |x|\*)(\s)?(NUMBER)(\s)?(UNIT)\b/i` (`6 x 33 cl`), at its
  * leftmost match, else `/(NUMBER)(\s)?(UNIT)\s*\b/i` at its leftmost. Linear: an attempt starts
  * only at a digit run's first digit, since one inside the run ends where the run's own does, and
@@ -865,41 +976,43 @@ const MULTIPLIER_SEPARATORS = [' de ', ' of ', 'x', '*'] as const;
  */
 function quantityUnit(text: string): UnitEntry | undefined {
   const atBoundary = (end: number) => isBoundary(text, end);
-  for (let start = 0; start < text.length; start++) {
-    if (!startsDigitRun(text, start)) continue;
-    const digitsEnd = digitRunEnd(text, start);
-    // (\s(\p{Letter}| )+)? is greedy: its longest extent first, then each shorter one, then none.
-    const groupEnds: number[] = [];
-    if (isSpace(text, digitsEnd)) {
-      let end = digitsEnd + 1;
-      while (end < text.length && (LETTER.test(text.charAt(end)) || text.charAt(end) === ' '))
-        end++;
-      for (let groupEnd = end; groupEnd >= digitsEnd + 2; groupEnd--) groupEnds.push(groupEnd);
-    }
-    groupEnds.push(digitsEnd);
-    for (const groupEnd of groupEnds) {
-      for (const separatorStart of afterOptionalSpace(text, groupEnd)) {
-        for (const separator of MULTIPLIER_SEPARATORS) {
-          if (!text.startsWith(separator, separatorStart)) continue;
-          const after = separatorStart + separator.length;
-          for (const numberStart of afterOptionalSpace(text, after)) {
-            const match = numberAndUnitAt(text, numberStart, isSpace, atBoundary);
-            if (match) return match.unit;
-          }
-        }
-      }
-    }
-  }
   const spacesThenBoundary = (end: number) => {
     let spaces = end;
     while (isSpace(text, spaces)) spaces++;
     for (let at = spaces; at >= end; at--) if (isBoundary(text, at)) return true;
     return false;
   };
-  for (let start = 0; start < text.length; start++) {
-    if (isDigit(text, start) && !startsDigitRun(text, start)) continue;
-    const match = numberAndUnitAt(text, start, isSpace, spacesThenBoundary);
-    if (match) return match.unit;
+  for (const units of UNIT_PASSES) {
+    for (let start = 0; start < text.length; start++) {
+      if (!startsDigitRun(text, start)) continue;
+      const digitsEnd = digitRunEnd(text, start);
+      // (\s(\p{Letter}| )+)? is greedy: its longest extent first, then each shorter one, then none.
+      const groupEnds: number[] = [];
+      if (isSpace(text, digitsEnd)) {
+        let end = digitsEnd + 1;
+        while (end < text.length && (LETTER.test(text.charAt(end)) || text.charAt(end) === ' '))
+          end++;
+        for (let groupEnd = end; groupEnd >= digitsEnd + 2; groupEnd--) groupEnds.push(groupEnd);
+      }
+      groupEnds.push(digitsEnd);
+      for (const groupEnd of groupEnds) {
+        for (const separatorStart of afterOptionalSpace(text, groupEnd)) {
+          for (const separator of MULTIPLIER_SEPARATORS) {
+            if (!text.startsWith(separator, separatorStart)) continue;
+            const after = separatorStart + separator.length;
+            for (const numberStart of afterOptionalSpace(text, after)) {
+              const match = numberAndUnitAt(text, numberStart, isSpace, atBoundary, units);
+              if (match) return match.unit;
+            }
+          }
+        }
+      }
+    }
+    for (let start = 0; start < text.length; start++) {
+      if (isDigit(text, start) && !startsDigitRun(text, start)) continue;
+      const match = numberAndUnitAt(text, start, isSpace, spacesThenBoundary, units);
+      if (match) return match.unit;
+    }
   }
   return undefined;
 }
@@ -925,9 +1038,10 @@ function convertStringToNumber(quantity: string): number {
  * `serving_quantity` and `serving_quantity_unit` as the downgrade to API v2 rewrites them from a
  * non-empty `serving_size` (`normalize_product_quantity_and_serving_size`). The quantity is the
  * serving in its unit's standard unit (`normalize_serving_size` → `unit_to_g`, a `kcal` serving
- * rounded to whole kJ), `null` when no number and unit parse. The unit is the standard unit of the
- * first number and unit `parse_quantity_unit` finds, `undefined` when it finds none, which keeps
- * the stored one: `1/2 cup (60 g)` stored as `g` reads back as `ml`, from the cup.
+ * rounded to whole kJ), `null` when no number and unit parse. The unit is that same serving
+ * unit's standard unit, so `1/2 cup (60 g)` reads back as `g`; when no serving parses, it is the
+ * standard unit of the first number and unit `parse_quantity_unit` finds, and `undefined` when it
+ * finds none either, which keeps the stored one.
  */
 function normalizedServing(servingSize: string): {
   quantity: number | null;
@@ -937,7 +1051,7 @@ function normalizedServing(servingSize: string): {
   const match = servingNumberAndUnit(text);
   return {
     quantity: match ? unitToG(convertStringToNumber(match.quantity), match.unit.name) : null,
-    unit: quantityUnit(text)?.standard,
+    unit: match?.unit.standard ?? quantityUnit(text)?.standard,
   };
 }
 
@@ -1033,7 +1147,9 @@ export function buildMirrorRecord(p: unknown): MirrorRecord | null {
   set('generic_name', languageField(p, 'generic_name', lc));
   set('brands', v2Brands(p, from));
   set('quantity', p.quantity);
+  set('lang', lc);
   set('ingredients_text', languageField(p, 'ingredients_text', lc));
+  set('ingredients_text_languages', languagesMap(p, 'ingredients_text'));
   set(
     'ingredients',
     Array.isArray(p.ingredients) ? projectIngredients(p.ingredients) : p.ingredients,
@@ -1047,8 +1163,11 @@ export function buildMirrorRecord(p: unknown): MirrorRecord | null {
     set(field, v2Tags(p, field, from));
   }
   set('nutriscore_grade', p.nutriscore_grade);
+  set('nutriscore_score', withPerlNumbers(p.nutriscore_score));
   set('nova_group', p.nova_group);
-  set('ecoscore_grade', v2EcoscoreGrade(p, from));
+  const ecoscore = v2Ecoscore(p, from);
+  set('ecoscore_grade', ecoscore.grade);
+  set('ecoscore_score', withPerlNumbers(ecoscore.score));
   // Stored as computed: the v2 read copies it through every schema downgrade unchanged.
   set('nutrient_levels', p.nutrient_levels);
   set('nutriments', nutriments);
@@ -1073,7 +1192,9 @@ export function buildMirrorRecord(p: unknown): MirrorRecord | null {
   ]) {
     set(field, v2Tags(p, field, from));
   }
-  set('image_url', frontImageUrl(p, from, lc, code));
+  set('image_url', selectedImageUrl(p, from, lc, code, 'front'));
+  set('image_ingredients_url', selectedImageUrl(p, from, lc, code, 'ingredients'));
+  set('image_nutrition_url', selectedImageUrl(p, from, lc, code, 'nutrition'));
   set(
     'completeness',
     typeof p.completeness === 'number' ? perlNumber(p.completeness) : p.completeness,

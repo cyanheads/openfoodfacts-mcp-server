@@ -26,7 +26,7 @@ import {
   getOpenFoodFactsService,
   type ProductRead,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import type { RawProduct } from '@/services/openfoodfacts/types.js';
+import { PRODUCT_FIELD_NAMES, type RawProduct } from '@/services/openfoodfacts/types.js';
 import { v2Capture, v35Capture } from '../../../fixtures/as-sold-captures.js';
 import { ACCEPTED_BARCODES, REJECTED_BARCODES } from '../../../fixtures/barcode-cases.js';
 import { PRODUCT_FOUND, PRODUCT_NOT_FOUND_404 } from '../../../fixtures/upstream-envelopes.js';
@@ -133,6 +133,53 @@ const SPAGHETTI = {
     sodium_100g: 0.004,
     starch_100g: 0,
     sugars_100g: 0.5,
+  },
+};
+
+/**
+ * 0076808003888 (Barilla Gluten Free Spaghetti) from the v2 product route: carbohydrates-total and
+ * no carbohydrates, Nutri-Score b on 1 point, Green-Score a on 78.
+ */
+const BARILLA = {
+  product_name: 'Gluten Free Spaghetti',
+  brands: 'Barilla',
+  nutriscore_grade: 'b',
+  nutriscore_score: 1,
+  nova_group: 4,
+  ecoscore_grade: 'a',
+  ecoscore_score: 78,
+  nutriments: {
+    'carbohydrates-total_100g': 77.6027162890769,
+    'energy-kcal_100g': 335.102638521014,
+    fat_100g: 1.76369809747902,
+    fiber_100g: 3.52739619495804,
+    proteins_100g: 7.05479238991608,
+    salt_100g: 0,
+    'saturated-fat_100g': 0,
+    sugars_100g: 0,
+  },
+};
+
+/**
+ * 0857183005007 (Banza Penne) from the v2 product route: carbohydrates holding the US label's total
+ * (fiber 12.5 g) and no carbohydrates-total, Nutri-Score a on -8 points, no Green-Score points.
+ */
+const BANZA = {
+  product_name: 'Banza Penne Made From Chickpeas',
+  brands: 'Banza',
+  nutriscore_grade: 'a',
+  nutriscore_score: -8,
+  nova_group: 4,
+  ecoscore_grade: 'unknown',
+  nutriments: {
+    carbohydrates_100g: 60.7142857142857,
+    'energy-kcal_100g': 339.285714285714,
+    fat_100g: 5.35714285714286,
+    fiber_100g: 12.5,
+    proteins_100g: 19.6428571428571,
+    salt_100g: 0.491071428571427,
+    'saturated-fat_100g': 0,
+    sugars_100g: 1.78571428571429,
   },
 };
 
@@ -385,6 +432,20 @@ describe('off_compare_products', () => {
 
     expect(text).toContain('79%');
     expect(text).toContain('0.7875');
+  });
+
+  it('reads a completeness sent as a numeric string as the score, on both surfaces (#92)', async () => {
+    mockGetProductFields
+      .mockResolvedValueOnce(liveRead({ product_name: 'String score', completeness: '0.65' }))
+      .mockResolvedValueOnce(liveRead({ product_name: 'Number score', completeness: 0.72 }));
+
+    const result = await runToolContract(offCompareProductsTool, {
+      barcodes: ['5053990161669', '7622210100146'],
+    });
+
+    const { products } = result.structuredContent as { products: { completeness?: number }[] };
+    expect(products.map(({ completeness }) => completeness)).toEqual([0.65, 0.72]);
+    expect(contractText(result)).toContain('| 65% (0.65) |');
   });
 
   it('formats result with not_found barcodes listed', () => {
@@ -1596,7 +1657,7 @@ describe('off_compare_products', () => {
       expect(mockGetProductFields).toHaveBeenCalledTimes(2);
     });
 
-    it('prints the Carbohydrates column between Sat. Fat and Sugars (#71)', () => {
+    it('prints Carbohydrates, then Total Carbs incl. Fiber, between Sat. Fat and Sugars (#71, #90)', () => {
       const text = firstText(
         offCompareProductsTool.format!({
           products: [{ barcode: '12345678', found: true, carbohydrates_100g: 75 }],
@@ -1611,6 +1672,7 @@ describe('off_compare_products', () => {
         'Fat (g)',
         'Sat. Fat (g)',
         'Carbohydrates (g)',
+        'Total Carbs incl. Fiber (g)',
         'Sugars (g)',
         'Salt (g)',
         'Protein (g)',
@@ -1673,10 +1735,89 @@ describe('off_compare_products', () => {
       expect(rows[1]?.carbohydrates_100g).toBe(79);
     });
 
-    it('names carbohydrates in the tool description (#71)', () => {
+    it('names both carbohydrates in the tool description (#71, #90)', () => {
       expect(offCompareProductsTool.description).toContain(
-        'saturated fat, carbohydrates, sugars, salt, protein, and fiber',
+        'saturated fat, carbohydrates, total carbohydrates including fiber, sugars, salt, protein, and fiber',
       );
+    });
+
+    // ── #90: carbohydrates-total is its own nutrient and column ─────────────
+
+    it('carries carbohydrates-total in its own field and column, never merged with carbohydrates (#90)', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(BARILLA))
+        .mockResolvedValueOnce(liveRead(BANZA));
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['0076808003888', '0857183005007'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]?.carbohydrates_total_100g).toBe(77.6027162890769);
+      expect(rows[0]).not.toHaveProperty('carbohydrates_100g');
+      expect(rows[1]?.carbohydrates_100g).toBe(60.7142857142857);
+      expect(rows[1]).not.toHaveProperty('carbohydrates_total_100g');
+      const table = tableUnder(contractText(result), TABLE);
+      expect(
+        table?.map((row) => [row['Carbohydrates (g)'], row['Total Carbs incl. Fiber (g)']]),
+      ).toEqual([
+        ['N/A', '77.6027162890769'],
+        ['60.7142857142857', 'N/A'],
+      ]);
+    });
+
+    it('reads a prepared total into prepared.carbohydrates_total_100g alone (#90)', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce(
+          liveRead({
+            product_name: 'Mix',
+            nutriments: { carbohydrates_100g: 10, 'carbohydrates-total_prepared_100g': 12 },
+          }),
+        )
+        .mockResolvedValueOnce(liveRead(LINGUINE));
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['12345678', '7310100605412'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]?.prepared).toEqual({ carbohydrates_total_100g: 12 });
+      expect(rows[0]).not.toHaveProperty('carbohydrates_total_100g');
+      const prepared = tableUnder(
+        contractText(result),
+        '### Nutrition per 100 g / 100 ml, as prepared',
+      );
+      expect(prepared?.[0]?.['Total Carbs incl. Fiber (g)']).toBe('12');
+    });
+
+    it('fills the column from a stored as-sold set holding carbohydrates-total (#90)', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(NESQUIK))
+        .mockResolvedValueOnce(liveRead(SPAGHETTI));
+      mockReadStoredAsSold.mockResolvedValue({
+        status: 'read',
+        nutriments: { ...NESQUIK_STORED.nutriments, 'carbohydrates-total_100g': 70.1 },
+      });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['7613035530799', '8076809545440'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]?.carbohydrates_total_100g).toBe(70.1);
+      expect(rows[0]).not.toHaveProperty('carbohydrates_100g');
+      const table = tableUnder(contractText(result), TABLE);
+      expect(table?.[0]?.['Total Carbs incl. Fiber (g)']).toBe('70.1');
+    });
+
+    it('describes carbohydrates without calling it the total, on both figure sets (#90)', () => {
+      const row = offCompareProductsTool.output.shape.products.element.shape;
+      const prepared = row.prepared.unwrap().shape;
+      for (const figures of [row, prepared]) {
+        expect(figures.carbohydrates_100g.description).not.toMatch(/total carbohydrates/i);
+        expect(figures.carbohydrates_100g.description).toContain('carbohydrates_total_100g');
+        expect(figures.carbohydrates_total_100g.description).toMatch(/including fiber/);
+      }
     });
   });
 
@@ -1759,6 +1900,7 @@ describe('off_compare_products', () => {
           'Fat (g)': '1.9',
           'Sat. Fat (g)': '1.1',
           'Carbohydrates (g)': '7.6',
+          'Total Carbs incl. Fiber (g)': 'N/A',
           'Sugars (g)': '6.3',
           'Salt (g)': '0.12',
           'Protein (g)': '3.8',
@@ -1889,6 +2031,7 @@ describe('off_compare_products', () => {
           'Fat (g)': '1.9',
           'Sat. Fat (g)': 'N/A',
           'Carbohydrates (g)': 'N/A',
+          'Total Carbs incl. Fiber (g)': 'N/A',
           'Sugars (g)': 'N/A',
           'Salt (g)': 'N/A',
           'Protein (g)': 'N/A',
@@ -2081,6 +2224,7 @@ describe('off_compare_products', () => {
         'fat_100g',
         'saturated_fat_100g',
         'carbohydrates_100g',
+        'carbohydrates_total_100g',
         'sugars_100g',
         'salt_100g',
         'proteins_100g',
@@ -2577,6 +2721,169 @@ describe('off_compare_products', () => {
         expect(JSON.stringify(result)).not.toContain('stored_as_sold');
         expect(JSON.stringify(result)).not.toContain('unread');
         expect(sent).toHaveLength(5);
+      });
+    });
+  });
+
+  // ── #93: the points behind the Nutri-Score and Green-Score grades ─────────
+
+  describe('Nutri-Score and Green-Score points (#93)', () => {
+    /** 0708953628134 (Lotus Foods Millet & Brown Rice Ramen) from the v2 product route. */
+    const LOTUS = {
+      product_name: 'Millet & Brown Rice Ramen Noodles',
+      brands: 'Lotus Foods',
+      nutriscore_grade: 'a',
+      nutriscore_score: -3,
+      nova_group: 1,
+      ecoscore_grade: 'unknown',
+    };
+
+    /** The Nutri-Score and Green-Score cells of each Scores row, in row order. */
+    function scoreCells(text: string): string[][] | undefined {
+      return tableUnder(text, '### Scores')?.map((row) => [
+        row['Nutri-Score'] ?? '',
+        row['Green-Score'] ?? '',
+      ]);
+    }
+
+    it('returns the points beside each grade on both surfaces (0857183005007, 0708953628134, 0076808003888)', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce(liveRead(BANZA))
+        .mockResolvedValueOnce(liveRead(LOTUS))
+        .mockResolvedValueOnce(liveRead(BARILLA));
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['0857183005007', '0708953628134', '0076808003888'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows.map((row) => row.nutriscore_score)).toEqual([-8, -3, 1]);
+      expect(rows.map((row) => row.ecoscore_score)).toEqual([undefined, undefined, 78]);
+      expect(rows[0]).not.toHaveProperty('ecoscore_score');
+      expect(rows[1]).not.toHaveProperty('ecoscore_score');
+      expect(scoreCells(contractText(result))).toEqual([
+        ['a (-8)', 'unknown'],
+        ['a (-3)', 'unknown'],
+        ['b (1)', 'a (78)'],
+      ]);
+    });
+
+    it('asks for both points, among fields the local copy holds so a comparison can stay on it', async () => {
+      mockGetProductFields.mockResolvedValue(liveRead(BARILLA));
+
+      await offCompareProductsTool.handler({ barcodes: ['0076808003888', '0857183005007'] }, ctx);
+
+      const fields = String(mockGetProductFields.mock.calls[0]?.[1]).split(',');
+      expect(fields).toEqual(expect.arrayContaining(['nutriscore_score', 'ecoscore_score']));
+      const held: readonly string[] = PRODUCT_FIELD_NAMES;
+      expect(fields.filter((field) => !held.includes(field))).toEqual([]);
+    });
+
+    it('renders a grade alone without points, and points without a grade beside N/A', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [
+            {
+              barcode: '01723380',
+              product_name: 'Turkey breast fillet portions',
+              found: true,
+              nutriscore_grade: 'unknown',
+              ecoscore_grade: 'd',
+              ecoscore_score: 35,
+            },
+            { barcode: '12345678', product_name: 'Points only', found: true, nutriscore_score: 4 },
+          ],
+          succeeded: 2,
+          not_found: [],
+        }),
+      );
+
+      expect(scoreCells(text)).toEqual([
+        ['unknown', 'd (35)'],
+        ['N/A (4)', 'N/A'],
+      ]);
+    });
+
+    it('describes what the points rank and how far they run, on the rows and the tool', () => {
+      const row = offCompareProductsTool.output.shape.products.element.shape;
+      expect(row.nutriscore_score.description).toMatch(/lower is better/i);
+      expect(row.nutriscore_score.description).toContain('beverages');
+      expect(row.nutriscore_score.description).toContain('fats, oils, nuts, and seeds');
+      expect(row.ecoscore_score.description).toMatch(/higher/i);
+      expect(row.ecoscore_score.description).toContain('100');
+      for (const field of [row.nutriscore_score, row.ecoscore_score]) {
+        expect(field.description).toMatch(/never derived from/);
+        expect(field.description).toContain('mirror_fields_unread');
+      }
+      expect(offCompareProductsTool.description).toMatch(/points/);
+    });
+
+    describe('a row the local copy holds from before it stored the points', () => {
+      const UNREAD = {
+        fields: ['nutriscore_score', 'ecoscore_score'],
+        outcome: 'skipped',
+      } as const;
+      const NOTE =
+        "nutriscore_score and ecoscore_score are absent because they were not read, not because Open Food Facts lacks them: this server's local copy of this product predates them, and no live read was sent for them; off_get_product reads them for this barcode.";
+      const FOOTER_UNREAD =
+        '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered; unread fields = not read.*';
+
+      it('serves the row without the points, naming them unread on both surfaces', async () => {
+        const { nutriscore_score: _n, ecoscore_score: _e, ...stored } = BARILLA;
+        mockGetProductFields
+          .mockResolvedValueOnce({ ...mirrorRead(stored), unread: UNREAD })
+          .mockResolvedValueOnce(liveRead(BANZA));
+
+        const result = await runToolContract(offCompareProductsTool, {
+          barcodes: ['0076808003888', '0857183005007'],
+        });
+
+        expect(result.isError).toBeFalsy();
+        const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+        expect(rows[0]).toMatchObject({
+          source: 'off_mirror',
+          nutriscore_grade: 'b',
+          ecoscore_grade: 'a',
+          mirror_fields_unread: NOTE,
+        });
+        expect(rows[0]).not.toHaveProperty('nutriscore_score');
+        expect(rows[0]).not.toHaveProperty('ecoscore_score');
+        expect(rows[1]).not.toHaveProperty('mirror_fields_unread');
+        const text = contractText(result);
+        expect(scoreCells(text)).toEqual([
+          ['b', 'a'],
+          ['a (-8)', 'unknown'],
+        ]);
+        const lines = text.split('\n');
+        const at = lines.indexOf('**Unread fields:**');
+        expect(at).toBeGreaterThan(-1);
+        expect(lines[at - 1]?.startsWith('**Source:**')).toBe(true);
+        expect(lines.slice(at + 1, at + 3)).toEqual([`- 0076808003888: ${NOTE}`, FOOTER_UNREAD]);
+      });
+
+      it('keeps the plain footer and no unread list when no row lacks a field', async () => {
+        mockGetProductFields
+          .mockResolvedValueOnce(mirrorRead(BARILLA))
+          .mockResolvedValueOnce(liveRead(BANZA));
+
+        const result = await runToolContract(offCompareProductsTool, {
+          barcodes: ['0076808003888', '0857183005007'],
+        });
+
+        const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+        for (const row of rows) expect(row).not.toHaveProperty('mirror_fields_unread');
+        const text = contractText(result);
+        expect(text).not.toContain('**Unread fields:**');
+        expect(text).toContain(
+          '*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A" = not yet entered.*',
+        );
+      });
+
+      it('describes mirror_fields_unread in off_get_product’s terms', () => {
+        const row = offCompareProductsTool.output.shape.products.element.shape;
+        expect(row.mirror_fields_unread.description).toContain('source is "off_mirror"');
+        expect(row.mirror_fields_unread.description).toContain('not read rather than not entered');
       });
     });
   });

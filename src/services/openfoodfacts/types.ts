@@ -34,7 +34,11 @@ export type RawProduct = {
   generic_name?: string;
   brands?: string;
   quantity?: string;
+  /** The record's main language code (`"en"`): the language `ingredients_text` is written in. */
+  lang?: string;
   ingredients_text?: string;
+  /** `ingredients_text_<lc>` for every language code the record lists, empty entries included. */
+  ingredients_text_languages?: Record<string, string>;
   ingredients?: RawIngredient[];
   allergens_tags?: string[];
   /**
@@ -47,8 +51,12 @@ export type RawProduct = {
   /** Product-level vegan, vegetarian, and palm-oil verdicts Open Food Facts computes itself. */
   ingredients_analysis_tags?: string[];
   nutriscore_grade?: string;
+  /** Nutri-Score points behind `nutriscore_grade`; lower is better. */
+  nutriscore_score?: number;
   nova_group?: number;
   ecoscore_grade?: string;
+  /** Green-Score points behind `ecoscore_grade` (the world score); higher means lower impact. */
+  ecoscore_score?: number;
   /**
    * Open Food Facts' `low` / `moderate` / `high` verdict per nutrient, keyed `fat`,
    * `saturated-fat`, `sugars`, and `salt`, computed on the record's aggregated nutrition set, where
@@ -74,28 +82,42 @@ export type RawProduct = {
   /** Countries the product is sold in — the values `off_search_products` accepts as `countries_tag`. */
   countries_tags?: string[];
   image_url?: string;
-  completeness?: number;
+  /** The selected ingredients-panel photo, in the language `image_url` is chosen by. */
+  image_ingredients_url?: string;
+  /** The selected nutrition-table photo, in the language `image_url` is chosen by. */
+  image_nutrition_url?: string;
+  /** A number, or on some records the numeric string Open Food Facts stored (`"0.65"`). */
+  completeness?: number | string;
   data_quality_tags?: string[];
+  /** When the record was last edited, in epoch seconds; on the text index, the indexed revision's. */
+  last_modified_t?: number;
+  /** When the record was created, in epoch seconds. */
+  created_t?: number;
 };
 
 /**
  * The fields a product read asks Open Food Facts for, in request order: the `fields=` list of a
- * full `off_get_product` read and the values its `fields` input accepts.
+ * full `off_get_product` read, and the values its `fields` input accepts, under the names its
+ * output gives them (`last_modified_t` and `created_t` are `last_modified` and `created` there).
  */
 export const PRODUCT_FIELD_NAMES = [
   'product_name',
   'generic_name',
   'brands',
   'quantity',
+  'lang',
   'ingredients_text',
+  'ingredients_text_languages',
   'ingredients',
   'allergens_tags',
   'traces_tags',
   'additives_tags',
   'ingredients_analysis_tags',
   'nutriscore_grade',
+  'nutriscore_score',
   'nova_group',
   'ecoscore_grade',
+  'ecoscore_score',
   'nutrient_levels',
   'nutriments',
   'serving_size',
@@ -107,8 +129,12 @@ export const PRODUCT_FIELD_NAMES = [
   'origins_tags',
   'countries_tags',
   'image_url',
+  'image_ingredients_url',
+  'image_nutrition_url',
   'completeness',
   'data_quality_tags',
+  'last_modified_t',
+  'created_t',
 ] as const satisfies readonly (keyof RawProduct)[];
 
 /**
@@ -190,10 +216,16 @@ export type RawTextSearchHit = {
   product_name?: string;
   /** brands is an array here, unlike the /api/v2 string field. */
   brands?: string | string[];
+  quantity?: string;
+  /** A number, or on some records a numeric string, as on `RawProduct`. */
+  completeness?: number | string;
   nutriscore_grade?: string;
   nova_group?: number;
   ecoscore_grade?: string;
   categories_tags?: string[];
+  /** The indexed revision's edit time, in epoch seconds, which can be older than the live record's. */
+  last_modified_t?: number;
+  created_t?: number;
   /**
    * The index's per-100 g / 100 ml nutrient map (`sugars_100g`, `energy-kcal_100g`, …), returned
    * only when `nutriments` is among the requested `fields`. A dotted field such as
@@ -334,6 +366,14 @@ export type NutrientFilter = {
 };
 
 /**
+ * One tag filter value: its tag ID, or the IDs one value can be stored under, any of which
+ * matches. A text search sends both IDs of a value nothing confirmed whose whole-string lowercase
+ * spells it differently, which turns a word-final capital sigma into `ς`: a brand's two slugs
+ * (`brandTextSlugs`) or a taxonomy value's two IDs (`taxonomyTextIds`).
+ */
+export type TagValue = string | string[];
+
+/**
  * Search parameters shared by both search backends. A `query`, a nutrient constraint, or an
  * ingredient filter (with or without tag filters) routes to search.openfoodfacts.org, where any tag
  * filters are folded into the Lucene `q`; tag filters alone route to /api/v2/search. `sort_by`
@@ -343,21 +383,21 @@ export type NutrientFilter = {
  */
 export type SearchParams = {
   query?: string;
-  categories_tag?: string;
-  brands_tag?: string;
-  /** One label, or several that must all apply. */
-  labels_tag?: string | string[];
-  allergens_tag?: string;
+  categories_tag?: TagValue;
+  brands_tag?: TagValue;
+  /** One label, or a list of labels that must all apply, each one `TagValue`. */
+  labels_tag?: string | TagValue[];
+  allergens_tag?: TagValue;
   /** An allergen the label warns the product may contain as a trace. */
-  traces_tag?: string;
+  traces_tag?: TagValue;
   ingredients_analysis_tag?: IngredientsAnalysisTag;
   /**
-   * One parsed-ingredient tag (`en:inulin`), or several that must all apply. A record's
-   * `ingredients_tags` carry each ingredient's taxonomy parents too, so `en:vegetable` matches a
-   * product listing carrot. Served only by the text backend, like `nutrient_filters`: the mirror
-   * indexes no ingredients, and /api/v2/search serves a tag-only search through page 10 only.
+   * One parsed-ingredient tag (`en:inulin`), or a list that must all apply, each one `TagValue`. A
+   * record's `ingredients_tags` carry each ingredient's taxonomy parents too, so `en:vegetable`
+   * matches a product listing carrot. Served only by the text backend, like `nutrient_filters`: the
+   * mirror indexes no ingredients, and /api/v2/search serves a tag-only search through page 10 only.
    */
-  ingredients_tag?: string | string[];
+  ingredients_tag?: string | TagValue[];
   /**
    * Allergen and trace tags a product must not carry. Sent only as confirmed canonical IDs: an
    * exclusion value neither backend recognizes excludes nothing, so the tool refuses one rather
@@ -381,7 +421,7 @@ export type SearchParams = {
    * the world grade, so a row can show a different letter than the one it matched.
    */
   ecoscore_grade?: string | string[];
-  countries_tag?: string;
+  countries_tag?: TagValue;
   /**
    * Numeric per-100 g / 100 ml nutrient constraints, ANDed with every other filter. Served only by
    * the text backend — /api/v2/search documents the equivalent comparison parameters but ignores

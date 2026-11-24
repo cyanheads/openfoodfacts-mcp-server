@@ -10,7 +10,9 @@ import {
   mirrorSnapshotTrailer,
   type SourceGroup,
   sourcesLine,
+  unreadFieldsNote,
 } from '@/mcp-server/tools/read-source.js';
+import { completenessScore } from '@/mcp-server/tools/record-metadata.js';
 import {
   applyAsSoldSelection,
   holdsOnlyPreparedFigures,
@@ -29,9 +31,29 @@ import {
 } from '@/services/openfoodfacts/types.js';
 import { mdInline } from '@/utils/markdown.js';
 
-/** Fields needed for comparison — narrower than full product fetch. */
+/**
+ * Fields needed for comparison — narrower than full product fetch. Every one is a field the local
+ * copy holds, so a comparison is served from it for each barcode it holds.
+ */
 const COMPARE_FIELDS =
-  'product_name,brands,nutriscore_grade,nova_group,ecoscore_grade,nutriments,completeness';
+  'product_name,brands,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutriments,completeness';
+
+/** The `nutriscore_score` output field's description, one for both product tools. */
+export const NUTRISCORE_POINTS_DESCRIPTION =
+  "Nutri-Score points behind nutriscore_grade, Open Food Facts' own ranking: lower is better, and the grade is read off them. They rank products of one kind only: beverages, and fats, oils, nuts, and seeds, are graded on their own thresholds, so the same points can carry different grades across kinds. Absent when Open Food Facts computed none (never derived from the grade), or when mirror_fields_unread names it as not read.";
+
+/** The `ecoscore_score` output field's description, one for both product tools. */
+export const GREEN_SCORE_POINTS_DESCRIPTION =
+  'Green-Score points behind ecoscore_grade: the world score, higher meaning lower environmental impact ("a" from 75, "a-plus" from 90), and bonuses can take it past 100. Absent when Open Food Facts computed none (never derived from the grade), or when mirror_fields_unread names it as not read.';
+
+/**
+ * A grade as the text shows it, with the points behind it when the read carried them: `b (1)`.
+ * Points that came without a grade sit beside `N/A`, so neither surface drops them.
+ */
+export function gradeWithPoints(grade: string | undefined, points: number | undefined): string {
+  const shown = grade === undefined ? 'N/A' : mdInline(grade);
+  return points === undefined ? shown : `${shown} (${points})`;
+}
 
 /**
  * Most distinct barcodes one call fetches. More, up to the input's hard ceiling, are listed in
@@ -70,7 +92,15 @@ const NUTRITION_COLUMNS = [
     key: 'carbohydrates_100g',
     raw: 'carbohydrates',
     header: 'Carbohydrates (g)',
-    measure: 'Total carbohydrates in grams',
+    measure:
+      "Carbohydrates in grams (Open Food Facts' carbohydrates nutrient, which records entered from US labels often fill with the label's total, fiber included; carbohydrates_total_100g is the separate total including fiber)",
+  },
+  {
+    key: 'carbohydrates_total_100g',
+    raw: 'carbohydrates-total',
+    header: 'Total Carbs incl. Fiber (g)',
+    measure:
+      'Total carbohydrates including fiber, a separate Open Food Facts nutrient from carbohydrates_100g and never derived from it, in grams',
   },
   { key: 'sugars_100g', raw: 'sugars', header: 'Sugars (g)', measure: 'Total sugars in grams' },
   { key: 'salt_100g', raw: 'salt', header: 'Salt (g)', measure: 'Salt in grams' },
@@ -96,13 +126,16 @@ type CompareRow = NutritionFigures & {
   brands?: string;
   found: boolean;
   nutriscore_grade?: string;
+  nutriscore_score?: number;
   nova_group?: number;
   ecoscore_grade?: string;
+  ecoscore_score?: number;
   prepared?: NutritionFigures;
   completeness?: number;
   stored_as_sold?: StoredAsSold;
   source?: ReadSource['source'];
   mirror_as_of?: string;
+  mirror_fields_unread?: string;
 };
 
 /** Extract a numeric value from the raw nutriments map. */
@@ -400,13 +433,13 @@ function sourceGroups(
 }
 
 /**
- * Build a comparison row from a raw product, where its read was answered, and how its stored
- * as-sold read went when one ran.
+ * Build a comparison row from a raw product, the read it came from (its source, and the fields a
+ * mirror row predates and so lacks), and how its stored as-sold read went when one ran.
  */
 function buildCompareRow(
   barcode: string,
   raw: RawProduct,
-  from: ReadSource,
+  from: ProductRead,
   storedAsSold?: StoredAsSold,
 ): CompareRow {
   const row: CompareRow = { barcode, found: true };
@@ -414,9 +447,13 @@ function buildCompareRow(
   if (raw.product_name) row.product_name = raw.product_name;
   if (raw.brands) row.brands = raw.brands;
   if (raw.nutriscore_grade) row.nutriscore_grade = raw.nutriscore_grade;
+  // Points are passed through as Open Food Facts computed them, never derived from a grade.
+  if (typeof raw.nutriscore_score === 'number') row.nutriscore_score = raw.nutriscore_score;
   if (typeof raw.nova_group === 'number') row.nova_group = raw.nova_group;
   if (raw.ecoscore_grade) row.ecoscore_grade = raw.ecoscore_grade;
-  if (typeof raw.completeness === 'number') row.completeness = raw.completeness;
+  if (typeof raw.ecoscore_score === 'number') row.ecoscore_score = raw.ecoscore_score;
+  const completeness = completenessScore(raw.completeness);
+  if (completeness !== undefined) row.completeness = completeness;
 
   if (raw.nutriments) {
     Object.assign(row, readFigures(raw.nutriments, '_100g'));
@@ -425,7 +462,10 @@ function buildCompareRow(
   }
   if (storedAsSold) row.stored_as_sold = storedAsSold;
   row.source = from.source;
-  if (from.source === 'off_mirror') row.mirror_as_of = from.mirrorAsOf;
+  if (from.source === 'off_mirror') {
+    row.mirror_as_of = from.mirrorAsOf;
+    if (from.unread) row.mirror_fields_unread = unreadFieldsNote(from.unread, from.mirrorAsOf);
+  }
 
   return row;
 }
@@ -433,7 +473,7 @@ function buildCompareRow(
 export const offCompareProductsTool = tool('off_compare_products', {
   title: 'Compare Food Products Side-by-Side',
   description:
-    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, carbohydrates, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score, NOVA group, and Green-Score. Open Food Facts returns one preparation state per read, so figures for the prepared product arrive in a prepared object on the row, with the same columns and basis, and never fill an as-sold field; a row whose read returned only prepared figures gets one more product read, of the as-sold set its record stores, once the read of every barcode has settled, with stored_as_sold saying how it went. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, carbohydrates, total carbohydrates including fiber, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score and Green-Score, each with the points behind its grade, and NOVA group. Open Food Facts returns one preparation state per read, so figures for the prepared product arrive in a prepared object on the row, with the same columns and basis, and never fill an as-sold field; a row whose read returned only prepared figures gets one more product read, of the as-sold set its record stores, once the read of every barcode has settled, with stored_as_sold saying how it went. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats; Nutri-Score points break a grade tie only between products of one kind. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -472,6 +512,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
               .describe(
                 'Nutri-Score grade: "a" through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none.',
               ),
+            nutriscore_score: z.number().optional().describe(NUTRISCORE_POINTS_DESCRIPTION),
             nova_group: z
               .number()
               .optional()
@@ -482,6 +523,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
               .describe(
                 'Green-Score (formerly Eco-Score) environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Often absent.',
               ),
+            ecoscore_score: z.number().optional().describe(GREEN_SCORE_POINTS_DESCRIPTION),
             ...nutritionFields(
               (measure) =>
                 `${measure} per 100 g, or per 100 ml for liquids, as sold. When the product read returned only prepared figures, read from the record's stored as-sold set instead (see stored_as_sold). Absent when not entered, or when that stored set was not read.`,
@@ -501,7 +543,9 @@ export const offCompareProductsTool = tool('off_compare_products', {
             completeness: z
               .number()
               .optional()
-              .describe('Data completeness 0–1. Low values mean many fields are missing.'),
+              .describe(
+                'Data completeness score as Open Food Facts reports it: higher means more of the record is filled in, and it can exceed 1 (e.g. 1.0875). Low values mean many fields are missing.',
+              ),
             source: z
               .enum(['off_api', 'off_mirror'])
               .optional()
@@ -513,6 +557,12 @@ export const offCompareProductsTool = tool('off_compare_products', {
               .optional()
               .describe(
                 'ISO 8601 time up to which the local copy reflects every product contributed or edited on Open Food Facts. Present only when source is "off_mirror".',
+              ),
+            mirror_fields_unread: z
+              .string()
+              .optional()
+              .describe(
+                'Present only when source is "off_mirror" and the local copy holds this product from before it stored fields a comparison reads, such as nutriscore_score and ecoscore_score. Names the fields this row lacks for that reason, which are not read rather than not entered: a comparison sends no live read for them, and off_get_product reads them for the barcode.',
               ),
           })
           .describe('A single product comparison row.'),
@@ -620,8 +670,11 @@ export const offCompareProductsTool = tool('off_compare_products', {
     const compared = distinct.slice(0, COMPARE_BARCODE_CAP);
     const unprocessed = distinct.slice(COMPARE_BARCODE_CAP);
 
+    // A row the local copy holds from before it stored a compared field is served as it is, the
+    // field named unread, rather than read live: a reload rewrites rows over hours, and reading each
+    // such barcode live would spend the product budget the copy exists to spare.
     const settlements = await Promise.allSettled(
-      compared.map((barcode) => svc.getProductFields(barcode, COMPARE_FIELDS, ctx)),
+      compared.map((barcode) => svc.getProductFields(barcode, COMPARE_FIELDS, ctx, 'serve_row')),
     );
 
     /*
@@ -762,9 +815,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
         p.completeness !== undefined
           ? `${Math.round(p.completeness * 100)}% (${p.completeness})`
           : 'N/A';
-      const grade = (value: string | undefined) => (value === undefined ? 'N/A' : mdInline(value));
       lines.push(
-        `| ${name} | ${p.barcode} | ${p.found} | ${grade(p.nutriscore_grade)} | ${p.nova_group ?? 'N/A'} | ${grade(p.ecoscore_grade)} | ${completeness} |`,
+        `| ${name} | ${p.barcode} | ${p.found} | ${gradeWithPoints(p.nutriscore_grade, p.nutriscore_score)} | ${p.nova_group ?? 'N/A'} | ${gradeWithPoints(p.ecoscore_grade, p.ecoscore_score)} | ${completeness} |`,
       );
     }
 
@@ -842,12 +894,20 @@ export const offCompareProductsTool = tool('off_compare_products', {
     // Scoped rather than dropped when an "as prepared" table prints: Scores keeps its N/As even
     // when no as-sold table does.
     const naScope = asPrepared.length > 0 ? ' outside the "as prepared" table' : '';
-    // The rows' sources, one line for the whole comparison, close the answer above its footer.
+    // The rows' sources, one line for the whole comparison, close the answer above its footer,
+    // with the fields rows the local copy predates lack. Those are missing because they were not
+    // read, so the footer's claim narrows to exclude them.
     const [firstSource, ...otherSources] = sourceGroups(result.products);
+    const unread = found.flatMap((p) =>
+      p.mirror_fields_unread === undefined
+        ? []
+        : [`- ${p.barcode}: ${mdInline(p.mirror_fields_unread)}`],
+    );
     lines.push(
       '',
       ...(firstSource ? [sourcesLine([firstSource, ...otherSources])] : []),
-      `*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A"${naScope} = not yet entered.*`,
+      ...(unread.length > 0 ? ['**Unread fields:**', ...unread] : []),
+      `*Data: Open Food Facts (ODbL 1.0) — crowd-sourced. "N/A"${naScope} = not yet entered${unread.length > 0 ? '; unread fields = not read' : ''}.*`,
     );
 
     return [{ type: 'text' as const, text: lines.join('\n') }];

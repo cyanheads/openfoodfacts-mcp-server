@@ -2,8 +2,8 @@
   "schema": "1004",
   "shape": "prepared_only",
   "code": "7613035530799",
-  "capturedAt": "2026-11-08T17:01:48.263Z",
-  "request": "/api/v2/product/7613035530799.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:48:33.000Z",
+  "request": "/api/v2/product/7613035530799.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "GET /api/v2/product/7613035530799.json?fields=raw at 2026-11-01T13:05:23.754Z, image_* and selected_images fields removed",
   "line": {
     "_id": "7613035530799",
@@ -4371,6 +4371,7 @@
         "en:spain",
         "en:switzerland"
       ],
+      "created_t": 1468476332,
       "data_quality_tags": [
         "en:photo-and-data-checked-by-an-experienced-contributor",
         "en:ingredients-en-photo-selected",
@@ -4407,7 +4408,10 @@
         "en:environmental-score-packaging-unspecified-material"
       ],
       "ecoscore_grade": "a-plus",
+      "ecoscore_score": 90,
       "generic_name": "",
+      "image_ingredients_url": "https://images.openfoodfacts.org/images/products/761/303/553/0799/ingredients_en.254.400.jpg",
+      "image_nutrition_url": "https://images.openfoodfacts.org/images/products/761/303/553/0799/nutrition_en.352.400.jpg",
       "image_url": "https://images.openfoodfacts.org/images/products/761/303/553/0799/front_en.199.400.jpg",
       "ingredients": [
         {
@@ -4513,6 +4517,13 @@
       ],
       "ingredients_analysis_tags": ["en:palm-oil-free", "en:maybe-vegan", "en:maybe-vegetarian"],
       "ingredients_text": "low-fat cocoa powder (28%), soluble corn fibre, sugars, oat flour**, emulsifier (soy lecithin), natural flavours, vitamins (c, d), cinnamon, **gluten free,",
+      "ingredients_text_languages": {
+        "en": "low-fat cocoa powder (28%), soluble corn fibre, sugars, oat flour**, emulsifier (soy lecithin), natural flavours, vitamins (c, d), cinnamon, **gluten free,",
+        "es": "",
+        "fr": "Cacao maigre en poudre (28%)(4), fibres solubles de maïs, sucres, farine d'AVOINE(5), émulsifiant (lécithine de SOJA), arômes naturels, vitamines (C, D), cannelle., (4)Bilan massique certifié Rainforest Alliance www.ra.org/fr (5)Sans gluten",
+        "it": "Cacao magro (28%), fibre solubili di mais, zucchero, farina D'Avena, emulsionante: lecitine di soia, aromi naturali, vitamina C, vitamina d, cannella",
+        "zh": "低脂可可粉（28%）、可溶性玉米纤维、糖、燕麦粉**、乳化剂（大豆卵磷脂）、天然香料、维生素（C、D）、肉桂，**无麸质"
+      },
       "labels_tags": [
         "en:low-or-no-sugar",
         "en:low-sugar",
@@ -4524,6 +4535,7 @@
         "en:Fabriqué-en-france",
         "en:Point-vert"
       ],
+      "lang": "en",
       "last_modified_t": 1790090792,
       "nova_group": 4,
       "nutrient_levels": {
@@ -4625,6 +4637,7 @@
         "zinc_unit": "g"
       },
       "nutriscore_grade": "c",
+      "nutriscore_score": 5,
       "nutrition_data_per": "100g",
       "nutrition_data_prepared": "on",
       "nutrition_data_prepared_per": "100g",

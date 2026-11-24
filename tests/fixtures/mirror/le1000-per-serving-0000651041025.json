@@ -2,8 +2,8 @@
   "schema": "le1000",
   "shape": "per_serving",
   "code": "0000651041025",
-  "capturedAt": "2026-11-08T17:02:10.181Z",
-  "request": "/api/v2/product/0000651041025.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:49:30.000Z",
+  "request": "/api/v2/product/0000651041025.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0000651041025",
@@ -836,6 +836,7 @@
       "code": "0000651041025",
       "completeness": 0.6625,
       "countries_tags": ["en:united-states"],
+      "created_t": 1489057181,
       "data_quality_tags": [
         "en:no-packaging-data",
         "en:ingredients-percent-analysis-ok",
@@ -869,13 +870,10 @@
         "en:vegetarian-status-unknown"
       ],
       "ingredients_text": "GREEN LEAF.",
+      "ingredients_text_languages": { "en": "GREEN LEAF." },
+      "lang": "en",
       "last_modified_t": 1740179836,
-      "nutrient_levels": {
-        "fat": "low",
-        "salt": "low",
-        "saturated-fat": "low",
-        "sugars": "low"
-      },
+      "nutrient_levels": { "fat": "low", "salt": "low", "saturated-fat": "low", "sugars": "low" },
       "nutriments": {
         "calcium": 0.0282352941176471,
         "calcium_100g": 0.0282352941176471,
@@ -959,6 +957,7 @@
         "vitamin-c_value": 0.00494117647058824
       },
       "nutriscore_grade": "a",
+      "nutriscore_score": 0,
       "nutrition_data": "on",
       "nutrition_data_per": "100g",
       "nutrition_data_prepared_per": "100g",

@@ -13,7 +13,14 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import { slugTagValue, TaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
+import {
+  brandSlug,
+  brandSlugs,
+  brandTextSlugs,
+  slugTagValue,
+  TaxonomyService,
+  taxonomyTextIds,
+} from '@/services/taxonomy/taxonomy-service.js';
 import { AUTOCOMPLETE_TIMED_OUT } from '../../fixtures/upstream-envelopes.js';
 
 /** Wrap a body + status in a minimal Response-like mock, as a real fetch would resolve. */
@@ -84,7 +91,7 @@ describe('TaxonomyService.canonicalizeTag', () => {
       ['  Nutella  ', 'nutella'],
       ['nutella', 'nutella'],
       ["Ben & Jerry's", 'ben-jerry-s'],
-      ['Côte d’Or', 'côte-d-or'],
+      ['Côte d’Or', 'cote-d-or'],
       ['M.&M.', 'm-m'],
       ['nutell', 'nutell'],
     ])('slugs %j to %j the way Product Opener does, with no lookup', async (input, slug) => {
@@ -94,6 +101,40 @@ describe('TaxonomyService.canonicalizeTag', () => {
         reason: 'no_vocabulary',
       });
       expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    // The text index's `brands_tags` for each brand as printed (2026-11-24): the `xx` slug folds
+    // a fixed list of Latin letters and keeps every other mark.
+    it.each([
+      ['Nestlé', 'nestle'],
+      ['Häagen-Dazs', 'haagen-dazs'],
+      ['Meßmer', 'messmer'],
+      ['Kærgården', 'kaergarden'],
+      ['Cœur de Lion', 'coeur-de-lion'],
+      ['Côte d’Or', 'cote-d-or'],
+      ['Çaykur', 'caykur'],
+      ['Kinh Đô', 'kinh-đo'],
+      ['ΟΛΥΜΠΟΣ', 'ολυμποσ'],
+      ['Løgismose', 'løgismose'],
+      ['Łowicz', 'łowicz'],
+      ['Vĩnh Hảo', 'vĩnh-hảo'],
+      ['Δέλτα', 'δέλτα'],
+      ['Красный Октябрь', 'красный-октябрь'],
+      ['Весёлый молочник', 'весёлый-молочник'],
+      ['ブルボン', 'ブルボン'],
+      ['농심', '농심'],
+      ['康师傅', '康师傅'],
+      ['المراعي', 'المراعي'],
+      ["Kellogg's", 'kellogg-s'],
+      ["M&M's", 'm-m-s'],
+      ['Dr. Oetker', 'dr-oetker'],
+      ['Ţară Şcoală Ăla', 'tara-scoala-ala'],
+    ])('sends %j as %j, the tag Product Opener stores', async (input, stored) => {
+      await expect(taxonomy.canonicalizeTag('brands', input, ctx)).resolves.toEqual({
+        value: stored,
+        resolution: 'normalized',
+        reason: 'no_vocabulary',
+      });
     });
 
     it.each([
@@ -195,6 +236,43 @@ describe('TaxonomyService.canonicalizeTag', () => {
       await expect(taxonomy.canonicalizeTag('categories', 'en:hummus', ctx)).resolves.toEqual({
         value: 'en:hummus',
         resolution: 'vocabulary',
+      });
+    });
+
+    /**
+     * A vocabulary ID built from a name written in lowercase ends in ς, while an all-caps value
+     * slugs one character at a time to σ, so only the whole-string lowercase of the value reaches
+     * it. Named options would confirm the value by name; these match by ID alone.
+     */
+    it('confirms an all-caps value ending in Σ by the ID a whole-string lowercase gives it, in one lookup', async () => {
+      stubOptions([{ id: 'el:σαλατες', text: 'Salads' }]);
+
+      await expect(taxonomy.canonicalizeTag('categories', 'EL:ΣΑΛΑΤΕΣ', ctx)).resolves.toEqual({
+        value: 'el:σαλατες',
+        resolution: 'vocabulary',
+      });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it('prefers the ID a value slugs to one character at a time when the vocabulary holds both', async () => {
+      stubOptions([
+        { id: 'el:σαλατες', text: 'Salads' },
+        { id: 'el:σαλατεσ', text: 'Salad mixes' },
+      ]);
+
+      await expect(taxonomy.canonicalizeTag('categories', 'EL:ΣΑΛΑΤΕΣ', ctx)).resolves.toEqual({
+        value: 'el:σαλατεσ',
+        resolution: 'vocabulary',
+      });
+    });
+
+    it('leaves an all-caps value ending in Σ that nothing confirms under the ID it slugs to one character at a time', async () => {
+      stubOptions([{ id: 'en:salads', text: 'Salads' }]);
+
+      await expect(taxonomy.canonicalizeTag('categories', 'EL:ΣΑΛΑΤΕΣ', ctx)).resolves.toEqual({
+        value: 'el:σαλατεσ',
+        resolution: 'normalized',
+        reason: 'no_match',
       });
     });
 
@@ -642,6 +720,72 @@ describe('TaxonomyService.canonicalizeTag', () => {
 
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect(lookupUrl(1).searchParams.get('taxonomy_names')).toBe('label');
+    });
+
+    /**
+     * `EL:ΣΑΛΑΤΕΣ` and a typed `el:σαλατεσ` normalize to the same ID, `el:σαλατεσ`, but only the
+     * all-caps value also carries the final-ς ID `el:σαλατες`, so one vocabulary answer confirms it
+     * and not the other. Neither answer may decide the other's, whichever is looked up first.
+     */
+    describe('values that share a normalized ID but not a final-ς ID', () => {
+      const allCaps = 'EL:ΣΑΛΑΤΕΣ';
+      const typed = 'el:σαλατεσ';
+      const confirmed = { value: 'el:σαλατες', resolution: 'vocabulary' };
+      const unconfirmed = { value: 'el:σαλατεσ', resolution: 'normalized', reason: 'no_match' };
+
+      /** The autocomplete `q` of every lookup sent, in order. */
+      const lookupTerms = () =>
+        vi
+          .mocked(global.fetch)
+          .mock.calls.map(([url]) => new URL(String(url)).searchParams.get('q'));
+
+      beforeEach(() => stubOptions([{ id: 'el:σαλατες', text: 'Salads' }]));
+
+      it.each([
+        ['A then B', [allCaps, typed], [confirmed, unconfirmed], ['ΣΑΛΑΤΕΣ', 'σαλατεσ']],
+        ['B then A', [typed, allCaps], [unconfirmed, confirmed], ['σαλατεσ', 'ΣΑΛΑΤΕΣ']],
+        ['A alone', [allCaps], [confirmed], ['ΣΑΛΑΤΕΣ']],
+        ['B alone', [typed], [unconfirmed], ['σαλατεσ']],
+      ])(
+        '%s: each value gets its own answer from its own lookup',
+        async (_order, values, expected, terms) => {
+          const results: unknown[] = [];
+          for (const value of values) {
+            results.push(await taxonomy.canonicalizeTag('categories', value, ctx));
+          }
+
+          expect(results).toEqual(expected);
+          expect(lookupTerms()).toEqual(terms);
+        },
+      );
+
+      it('gives each its own answer when both are looked up at once', async () => {
+        const results = await Promise.all([
+          taxonomy.canonicalizeTag('categories', allCaps, ctx),
+          taxonomy.canonicalizeTag('categories', typed, ctx),
+        ]);
+
+        expect(results).toEqual([confirmed, unconfirmed]);
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('still shares one lookup between two values whose IDs match', async () => {
+        // `el:σαλατεΣ` has both IDs too: `el:σαλατεσ`, then `el:σαλατες`.
+        await taxonomy.canonicalizeTag('categories', allCaps, ctx);
+        await expect(taxonomy.canonicalizeTag('categories', 'el:σαλατεΣ', ctx)).resolves.toEqual(
+          confirmed,
+        );
+        expect(global.fetch).toHaveBeenCalledOnce();
+
+        taxonomy = makeTaxonomy();
+        vi.mocked(global.fetch).mockClear();
+        const results = await Promise.all([
+          taxonomy.canonicalizeTag('categories', allCaps, ctx),
+          taxonomy.canonicalizeTag('categories', 'el:σαλατεΣ', ctx),
+        ]);
+        expect(results).toEqual([confirmed, confirmed]);
+        expect(global.fetch).toHaveBeenCalledOnce();
+      });
     });
 
     it('stays bounded, evicting the oldest entry first', async () => {
@@ -1302,4 +1446,220 @@ describe('slugTagValue', () => {
   it('collapses runs of separators and trims them from both ends', () => {
     expect(slugTagValue(' -- a  //  b -- ')).toBe('a-b');
   });
+
+  it('lowercases one character at a time, so a final capital sigma becomes σ, as Perl lc does', () => {
+    expect(slugTagValue('ΟΛΥΜΠΟΣ')).toBe('ολυμποσ');
+    expect(slugTagValue('ΣΟΦΟΣ ΚΑΦΕΣ')).toBe('σοφοσ-καφεσ');
+    // A lowercase final sigma typed as such stays one.
+    expect(slugTagValue('ολυμπος')).toBe('ολυμπος');
+  });
+
+  it('keeps every accent, as the default normalization does for taxonomy values', () => {
+    expect(slugTagValue('Côte d’Or')).toBe('côte-d-or');
+    expect(slugTagValue('Meßmer Kærgården')).toBe('meßmer-kærgården');
+  });
+});
+
+describe('brandSlug', () => {
+  it('composes before folding, so a decomposed accent folds like a precomposed one', () => {
+    expect(brandSlug('Nestlé')).toBe('nestle');
+    expect(brandSlug('Häagen-Dazs')).toBe('haagen-dazs');
+  });
+
+  it('keeps the marks of letters outside the folded list, decomposed ones included', () => {
+    expect(brandSlug('ブルボン')).toBe('ブルボン');
+    expect(brandSlug('Йогурт')).toBe('йогурт');
+    expect(brandSlug('Δέλτα')).toBe('δέλτα');
+    expect(brandSlug('Vĩnh Hảo')).toBe('vĩnh-hảo');
+  });
+
+  it('folds a capital sharp s, which lowercases to ß', () => {
+    expect(brandSlug('MEẞMER')).toBe('messmer');
+  });
+
+  it('folds every letter of the fold list, capital and small', () => {
+    // One word per fold group, its letters capital then small, in fold-list order.
+    expect(
+      brandSlug(
+        'ÀÁÂÃÄÅĂàáâãäåă Çç ÈÉÊËèéêë ÌÍÎÏìíîï Ññ ÒÓÔÕÖòóôõö ÙÚÛÜùúûü ÝŸýÿ ȘŞșş ȚŢțţ Œœ Ææ ẞß',
+      ),
+    ).toBe(
+      'aaaaaaaaaaaaaa-cc-eeeeeeee-iiiiiiii-nn-oooooooooo-uuuuuuuu-yyyy-ssss-tttt-oeoe-aeae-ssss',
+    );
+  });
+
+  it.each([
+    ['xx:nutella', 'nutella'],
+    ['en:nutella', 'nutella'],
+    [' XX:Nestlé ', 'nestle'],
+  ])('drops the language prefix of %j', (input, slug) => {
+    expect(brandSlug(input)).toBe(slug);
+  });
+});
+
+describe('brandSlugs', () => {
+  it('tries the folded slug first, then the accent-keeping one when it differs', () => {
+    expect(brandSlugs('Nestlé')).toEqual(['nestle', 'nestlé']);
+    expect(brandSlugs('café-bar')).toEqual(['cafe-bar', 'café-bar']);
+    expect(brandSlugs('xx:Meßmer')).toEqual(['messmer', 'meßmer']);
+  });
+
+  it('names a slug the normalizations agree on once', () => {
+    expect(brandSlugs('Nutella')).toEqual(['nutella']);
+    expect(brandSlugs('Løgismose')).toEqual(['løgismose']);
+    expect(brandSlugs('Όλυμπος')).toEqual(['όλυμπος']);
+  });
+
+  it('tries last the final-ς slug a whole-string lowercase gives an all-caps name, as 0.4.4 slugged it', () => {
+    expect(brandSlugs('ΟΛΥΜΠΟΣ')).toEqual(['ολυμποσ', 'ολυμπος']);
+    expect(brandSlugs('ΌΛΥΜΠΟΣ')).toEqual(['όλυμποσ', 'όλυμπος']);
+    expect(brandSlugs('CAFÉ ΣΟΦΟΣ')).toEqual(['cafe-σοφοσ', 'café-σοφοσ', 'café-σοφος']);
+  });
+
+  it('names nothing for a brand that slugs to nothing', () => {
+    expect(brandSlugs('™')).toEqual([]);
+    expect(brandSlugs('  ')).toEqual([]);
+  });
+
+  it.each([
+    ['en:en:foo', ['en-foo']],
+    ['xx:xx:Nestlé', ['xx-nestle', 'xx-nestlé']],
+    ['xx:en:ΣΟΦΟΣ', ['en-σοφοσ', 'en-σοφος']],
+  ])('drops one language prefix from %j, as brandSlug does', (input, slugs) => {
+    expect(brandSlugs(input)).toEqual(slugs);
+    expect(brandSlugs(input)[0]).toBe(brandSlug(input));
+  });
+});
+
+describe('brandTextSlugs', () => {
+  /**
+   * The text index holds a brand under whichever slug its records' brand text gave: an all-caps
+   * name slugs with `σ` (`ΟΛΥΜΠΟΣ` → `ολυμποσ`), one typed in lowercase keeps `ς` (`όλυμπος`, 29
+   * matches live 2026-11-24, where `όλυμποσ` matched none and the two as an OR group matched 29).
+   */
+  it.each([
+    ['ΌΛΥΜΠΟΣ', ['όλυμποσ', 'όλυμπος']],
+    ['ΟΛΥΜΠΟΣ', ['ολυμποσ', 'ολυμπος']],
+    ['xx:ΣΟΦΟΣ ΚΑΦΕΣ', ['σοφοσ-καφεσ', 'σοφος-καφες']],
+    // Both slugs fold, so neither keeps an accent the stored tag dropped.
+    ['CAFÉ ΣΟΦΟΣ', ['cafe-σοφοσ', 'cafe-σοφος']],
+    ['en:en:ΣΟΦΟΣ', ['en-σοφοσ', 'en-σοφος']],
+  ])(
+    'slugs %j to brandSlug, then the final-ς slug a whole-string lowercase gives',
+    (input, slugs) => {
+      expect(brandTextSlugs(input)).toEqual(slugs);
+      expect(brandTextSlugs(input)[0]).toBe(brandSlug(input));
+    },
+  );
+
+  it.each([
+    ['Nestlé', 'nestle'],
+    ['Όλυμπος', 'όλυμπος'],
+    ['ολυμποσ', 'ολυμποσ'],
+    // A capital sigma inside a word lowercases to σ either way.
+    ['ΜΑΣΤΙΧΑ', 'μαστιχα'],
+    ["Ben & Jerry's", 'ben-jerry-s'],
+  ])('slugs %j one way when both lowercasings agree', (input, slug) => {
+    expect(brandTextSlugs(input)).toEqual([slug]);
+  });
+});
+
+describe('taxonomyTextIds', () => {
+  /**
+   * A taxonomy value nothing confirmed goes to the text index under the ID Product Opener would
+   * normalize it to, which lowercases one character at a time, and under the ID of its whole-string
+   * lowercase when that spells it differently: a record whose tag came from text typed in lowercase
+   * carries the final `ς` (`el:σαλατες`), one typed in capitals the `σ` (`el:σαλατεσ`).
+   */
+  it.each([
+    ['EL:ΣΑΛΑΤΕΣ', ['el:σαλατεσ', 'el:σαλατες']],
+    ['el:ΣΑΛΑΤΕΣ', ['el:σαλατεσ', 'el:σαλατες']],
+    // No language prefix reads as English, as Product Opener normalizes it.
+    ['ΒΙΟΛΟΓΙΚΟΣ', ['en:βιολογικοσ', 'en:βιολογικος']],
+    ['el:ΣΑΛΑΤΕΣ ΦΡΟΥΤΩΝ', ['el:σαλατεσ-φρουτων', 'el:σαλατες-φρουτων']],
+    ['  EL:ΣΑΛΑΤΕΣ  ', ['el:σαλατεσ', 'el:σαλατες']],
+  ])(
+    'sends %j under its normalized ID, then the final-ς ID a whole-string lowercase gives',
+    (input, ids) => {
+      expect(taxonomyTextIds(input)).toEqual(ids);
+    },
+  );
+
+  it.each([
+    ['el:σαλάτες', 'el:σαλάτες'],
+    ['el:σαλατεσ', 'el:σαλατεσ'],
+    // A capital sigma inside a word lowercases to σ either way.
+    ['EL:ΜΑΣΤΙΧΑ', 'el:μαστιχα'],
+    ['EN:Organic', 'en:organic'],
+    ['US', 'en:us'],
+  ])('sends %j under one ID when both lowercasings agree', (input, id) => {
+    expect(taxonomyTextIds(input)).toEqual([id]);
+  });
+});
+
+/**
+ * Per-call thread CPU in ms: the least of five samples, each a batch of calls run until it has
+ * spent 5 ms, so a garbage-collection pause, which only adds time, and the timer's resolution on a
+ * small input never read as growth.
+ */
+function cpuMsPerCall(run: () => void): number {
+  let least = Number.POSITIVE_INFINITY;
+  for (let sample = 0; sample < 5; sample++) {
+    const start = process.threadCpuUsage();
+    let calls = 0;
+    let spentMs = 0;
+    do {
+      run();
+      calls++;
+      const used = process.threadCpuUsage(start);
+      spentMs = (used.user + used.system) / 1000;
+    } while (spentMs < 5);
+    least = Math.min(least, spentMs / calls);
+  }
+  return least;
+}
+
+describe('brand slug timing', () => {
+  /**
+   * The brand reaches the slug with no length bound but the transport's: 1 MiB over HTTP, none on
+   * stdio. Doubles the input from 5k to 320k characters, bounding CPU at each size before the next
+   * runs, so a quadratic fails in seconds. The 5k baseline is timed again beside each size and the
+   * full span asserts on the least growth across those pairs, since a baseline timed once can run on
+   * a faster core than a later size.
+   */
+  it.each([
+    ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
+    ['breaks throughout', (n: number) => '  \r\n'.repeat(n / 4)],
+    ['a long dash run', (n: number) => '-'.repeat(n)],
+    ['dots between letters', (n: number) => 'a.'.repeat(n / 2)],
+    ['folded letters that expand', (n: number) => 'ßœæ'.repeat(n / 3)],
+    ['capital sigmas', (n: number) => 'Σ'.repeat(n)],
+    // A whole-string lowercase looks past case-ignorable marks on both sides of each capital sigma.
+    ['capital sigmas between combining marks', (n: number) => 'Σ́́'.repeat(n / 3)],
+    ['combining marks only', (n: number) => '́'.repeat(n)],
+    ['decomposed accents', (n: number) => 'é'.repeat(n / 2)],
+    ['repeated language prefixes', (n: number) => 'xx:'.repeat(n / 3)],
+  ])(
+    'slugs %s in linear time',
+    (_shape, build) => {
+      /** Every slug a brand is looked up or sent under: the mirror's and the text index's. */
+      const slugAll = (text: string) => {
+        brandSlugs(text);
+        brandTextSlugs(text);
+      };
+      const baseline = build(5_000);
+      const baselines: number[] = [];
+      let largest = 0;
+      for (let n = 10_000; n <= 320_000; n *= 2) {
+        const input = build(n);
+        baselines.push(cpuMsPerCall(() => slugAll(baseline)));
+        largest = cpuMsPerCall(() => slugAll(input));
+        // 2 µs per character plus a floor: generous for linear work, far under a quadratic's.
+        expect(largest).toBeLessThan(5 + n * 0.002);
+      }
+      // 64× the input: linear stays near 64×, quadratic would reach 4,096×.
+      expect(largest / Math.max(...baselines)).toBeLessThan(256);
+    },
+    0,
+  );
 });

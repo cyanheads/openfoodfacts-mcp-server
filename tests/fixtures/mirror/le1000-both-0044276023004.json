@@ -2,8 +2,8 @@
   "schema": "le1000",
   "shape": "both",
   "code": "0044276023004",
-  "capturedAt": "2026-11-08T17:01:59.219Z",
-  "request": "/api/v2/product/0044276023004.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:49:02.000Z",
+  "request": "/api/v2/product/0044276023004.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "0044276023004",
@@ -1750,6 +1750,7 @@
       "code": "0044276023004",
       "completeness": 0.9625,
       "countries_tags": ["en:united-states"],
+      "created_t": 1489061248,
       "data_quality_tags": [
         "en:no-packaging-data",
         "en:ingredients-percent-analysis-ok",
@@ -1766,6 +1767,7 @@
       ],
       "ecoscore_grade": "unknown",
       "generic_name": "",
+      "image_nutrition_url": "https://images.openfoodfacts.org/images/products/004/427/602/3004/nutrition_fr.8.400.jpg",
       "image_url": "https://images.openfoodfacts.org/images/products/004/427/602/3004/front_en.5.400.jpg",
       "ingredients": [
         {
@@ -2025,15 +2027,15 @@
         "en:vegetarian-status-unknown"
       ],
       "ingredients_text": "WATER, SUGAR, AND/OR HIGH FRUCTOSE CORN SYRUP, GELATIN PARTIALLY HYDROGENATED SOYBEAN AND/OR PALM KERNEL OIL, CITRIC ACID, SODIUM CITRATE, NATURAL AND ARTIFICIAL FLAVORS, POTASSIUM SORBATE AND/OR SODIUM BENZOATE TO PRESERVE FRESHNESS. SALT. DEXTROSE, CARBOHYDRATE GUM, POLYSORBATE 60, POLYGLYCEROL ESTERS OF FATTY ACIDS, SOY LECITHIN, SODIUM STEAROYL LACTYLATE DISODIUM PHOSPHATE, XANTHAN GUM, BETA CAROTENE (COLOR), YELLOW 6 RED 40, STARCH-MODIFIED (CORN), GUM ACACIA YELLOW 5, BLUE 1.",
+      "ingredients_text_languages": {
+        "en": "WATER, SUGAR, AND/OR HIGH FRUCTOSE CORN SYRUP, GELATIN PARTIALLY HYDROGENATED SOYBEAN AND/OR PALM KERNEL OIL, CITRIC ACID, SODIUM CITRATE, NATURAL AND ARTIFICIAL FLAVORS, POTASSIUM SORBATE AND/OR SODIUM BENZOATE TO PRESERVE FRESHNESS. SALT. DEXTROSE, CARBOHYDRATE GUM, POLYSORBATE 60, POLYGLYCEROL ESTERS OF FATTY ACIDS, SOY LECITHIN, SODIUM STEAROYL LACTYLATE DISODIUM PHOSPHATE, XANTHAN GUM, BETA CAROTENE (COLOR), YELLOW 6 RED 40, STARCH-MODIFIED (CORN), GUM ACACIA YELLOW 5, BLUE 1.",
+        "fr": "Eau, glucose-fructose, sucre, gélatine, huile de palme hydrogénée, acide citrique, citrate de sodium, sel, SORBATE de potassium, arômes naturels et artificiels, dextrose, lactylate de sodium, polysorbate 60, ester polyglycérolique d'acides gras, gomme xanthane, gomme à base d'hydrates de carbone, lécithine de soya, phosphate disodique, bêta-carotène, colorant."
+      },
       "labels_tags": [],
+      "lang": "en",
       "last_modified_t": 1740369878,
       "nova_group": 4,
-      "nutrient_levels": {
-        "fat": "low",
-        "salt": "low",
-        "saturated-fat": "low",
-        "sugars": "high"
-      },
+      "nutrient_levels": { "fat": "low", "salt": "low", "saturated-fat": "low", "sugars": "high" },
       "nutriments": {
         "carbohydrates_prepared": 20,
         "carbohydrates_prepared_100g": 20,
@@ -2097,6 +2099,7 @@
         "trans-fat_unit": "g"
       },
       "nutriscore_grade": "c",
+      "nutriscore_score": 4,
       "nutrition_data_per": "100g",
       "nutrition_data_prepared": "on",
       "nutrition_data_prepared_per": "100g",

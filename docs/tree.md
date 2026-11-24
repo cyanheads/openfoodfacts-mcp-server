@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 15:21:26
+Generated on: 2026-11-24 08:30:30
 
 ```text
 openfoodfacts-mcp-server/
@@ -161,7 +161,8 @@ openfoodfacts-mcp-server/
 │   │       │   ├── get-product.tool.ts
 │   │       │   ├── index.ts
 │   │       │   └── search-products.tool.ts
-│   │       └── read-source.ts
+│   │       ├── read-source.ts
+│   │       └── record-metadata.ts
 │   ├── services/
 │   │   ├── mirror/
 │   │   │   ├── mirror-feeds.ts
@@ -182,7 +183,8 @@ openfoodfacts-mcp-server/
 │   │   └── taxonomy/
 │   │       └── taxonomy-service.ts
 │   ├── utils/
-│   │   └── markdown.ts
+│   │   ├── markdown.ts
+│   │   └── until-cancelled.ts
 │   └── index.ts
 ├── tests/
 │   ├── config/
@@ -202,6 +204,7 @@ openfoodfacts-mcp-server/
 │   │   │   └── v35-99999999999994.json
 │   │   ├── ingredients/
 │   │   │   ├── product-0028400157827.json
+│   │   │   ├── product-3017620422003.json
 │   │   │   ├── product-3046920022651.json
 │   │   │   └── product-7622210449283.json
 │   │   ├── mirror/
@@ -241,11 +244,12 @@ openfoodfacts-mcp-server/
 │   │   └── upstream-envelopes.ts
 │   ├── mcp-server/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── browse-taxonomy.tool.test.ts
-│   │           ├── compare-products.tool.test.ts
-│   │           ├── get-product.tool.test.ts
-│   │           └── search-products.tool.test.ts
+│   │       ├── definitions/
+│   │       │   ├── browse-taxonomy.tool.test.ts
+│   │       │   ├── compare-products.tool.test.ts
+│   │       │   ├── get-product.tool.test.ts
+│   │       │   └── search-products.tool.test.ts
+│   │       └── record-metadata.test.ts
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/

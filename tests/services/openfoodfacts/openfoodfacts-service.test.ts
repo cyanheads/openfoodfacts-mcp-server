@@ -99,11 +99,18 @@ const SEARCH_FIELD_LIST = [
   'code',
   'product_name',
   'brands',
+  'quantity',
   'nutriscore_grade',
   'nova_group',
   'ecoscore_grade',
   'categories_tags',
+  'completeness',
+  'last_modified_t',
+  'created_t',
 ];
+
+/** The tag path's `fields` query parameter: `SEARCH_FIELD_LIST`, encoded as its URL carries it. */
+const SEARCH_FIELDS_PARAM = new URLSearchParams({ fields: SEARCH_FIELD_LIST.join(',') }).toString();
 
 /**
  * The per-word group the text path must build: the word, as it will appear in `q`, against every
@@ -114,17 +121,17 @@ function wordGroup(word: string): string {
   return `(${UPSTREAM_MULTI_MATCH_FIELDS.map((field) => `${field}:${word}`).join(' OR ')})`;
 }
 
-/** The request the stubbed fetch received on a given call: URL, method, JSON body, and headers. */
+/**
+ * The request the stubbed fetch received on a given call, counted beside the text index date probe
+ * (`callsBesideProbe`): URL, method, JSON body, and headers.
+ */
 function sentRequest(call = 0): {
   url: string;
   method: string | undefined;
   body: Record<string, unknown> | undefined;
   headers: Record<string, string>;
 } {
-  const [url, init] = (vi.mocked(global.fetch).mock.calls[call] ?? []) as [
-    unknown,
-    RequestInit | undefined,
-  ];
+  const [url, init] = (callsBesideProbe()[call] ?? []) as [unknown, RequestInit | undefined];
   return {
     url: String(url),
     method: init?.method,
@@ -136,6 +143,35 @@ function sentRequest(call = 0): {
 /** The Lucene `q` the text path sent on a given call, read from the JSON body. */
 function sentQ(call = 0): string {
   return String(sentRequest(call).body?.q ?? '');
+}
+
+/**
+ * Whether a stubbed fetch call is the text index date probe: a POST to the text search endpoint
+ * whose JSON body carries no `q`. The first text search of each service instance sends one beside
+ * its own request, after it.
+ */
+function isTextIndexProbe(call: readonly unknown[]): boolean {
+  const [input, init] = call as [unknown, RequestInit | undefined];
+  if (String(input) !== TEXT_SEARCH_URL || typeof init?.body !== 'string') return false;
+  return !('q' in JSON.parse(init.body));
+}
+
+/**
+ * The stubbed fetch's calls in order, the text index date probe left out: what a case about the
+ * requests a search or lookup sends counts.
+ */
+function callsBesideProbe(): unknown[][] {
+  return vi.mocked(global.fetch).mock.calls.filter((call) => !isTextIndexProbe(call));
+}
+
+/**
+ * A fetch stub handing every request but the text index date probe to `answer`, and failing the
+ * probe at once with an empty index answer, so answers a case queues are never spent on it.
+ */
+function besideProbe(answer: (...call: unknown[]) => Promise<Response>): typeof fetch {
+  return vi.fn(async (...call: unknown[]) =>
+    isTextIndexProbe(call) ? mockResponse(TEXT_SEARCH_EMPTY) : answer(...call),
+  ) as unknown as typeof fetch;
 }
 
 /** Build a minimal service instance with default test config. */
@@ -1324,8 +1360,7 @@ describe('OpenFoodFactsService', () => {
       return sentQ();
     }
 
-    const SCALAR_URL =
-      'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&categories_tags=en%3Abreakfast-cereals&nutrition_grades_tags=b&nova_groups_tags=3&page=1&page_size=20';
+    const SCALAR_URL = `https://world.openfoodfacts.org/api/v2/search?${SEARCH_FIELDS_PARAM}&categories_tags=en%3Abreakfast-cereals&nutrition_grades_tags=b&nova_groups_tags=3&page=1&page_size=20`;
 
     describe('a single grade, as before', () => {
       it('sends a tag-only search the URL it always sent', async () => {
@@ -1351,7 +1386,7 @@ describe('OpenFoodFactsService', () => {
             countries_tag: 'en:france',
           }),
         ).resolves.toBe(
-          'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&nutrition_grades_tags=a%7Cb&nova_groups_tags=1%7C2&environmental_score_tags=a%7Ca-plus&countries_tags=en%3Afrance&page=1&page_size=20',
+          `https://world.openfoodfacts.org/api/v2/search?${SEARCH_FIELDS_PARAM}&nutrition_grades_tags=a%7Cb&nova_groups_tags=1%7C2&environmental_score_tags=a%7Ca-plus&countries_tags=en%3Afrance&page=1&page_size=20`,
         );
       });
 
@@ -1377,7 +1412,7 @@ describe('OpenFoodFactsService', () => {
             ecoscore_grade: [],
           }),
         ).resolves.toBe(
-          'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&categories_tags=en%3Abreakfast-cereals&page=1&page_size=20',
+          `https://world.openfoodfacts.org/api/v2/search?${SEARCH_FIELDS_PARAM}&categories_tags=en%3Abreakfast-cereals&page=1&page_size=20`,
         );
       });
 
@@ -1410,6 +1445,81 @@ describe('OpenFoodFactsService', () => {
     });
   });
 
+  // ── #94: a brand sent under each slug it can be stored under ─────────────
+
+  describe('searchProducts — a brand under any of its slugs', () => {
+    /** The live tag search URL `params` sends. */
+    async function tagUrl(params: ProductSearch): Promise<URL> {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_EMPTY));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      return new URL(String(vi.mocked(global.fetch).mock.calls[0]?.[0]));
+    }
+
+    /** The text search `q` `params` sends. */
+    async function textQ(params: ProductSearch): Promise<string> {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TEXT_SEARCH_EMPTY));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      return sentQ();
+    }
+
+    it('sends one slug to the text index as the clause it always sent, and several as an OR group', async () => {
+      await expect(textQ({ query: 'yaourt', brands_tag: 'nestle' })).resolves.toBe(
+        'brands_tags:"nestle" yaourt',
+      );
+      await expect(textQ({ query: 'yaourt', brands_tag: ['όλυμποσ', 'όλυμπος'] })).resolves.toBe(
+        'brands_tags:("όλυμποσ" OR "όλυμπος") yaourt',
+      );
+    });
+
+    it('joins several slugs with | on the live tag search, which reads them as any of them', async () => {
+      expect((await tagUrl({ brands_tag: 'nestle' })).searchParams.get('brands_tags')).toBe(
+        'nestle',
+      );
+      expect(
+        (await tagUrl({ brands_tag: ['όλυμποσ', 'όλυμπος'] })).searchParams.get('brands_tags'),
+      ).toBe('όλυμποσ|όλυμπος');
+    });
+  });
+
+  describe('searchProducts — a taxonomy value under any of its IDs', () => {
+    /** The text search `q` `params` sends. */
+    async function textQ(params: ProductSearch): Promise<string> {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TEXT_SEARCH_EMPTY));
+      await svc.searchProducts({ page: 1, page_size: 20, ...params }, createMockContext());
+      return sentQ();
+    }
+
+    it('sends a value under two IDs to the text index as one quoted OR group, in every tag field', async () => {
+      await expect(
+        textQ({
+          query: 'yaourt',
+          categories_tag: ['el:σαλατεσ', 'el:σαλατες'],
+          labels_tag: [['el:βιολογικοσ', 'el:βιολογικος'], 'en:vegan'],
+          allergens_tag: ['el:γαλακτοσ', 'el:γαλακτος'],
+          traces_tag: ['el:καρυδιασ', 'el:καρυδιας'],
+          ingredients_tag: [['el:ζαχαρησ', 'el:ζαχαρης']],
+          countries_tag: ['el:ελλασ', 'el:ελλας'],
+        }),
+      ).resolves.toBe(
+        'categories_tags:("el:σαλατεσ" OR "el:σαλατες") labels_tags:("el:βιολογικοσ" OR "el:βιολογικος") labels_tags:"en:vegan" allergens_tags:("el:γαλακτοσ" OR "el:γαλακτος") traces_tags:("el:καρυδιασ" OR "el:καρυδιας") ingredients_tags:("el:ζαχαρησ" OR "el:ζαχαρης") countries_tags:("el:ελλασ" OR "el:ελλας") yaourt',
+      );
+    });
+
+    it('keeps the clauses of values sent under one ID each', async () => {
+      await expect(
+        textQ({
+          query: 'yaourt',
+          categories_tag: 'el:σαλάτες',
+          labels_tag: ['en:organic', 'en:vegan'],
+          ingredients_tag: 'en:sugar',
+          countries_tag: 'en:greece',
+        }),
+      ).resolves.toBe(
+        'categories_tags:"el:σαλάτες" labels_tags:"en:organic" labels_tags:"en:vegan" ingredients_tags:"en:sugar" countries_tags:"en:greece" yaourt',
+      );
+    });
+  });
+
   // ── #88: the ingredient filter routes to the text index ──────────────────
 
   describe('searchProducts — ingredient filter (#88)', () => {
@@ -1417,7 +1527,7 @@ describe('OpenFoodFactsService', () => {
     async function sent(params: ProductSearch): Promise<ReturnType<typeof sentRequest>> {
       global.fetch = vi.fn().mockResolvedValue(mockResponse(TEXT_SEARCH_EMPTY));
       await svc.searchProducts(params, createMockContext());
-      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(callsBesideProbe()).toHaveLength(1);
       return sentRequest();
     }
 
@@ -1947,7 +2057,7 @@ describe('OpenFoodFactsService', () => {
       );
       const elapsedMs = Date.now() - startedAt;
 
-      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(callsBesideProbe()).toHaveLength(1);
       // No backoff sequence — the first retry alone would cost about a second.
       expect(elapsedMs).toBeLessThan(500);
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
@@ -2181,9 +2291,9 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn(async () => mockResponse(body, status));
     }
 
-    /** The pathname of every request the stubbed fetch received, in order. */
+    /** The pathname of every request the stubbed fetch received beside the probe, in order. */
     function requestedPaths(): string[] {
-      return vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname);
+      return callsBesideProbe().map(([input]) => new URL(String(input)).pathname);
     }
 
     /** Assert the declared retryable upstream failure, raised for a malformed body, after a full retry budget. */
@@ -2778,7 +2888,7 @@ describe('OpenFoodFactsService', () => {
       expect(request.method ?? 'GET').toBe('GET');
       expect(request.body).toBeUndefined();
       expect(request.url).toBe(
-        'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&categories_tags=en%3Aspreads&page=1&page_size=20',
+        `https://world.openfoodfacts.org/api/v2/search?${SEARCH_FIELDS_PARAM}&categories_tags=en%3Aspreads&page=1&page_size=20`,
       );
     });
 
@@ -2807,7 +2917,7 @@ describe('OpenFoodFactsService', () => {
         svc.searchProducts({ query: 'chocolate', page: 10_000, page_size: 50 }, ctx),
       );
 
-      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(callsBesideProbe()).toHaveLength(1);
       expect(error.data?.reason).toBe('upstream_rejected');
       expect(error.message).toContain('Maximum number of returned results is 10 000');
       expect(error.message).not.toContain('"loc"');
@@ -2874,6 +2984,88 @@ describe('OpenFoodFactsService', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+
+  // ── #92, #96: quantity, completeness, and record dates on search rows ────
+
+  describe('search row fields (#92, #96)', () => {
+    /** The text index's hit for 50457250 as it answered these fields (2026-11-23). */
+    const KETCHUP_HIT = {
+      code: '50457250',
+      product_name: 'Tomato Ketchup',
+      quantity: '700g',
+      completeness: 0.9875,
+      last_modified_t: 1_689_265_890,
+      created_t: 1_415_566_933,
+    };
+    /** /api/v2/search's row for 3017620425035 as it answered these fields (2026-11-23). */
+    const JAR_ROW = {
+      code: '3017620425035',
+      product_name: 'Nutella',
+      quantity: '1 kg',
+      completeness: 0.9,
+      last_modified_t: 1_794_902_892,
+      created_t: 1_532_452_519,
+    };
+
+    it('passes a text hit’s quantity and completeness to its row, and leaves out absent ones', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          textHits([KETCHUP_HIT, { code: '3017620422003', product_name: 'Bare' }]),
+        );
+
+      const result = served(await svc.searchProducts({ query: 'ketchup' }, ctx));
+
+      expect(result.products[0]).toMatchObject({ quantity: '700g', completeness: 0.9875 });
+      expect(result.products[1]).toStrictEqual({ code: '3017620422003', product_name: 'Bare' });
+    });
+
+    it('passes a tag search row’s quantity and completeness through', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ count: 1, page: 1, page_size: 20, products: [JAR_ROW] }));
+
+      const result = served(await svc.searchProducts({ brands_tag: 'nutella' }, ctx));
+
+      expect(new URL(sentRequest().url).searchParams.get('fields')?.split(',')).toEqual(
+        SEARCH_FIELD_LIST,
+      );
+      expect(result.products[0]).toMatchObject({ quantity: '1 kg', completeness: 0.9 });
+    });
+
+    it('passes a text hit’s indexed-revision dates to its row as the epoch seconds it holds', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          textHits([KETCHUP_HIT, { code: '3017620422003', created_t: 1_457_680_652 }]),
+        );
+
+      const result = served(await svc.searchProducts({ query: 'ketchup' }, ctx));
+
+      expect(result.products[0]).toMatchObject({
+        last_modified_t: 1_689_265_890,
+        created_t: 1_415_566_933,
+      });
+      expect(result.products[1]).toStrictEqual({ code: '3017620422003', created_t: 1_457_680_652 });
+    });
+
+    it('passes a tag search row’s dates through', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(mockResponse({ count: 1, page: 1, page_size: 20, products: [JAR_ROW] }));
+
+      const result = served(await svc.searchProducts({ brands_tag: 'nutella' }, ctx));
+
+      expect(result.products[0]).toMatchObject({
+        last_modified_t: 1_794_902_892,
+        created_t: 1_532_452_519,
+      });
     });
   });
 
@@ -3344,9 +3536,9 @@ describe('OpenFoodFactsService', () => {
       initTaxonomyService();
     });
 
-    /** Requests the stubbed fetch received, as `pathname?taxonomy_names&q` or `search`. */
+    /** Requests the stubbed fetch received beside the probe, as `pathname?taxonomy_names&q` or `search`. */
     function requestLog(): string[] {
-      return vi.mocked(global.fetch).mock.calls.map(([input]) => {
+      return callsBesideProbe().map(([input]) => {
         const url = new URL(String(input));
         return url.pathname === '/autocomplete'
           ? `autocomplete:${url.searchParams.get('taxonomy_names')}:${url.searchParams.get('q')}`
@@ -3389,6 +3581,28 @@ describe('OpenFoodFactsService', () => {
       );
     });
 
+    it.each([
+      // The text index holds this brand's 29 matches under `όλυμπος` and none under `όλυμποσ`, and
+      // answers the OR group with the 29 (live 2026-11-24).
+      ['ΌΛΥΜΠΟΣ', 'brands_tags:("όλυμποσ" OR "όλυμπος") γιαούρτι'],
+      ['ΟΛΥΜΠΟΣ', 'brands_tags:("ολυμποσ" OR "ολυμπος") γιαούρτι'],
+      ['Όλυμπος', 'brands_tags:"όλυμπος" γιαούρτι'],
+      ['Nestlé', 'brands_tags:"nestle" γιαούρτι'],
+    ])(
+      'sends brand %j to the text index under every slug it can be stored under',
+      async (brand, q) => {
+        routeFetch({});
+
+        await offSearchProductsTool.handler(
+          { query: 'γιαούρτι', brands_tag: brand, page: 1, page_size: 20 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        );
+
+        expect(sentQ(requestLog().indexOf('/search'))).toBe(q);
+        expect(requestLog()).toEqual(['/search']);
+      },
+    );
+
     it('sends an unconfirmable value normalized and still runs the search', async () => {
       global.fetch = vi.fn(async (input: unknown) =>
         new URL(String(input)).pathname === '/autocomplete'
@@ -3430,8 +3644,7 @@ describe('OpenFoodFactsService', () => {
 
   describe('exclusion, trace, verdict, and multi-label filters (#41)', () => {
     /** The tag-path URL prefix every search carries: endpoint plus the summary field list. */
-    const TAG_SEARCH_PREFIX =
-      'https://world.openfoodfacts.org/api/v2/search?fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags';
+    const TAG_SEARCH_PREFIX = `https://world.openfoodfacts.org/api/v2/search?${SEARCH_FIELDS_PARAM}`;
 
     /** Run a tag-only search with the given parameters and return the URL it fetched. */
     async function tagUrlFor(params: Record<string, unknown>): Promise<string> {
@@ -3556,9 +3769,9 @@ describe('OpenFoodFactsService', () => {
         });
       }
 
-      /** Every request the stubbed fetch received, as `autocomplete:<taxonomy>:<q>` or a path. */
+      /** Every request the stubbed fetch received beside the probe, as `autocomplete:<taxonomy>:<q>` or a path. */
       function requestLog(): string[] {
-        return vi.mocked(global.fetch).mock.calls.map(([input]) => {
+        return callsBesideProbe().map(([input]) => {
           const url = new URL(String(input));
           return url.pathname === '/autocomplete'
             ? `autocomplete:${url.searchParams.get('taxonomy_names')}:${url.searchParams.get('q')}`
@@ -3872,7 +4085,7 @@ describe('OpenFoodFactsService', () => {
 
       const result = await runToolContract(offSearchProductsTool, { query: 'dark chocolate' });
 
-      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(callsBesideProbe()).toHaveLength(1);
       expect(JSON.stringify(sentRequest().body)).toBe(
         JSON.stringify({
           q: `${wordGroup('dark')} ${wordGroup('chocolate')} dark chocolate`,
@@ -3907,9 +4120,7 @@ describe('OpenFoodFactsService', () => {
         categories_tag: 'en:dark-chocolates',
       });
 
-      expect(sentRequest().url).toContain(
-        'fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&',
-      );
+      expect(sentRequest().url).toContain(`${SEARCH_FIELDS_PARAM}&`);
       expect((result.structuredContent as { products: unknown[] }).products).toEqual([
         { barcode: '7771711000483' },
       ]);
@@ -3923,7 +4134,7 @@ describe('OpenFoodFactsService', () => {
         nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
       });
 
-      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(callsBesideProbe()).toHaveLength(1);
       expect(sentRequest().body?.fields).toEqual([...SEARCH_FIELD_LIST, 'nutriments']);
     });
 
@@ -4335,20 +4546,22 @@ describe('OpenFoodFactsService', () => {
             page_count: 2,
             hits: sugarHits(rows),
           });
-        global.fetch = vi
-          .fn()
-          .mockResolvedValueOnce(
-            page(1, [
-              ['3338310018864', 3.7],
-              ['3171939907825', 3],
-            ]),
-          )
-          .mockResolvedValueOnce(
-            page(2, [
-              ['20534585', 2],
-              ['5201310003230', 3.1],
-            ]),
-          );
+        global.fetch = besideProbe(
+          vi
+            .fn()
+            .mockResolvedValueOnce(
+              page(1, [
+                ['3338310018864', 3.7],
+                ['3171939907825', 3],
+              ]),
+            )
+            .mockResolvedValueOnce(
+              page(2, [
+                ['20534585', 2],
+                ['5201310003230', 3.1],
+              ]),
+            ),
+        );
 
         const nutrient_filters = [
           { nutrient: 'sugars' as const, operator: 'lte' as const, value: 3 },
@@ -4611,7 +4824,7 @@ describe('OpenFoodFactsService', () => {
       const paths: string[] = [];
       global.fetch = vi.fn((input: unknown, init?: RequestInit) => {
         const { pathname } = new URL(String(input));
-        paths.push(pathname);
+        if (!isTextIndexProbe([input, init])) paths.push(pathname);
         if (pathname === '/search') return Promise.resolve(mockResponse(TEXT_SEARCH_EMPTY));
         return new Promise<Response>((_resolve, reject) => {
           const signal = init?.signal as AbortSignal;
@@ -4684,11 +4897,17 @@ describe('OpenFoodFactsService', () => {
     const RUNTIME_SOCKET_ERROR =
       'ECONNRESET: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()';
 
-    /** Scripts fetch attempt by attempt, repeating the last step, and logs each abort reason seen. */
+    /**
+     * Scripts fetch attempt by attempt, repeating the last step, and logs each abort reason seen.
+     * The text index date probe takes no step: it fails at once on an empty index answer.
+     */
     function scriptFetch(...steps: Step[]): { abortReasons: unknown[] } {
       const abortReasons: unknown[] = [];
       let call = 0;
-      global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+      global.fetch = vi.fn((input: unknown, init?: RequestInit) => {
+        if (isTextIndexProbe([input, init])) {
+          return Promise.resolve(mockResponse(TEXT_SEARCH_EMPTY));
+        }
         const step = steps[Math.min(call, steps.length - 1)] as Step;
         call += 1;
         return new Promise<Response>((resolve, reject) => {
@@ -4763,9 +4982,9 @@ describe('OpenFoodFactsService', () => {
       return { settledAtMs, result: value };
     }
 
-    /** The pathname of every request the stubbed fetch received, in order. */
+    /** The pathname of every request the stubbed fetch received beside the probe, in order. */
     function requestedPaths(): string[] {
-      return vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname);
+      return callsBesideProbe().map(([input]) => new URL(String(input)).pathname);
     }
 
     /** Every read, its budget, and the per-call fields its failures carry. */
@@ -4840,7 +5059,7 @@ describe('OpenFoodFactsService', () => {
             operation,
           });
           // Every attempt but the last hit its own 15 s stall; the clock cut the last one off.
-          expect(global.fetch).toHaveBeenCalledTimes(attempts);
+          expect(callsBesideProbe()).toHaveLength(attempts);
           expect(abortReasons.at(-1)).toMatchObject({
             name: 'TimeoutError',
             message: `${operation} exceeded its ${deadlineMs}ms retry deadline.`,
@@ -4857,7 +5076,7 @@ describe('OpenFoodFactsService', () => {
 
         expect(settledAtMs).toBe(35_000);
         expect(error?.data?.reason).toBe('upstream_timeout');
-        expect(global.fetch).toHaveBeenCalledTimes(3);
+        expect(callsBesideProbe()).toHaveLength(3);
       });
 
       it('bounds a response body that stalls after its headers arrive', async () => {
@@ -4980,7 +5199,7 @@ describe('OpenFoodFactsService', () => {
             status: 429,
           });
           expect(result.error?.message).toContain('is rate-limiting this client (HTTP 429)');
-          expect(global.fetch).toHaveBeenCalledTimes(attempts);
+          expect(callsBesideProbe()).toHaveLength(attempts);
         },
       );
 
@@ -5061,7 +5280,7 @@ describe('OpenFoodFactsService', () => {
 
         expect(settledAtMs).toBe(33_000);
         expect(error?.data?.reason).toBe('upstream_timeout');
-        expect(global.fetch).toHaveBeenCalledTimes(3);
+        expect(callsBesideProbe()).toHaveLength(3);
       });
 
       it('fails at once on a Retry-After longer than what is left', async () => {
@@ -5258,7 +5477,7 @@ describe('OpenFoodFactsService', () => {
               retryAttempts: 4,
               operation,
             });
-            expect(global.fetch).toHaveBeenCalledTimes(4);
+            expect(callsBesideProbe()).toHaveLength(4);
             expect(JSON.stringify(error?.data)).not.toMatch(RUNTIME_TEXT);
           },
         );
@@ -6170,15 +6389,19 @@ describe('OpenFoodFactsService', () => {
       'generic_name',
       'brands',
       'quantity',
+      'lang',
       'ingredients_text',
+      'ingredients_text_languages',
       'ingredients',
       'allergens_tags',
       'traces_tags',
       'additives_tags',
       'ingredients_analysis_tags',
       'nutriscore_grade',
+      'nutriscore_score',
       'nova_group',
       'ecoscore_grade',
+      'ecoscore_score',
       'nutrient_levels',
       'nutriments',
       'serving_size',
@@ -6190,8 +6413,12 @@ describe('OpenFoodFactsService', () => {
       'origins_tags',
       'countries_tags',
       'image_url',
+      'image_ingredients_url',
+      'image_nutrition_url',
       'completeness',
       'data_quality_tags',
+      'last_modified_t',
+      'created_t',
     ];
 
     const FAILED_READ = 'Mirror read failed — reading Open Food Facts live instead';
@@ -6560,7 +6787,8 @@ describe('OpenFoodFactsService', () => {
           const prepare = handle.prepare.bind(handle);
           let synced = false;
           const spy = vi.spyOn(handle, 'prepare').mockImplementation((sql: string) => {
-            if (!synced && sql.startsWith('SELECT code, doc, record_version FROM products')) {
+            // The barcode lookup, known by its key rather than by the columns it selects.
+            if (!synced && sql.includes('FROM products WHERE code IN')) {
               synced = true;
               writerHandle
                 .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
@@ -6645,16 +6873,14 @@ describe('OpenFoodFactsService', () => {
 
         const read = await svc.getProductFields(
           OATS,
-          'product_name,last_modified_t',
+          'product_name,unique_scans_n',
           createMockContext(),
         );
 
-        expect(read).toEqual({
+        // unique_scans_n is a sort key the row stores in a column, never a product field it serves.
+        expect(read).toMatchObject({
           source: 'off_api',
-          product: {
-            product_name: 'Old Fashioned Oats',
-            last_modified_t: mirrorFixture(OATS).live.product.last_modified_t,
-          },
+          product: { product_name: 'Old Fashioned Oats' },
         });
         expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
       });
@@ -6835,6 +7061,97 @@ describe('OpenFoodFactsService', () => {
       });
     });
 
+    describe('record dates from the row’s columns (#96)', () => {
+      /** An organic product with `dates` among its export fields. */
+      const dated = (code: string, dates: Line): Line => ({
+        code,
+        schema_version: 1004,
+        lc: 'en',
+        product_name: `Product ${code}`,
+        quantity: '700g',
+        completeness: 0.9875,
+        labels_tags: ['en:organic'],
+        ...dates,
+      });
+      /** 50457250 as the live record dates it (2026-11-23), and a record storing no edit time. */
+      const LINES = [
+        dated('50457250', {
+          popularity_key: 2,
+          created_t: 1_415_566_933,
+          last_modified_t: 1_779_824_102,
+        }),
+        dated('3017620425035', { popularity_key: 1, created_t: 1_532_452_519 }),
+      ];
+
+      it('answers a full product read with both dates from the row, sending nothing', async () => {
+        await writeMirror(LINES);
+        forbidFetch();
+
+        const read = await svc.getProduct('50457250', createMockContext());
+
+        expect(read).toMatchObject({
+          source: 'off_mirror',
+          product: { last_modified_t: 1_779_824_102, created_t: 1_415_566_933 },
+        });
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('serves a read of one date from a record-version-1 row, that date alone', async () => {
+        await writeMirror(LINES, { recordVersion: 1 });
+        forbidFetch();
+
+        const read = await svc.getProductFields('50457250', 'last_modified_t', createMockContext());
+
+        expect(read?.source).toBe('off_mirror');
+        expect(read?.product).toStrictEqual({ last_modified_t: 1_779_824_102 });
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('leaves out a date the row’s column holds no value for', async () => {
+        await writeMirror(LINES);
+        forbidFetch();
+
+        const read = await svc.getProductFields(
+          '3017620425035',
+          'last_modified_t,created_t',
+          createMockContext(),
+        );
+
+        expect(read?.product).toStrictEqual({ created_t: 1_532_452_519 });
+      });
+
+      it('dates each row of a tag search it serves from record-version-1 rows', async () => {
+        await writeMirror(LINES, { recordVersion: 1 });
+        forbidFetch();
+
+        const outcome = served(
+          await svc.searchProducts(
+            { labels_tag: 'en:organic', tags_confirmed: true },
+            createMockContext(),
+          ),
+        );
+
+        expect(outcome.source).toBe('off_mirror');
+        expect(outcome.products).toStrictEqual([
+          {
+            code: '50457250',
+            product_name: 'Product 50457250',
+            quantity: '700g',
+            completeness: 0.9875,
+            last_modified_t: 1_779_824_102,
+            created_t: 1_415_566_933,
+          },
+          {
+            code: '3017620425035',
+            product_name: 'Product 3017620425035',
+            quantity: '700g',
+            completeness: 0.9875,
+            created_t: 1_532_452_519,
+          },
+        ]);
+      });
+    });
+
     describe('stored as-sold sets', () => {
       it('settles a mirrored prepared-only record that stores no sets as none, with no request', async () => {
         await writeMirror([mirrorFixture(NESQUIK).line], {
@@ -6863,8 +7180,11 @@ describe('OpenFoodFactsService', () => {
         const requests = stubLive([moved]);
         const ctx = createMockContext();
 
-        // A field the mirror does not hold sends the read of this mirrored barcode live.
-        const read = await svc.getProductFields(NESQUIK, 'nutriments,last_modified_t', ctx);
+        /**
+         * A field the mirror does not serve sends the read of this mirrored barcode live:
+         * unique_scans_n is a sort key the row stores in a column, never a product field.
+         */
+        const read = await svc.getProductFields(NESQUIK, 'nutriments,unique_scans_n', ctx);
         if (read?.source !== 'off_api') throw new Error('Expected a live read');
         const asSold = await svc.readStoredAsSold(NESQUIK, ctx, read);
 
@@ -6986,7 +7306,7 @@ describe('OpenFoodFactsService', () => {
           page: 11,
           page_count: 1,
           page_size: 1,
-          products: [{ code: '20000003', product_name: 'Product 20000003' }],
+          products: [{ code: '20000003', product_name: 'Product 20000003', quantity: '100 g' }],
           dropped: 0,
           source: 'off_mirror',
           mirrorAsOf: AS_OF,
@@ -7449,8 +7769,23 @@ describe('OpenFoodFactsService', () => {
       /** As-sold per 100 ml; generic name "assaisonnement". */
       const PER_100ML = '0008017310112';
 
-      /** What a row built at record version 1 holds: the doc without either field. */
-      const VERSION_1_DOC = `UPDATE products SET doc = json_remove(doc, '$.generic_name', '$.nutrient_levels')`;
+      /**
+       * The product fields a row built at record version 1 lacks, in the order a full read requests
+       * them: record version 2 added generic_name and nutrient_levels, and 3 added the other six.
+       */
+      const VERSION_1_LACKS = [
+        'generic_name',
+        'lang',
+        'ingredients_text_languages',
+        'nutriscore_score',
+        'ecoscore_score',
+        'nutrient_levels',
+        'image_ingredients_url',
+        'image_nutrition_url',
+      ];
+
+      /** What a row built at record version 1 holds: the doc without the fields it lacks. */
+      const VERSION_1_DOC = `UPDATE products SET doc = json_remove(doc, ${VERSION_1_LACKS.map((field) => `'$.${field}'`).join(', ')})`;
 
       it('asks for both fields on a full read, the list the fields enum offers', async () => {
         const urls: string[] = [];
@@ -7463,7 +7798,16 @@ describe('OpenFoodFactsService', () => {
 
         const sent = new URL(urls[0] ?? '').searchParams.get('fields')?.split(',');
         expect(sent).toEqual(PRODUCT_FIELD_LIST);
-        expect(sent).toEqual(offGetProductTool.input.shape.fields.unwrap().element.options);
+        // The enum names the record's dates as the output does, and asks for their `_t` fields.
+        const upstream: Record<string, string> = {
+          last_modified: 'last_modified_t',
+          created: 'created_t',
+        };
+        expect(sent).toEqual(
+          offGetProductTool.input.shape.fields
+            .unwrap()
+            .element.options.map((field) => upstream[field] ?? field),
+        );
       });
 
       it('reads a full product live from a row built before both fields, and serves a rewritten one', async () => {
@@ -7597,60 +7941,68 @@ describe('OpenFoodFactsService', () => {
         },
       );
 
-      describe('a row built before both fields whose live read fails or finds nothing', () => {
-        type Degraded = {
-          product: Record<string, unknown>;
-          requested_fields?: string[];
-          source?: string;
-          mirror_as_of?: string;
-          mirror_snapshot?: string;
-          mirror_fields_unread?: string;
-        };
+      /** An off_get_product answer as a row that predates requested fields can leave it. */
+      type Degraded = {
+        product: Record<string, unknown>;
+        requested_fields?: string[];
+        source?: string;
+        mirror_as_of?: string;
+        mirror_snapshot?: string;
+        mirror_fields_unread?: string;
+      };
 
-        /**
-         * Runs `run` on fake timers, a second at a time, until it settles. A mirror read awaits the
-         * store before the live read schedules its first backoff, so one `runAllTimersAsync`
-         * returns before there is a timer to run.
-         */
-        async function onSteppedTimers<T>(run: () => Promise<T>): Promise<T> {
-          vi.useFakeTimers({
-            toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+      /**
+       * Runs `run` on fake timers, a second at a time, until it settles. A mirror read awaits the
+       * store before the live read schedules its first backoff, so one `runAllTimersAsync`
+       * returns before there is a timer to run.
+       */
+      async function onSteppedTimers<T>(run: () => Promise<T>): Promise<T> {
+        vi.useFakeTimers({
+          toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+        });
+        try {
+          let settled = false;
+          const pending = run().finally(() => {
+            settled = true;
           });
-          try {
-            let settled = false;
-            const pending = run().finally(() => {
-              settled = true;
-            });
-            pending.catch(() => undefined);
-            for (let second = 0; second < 120 && !settled; second++) {
-              await vi.advanceTimersByTimeAsync(1_000);
-            }
-            return await pending;
-          } finally {
-            vi.useRealTimers();
+          pending.catch(() => undefined);
+          for (let second = 0; second < 120 && !settled; second++) {
+            await vi.advanceTimersByTimeAsync(1_000);
           }
+          return await pending;
+        } finally {
+          vi.useRealTimers();
         }
+      }
 
-        /** Answers every v2 read of `code` with `answer`; any other request fails the call. */
-        function stubProductRoute(
-          code: string,
-          answer: (signal: AbortSignal) => Promise<Response>,
-        ): string[] {
-          const requests: string[] = [];
-          global.fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
-            const url = new URL(String(input));
-            requests.push(url.pathname);
-            if (
-              url.hostname !== 'world.openfoodfacts.org' ||
-              url.pathname !== `/api/v2/product/${code}.json`
-            ) {
-              throw new Error(`Unexpected request: ${url.href}`);
-            }
-            return answer(init?.signal as AbortSignal);
-          }) as typeof fetch;
-          return requests;
-        }
+      /** Answers every v2 read of `code` with `answer`; any other request fails the call. */
+      function stubProductRoute(
+        code: string,
+        answer: (signal: AbortSignal) => Promise<Response>,
+      ): string[] {
+        const requests: string[] = [];
+        global.fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+          const url = new URL(String(input));
+          requests.push(url.pathname);
+          if (
+            url.hostname !== 'world.openfoodfacts.org' ||
+            url.pathname !== `/api/v2/product/${code}.json`
+          ) {
+            throw new Error(`Unexpected request: ${url.href}`);
+          }
+          return answer(init?.signal as AbortSignal);
+        }) as typeof fetch;
+        return requests;
+      }
 
+      /** Every text block of a run, joined: format() output plus trailer. */
+      function runText(run: ToolRun): string {
+        return (run.content as { type: string; text?: string }[])
+          .map((block) => block.text ?? '')
+          .join('\n');
+      }
+
+      describe('a row built at record version 1 whose live read fails or finds nothing', () => {
         /** A complete store holding `code` as a row built at record version 1. */
         function writeVersion1Row(code: string): Promise<void> {
           return writeMirror([mirrorFixture(code).line], {
@@ -7659,28 +8011,27 @@ describe('OpenFoodFactsService', () => {
           });
         }
 
-        /** Every text block of a run, joined: format() output plus trailer. */
-        function runText(run: ToolRun): string {
-          return (run.content as { type: string; text?: string }[])
-            .map((block) => block.text ?? '')
-            .join('\n');
-        }
-
         /**
          * The product off_get_product answers for `input` when the live read of a version-1 row
-         * succeeds, without the two fields the row predates: what the row itself holds.
+         * succeeds, without the fields the row predates: what the row itself holds.
          */
         async function storedProduct(code: string, input: Record<string, unknown>) {
           stubLive([mirrorFixture(code)]);
           const live = await runToolContract(offGetProductTool, input as { barcode: string });
           expect((live.structuredContent as Degraded).source).toBe('off_api');
-          const { generic_name, nutrient_levels, ...stored } = (live.structuredContent as Degraded)
-            .product;
-          return { stored, generic_name, nutrient_levels };
+          const { product } = live.structuredContent as Degraded;
+          const stored = Object.fromEntries(
+            Object.entries(product).filter(([field]) => !VERSION_1_LACKS.includes(field)),
+          );
+          return {
+            stored,
+            generic_name: product.generic_name,
+            nutrient_levels: product.nutrient_levels,
+          };
         }
 
-        const BOTH_UNREAD =
-          "generic_name and nutrient_levels are absent because they were not read, not because Open Food Facts lacks them: this server's local copy of this product predates them, and the live read for them";
+        const VERSION_1_UNREAD =
+          "generic_name, lang, ingredients_text_languages, nutriscore_score, ecoscore_score, nutrient_levels, image_ingredients_url, and image_nutrition_url are absent because they were not read, not because Open Food Facts lacks them: this server's local copy of this product predates them, and the live read for them";
 
         const FAILURES: [string, (signal: AbortSignal) => Promise<Response>, string][] = [
           ['HTTP 429', async () => mockResponse('', 429), 'rate_limited'],
@@ -7710,7 +8061,7 @@ describe('OpenFoodFactsService', () => {
         ];
 
         it.each(FAILURES)(
-          'answers a full read from the stored row, both fields named unread, when the live read answers %s',
+          'answers a full read from the stored row, every field it predates named unread, when the live read answers %s',
           async (_label, answer, reason) => {
             await writeVersion1Row(OATS);
             const { stored, generic_name } = await storedProduct(OATS, { barcode: OATS });
@@ -7731,7 +8082,7 @@ describe('OpenFoodFactsService', () => {
               mirror_snapshot: PRODUCT_NOTE,
             });
             const note = rest.mirror_fields_unread ?? '';
-            expect(note.startsWith(`${BOTH_UNREAD} failed (${reason}: "`)).toBe(true);
+            expect(note.startsWith(`${VERSION_1_UNREAD} failed (${reason}: "`)).toBe(true);
             expect(note.endsWith('"). Retry later to read them.')).toBe(true);
             const text = runText(result);
             expect(text).toContain(`**Unread fields:** ${note}`);
@@ -7748,7 +8099,7 @@ describe('OpenFoodFactsService', () => {
             runToolContract(offGetProductTool, { barcode: OATS }),
           );
 
-          const note = `${BOTH_UNREAD} failed (upstream_error: "Open Food Facts is unavailable (HTTP 503). (failed after 4 attempts)"). Retry later to read them.`;
+          const note = `${VERSION_1_UNREAD} failed (upstream_error: "Open Food Facts is unavailable (HTTP 503). (failed after 4 attempts)"). Retry later to read them.`;
           expect((result.structuredContent as Degraded).mirror_fields_unread).toBe(note);
           expect(runText(result)).toContain(`**Unread fields:** ${note}`);
         });
@@ -7769,7 +8120,7 @@ describe('OpenFoodFactsService', () => {
             expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
             const { product, ...rest } = result.structuredContent as Degraded;
             expect(product).toEqual(stored);
-            const note = `${BOTH_UNREAD} found no product under this barcode, which Open Food Facts may have removed since ${AS_OF}.`;
+            const note = `${VERSION_1_UNREAD} found no product under this barcode, which Open Food Facts may have removed since ${AS_OF}.`;
             expect(rest).toMatchObject({
               source: 'off_mirror',
               mirror_as_of: AS_OF,
@@ -7800,7 +8151,7 @@ describe('OpenFoodFactsService', () => {
           expect(product).toEqual(stored);
           expect(
             mirror_fields_unread?.startsWith(
-              `${BOTH_UNREAD} failed (rate_limited: "openfoodfacts-mcp-server declined this product request: its own client-side budget of 100 product requests/min is spent, so nothing was sent to Open Food Facts. A slot frees in about `,
+              `${VERSION_1_UNREAD} failed (rate_limited: "openfoodfacts-mcp-server declined this product request: its own client-side budget of 100 product requests/min is spent, so nothing was sent to Open Food Facts. A slot frees in about `,
             ),
           ).toBe(true);
         });
@@ -7878,6 +8229,315 @@ describe('OpenFoodFactsService', () => {
           expect(global.fetch).toHaveBeenCalledOnce();
         });
       });
+
+      describe('a row built at record version 2 (#91, #93)', () => {
+        /** The product fields record version 3 added, in the order a full read requests them. */
+        const VERSION_3_FIELDS = [
+          'lang',
+          'ingredients_text_languages',
+          'nutriscore_score',
+          'ecoscore_score',
+          'image_ingredients_url',
+          'image_nutrition_url',
+        ];
+
+        /** A complete store holding OATS as a row built at record version 2. */
+        function writeVersion2Row(): Promise<void> {
+          return writeMirror([mirrorFixture(OATS).line], {
+            recordVersion: 2,
+            sql: [
+              `UPDATE products SET doc = json_remove(doc, ${VERSION_3_FIELDS.map((field) => `'$.${field}'`).join(', ')})`,
+            ],
+          });
+        }
+
+        const VERSION_2_UNREAD =
+          "lang, ingredients_text_languages, nutriscore_score, ecoscore_score, image_ingredients_url, and image_nutrition_url are absent because they were not read, not because Open Food Facts lacks them: this server's local copy of this product predates them, and the live read for them";
+
+        it('reads a full off_get_product live for the six fields the row predates', async () => {
+          await writeVersion2Row();
+          const requests = stubLive([mirrorFixture(OATS)]);
+
+          const result = await runToolContract(offGetProductTool, { barcode: OATS });
+
+          expect(result.isError).toBeFalsy();
+          expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+          const { product, source } = result.structuredContent as Degraded;
+          expect(source).toBe('off_api');
+          expect(product).toMatchObject({
+            generic_name: 'Rolled oats',
+            lang: 'en',
+            ingredients_text_languages: { en: 'whole grain rolled oats' },
+            nutriscore_score: -8,
+            ecoscore_score: 65,
+            image_ingredients_url:
+              'https://images.openfoodfacts.org/images/products/003/000/001/0402/ingredients_en.274.400.jpg',
+            image_nutrition_url:
+              'https://images.openfoodfacts.org/images/products/003/000/001/0402/nutrition_en.273.400.jpg',
+          });
+        });
+
+        it.each<[string, () => Promise<Response>, string]>([
+          [
+            'HTTP 503',
+            async () => mockResponse('', 503),
+            `${VERSION_2_UNREAD} failed (upstream_error: "Open Food Facts is unavailable (HTTP 503). (failed after 4 attempts)"). Retry later to read them.`,
+          ],
+          [
+            'HTTP 404',
+            async () => mockResponse(PRODUCT_NOT_FOUND_404, 404),
+            `${VERSION_2_UNREAD} found no product under this barcode, which Open Food Facts may have removed since ${AS_OF}.`,
+          ],
+        ])(
+          'answers from the row, the six fields named unread, when the live read answers %s',
+          async (_label, answer, note) => {
+            await writeVersion2Row();
+            const requests = stubProductRoute(OATS, answer);
+
+            const result = await onSteppedTimers(() =>
+              runToolContract(offGetProductTool, { barcode: OATS }),
+            );
+
+            expect(result.isError).toBeFalsy();
+            expect(requests.length).toBeGreaterThan(0);
+            const { product, ...rest } = result.structuredContent as Degraded;
+            expect(rest).toMatchObject({
+              source: 'off_mirror',
+              mirror_as_of: AS_OF,
+              mirror_fields_unread: note,
+            });
+            expect(product).toMatchObject({
+              generic_name: 'Rolled oats',
+              ingredients_text: 'whole grain rolled oats',
+            });
+            for (const field of VERSION_3_FIELDS) expect(product).not.toHaveProperty(field);
+            const text = runText(result);
+            expect(text).toContain(`**Unread fields:** ${note}`);
+            expect(text).not.toMatch(/\*\*Main language:\*\*|Ingredients photo|Nutrition photo/);
+          },
+        );
+
+        it.each<[string, 'product_name' | 'generic_name']>([
+          ['product_name', 'product_name'],
+          ['generic_name, which record version 2 added', 'generic_name'],
+        ])('serves a subset naming %s from the row, sending nothing', async (_label, field) => {
+          await writeVersion2Row();
+          forbidFetch();
+
+          const result = await runToolContract(offGetProductTool, {
+            barcode: OATS,
+            fields: [field],
+          });
+
+          expect(result.isError).toBeFalsy();
+          expect(global.fetch).not.toHaveBeenCalled();
+          const { product, source, mirror_fields_unread } = result.structuredContent as Degraded;
+          expect(source).toBe('off_mirror');
+          expect(product).toEqual({ [field]: mirrorFixture(OATS).live.product[field] });
+          expect(mirror_fields_unread).toBeUndefined();
+        });
+
+        it('reads a subset naming ingredients_text live, for the lang it brings', async () => {
+          await writeVersion2Row();
+          const requests = stubLive([mirrorFixture(OATS)]);
+
+          const result = await runToolContract(offGetProductTool, {
+            barcode: OATS,
+            fields: ['ingredients_text'],
+          });
+
+          expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
+          expect(result.structuredContent).toEqual({
+            barcode: OATS,
+            product: { lang: 'en', ingredients_text: 'whole grain rolled oats' },
+            requested_fields: ['ingredients_text', 'lang'],
+            source: 'off_api',
+          });
+        });
+      });
+    });
+
+    describe('serving a row that predates requested fields without a live read (#93)', () => {
+      /** As-sold per 100 ml. */
+      const PER_100ML = '0008017310112';
+
+      /** A doc as a version-1 row holds it: without the fields record version 2 added. */
+      const VERSION_1_DOC = `UPDATE products SET doc = json_remove(doc, '$.generic_name', '$.nutrient_levels')`;
+
+      /** The note a comparison row from a row built before the points carries. */
+      const POINTS_UNREAD =
+        "nutriscore_score and ecoscore_score are absent because they were not read, not because Open Food Facts lacks them: this server's local copy of this product predates them, and no live read was sent for them; off_get_product reads them for this barcode.";
+
+      it('serves the row with no request, naming the fields it predates as skipped', async () => {
+        await writeMirror([mirrorFixture(OATS).line], { recordVersion: 1, sql: [VERSION_1_DOC] });
+        forbidFetch();
+        const ctx = createMockContext();
+
+        const read = await svc.getProductFields(
+          OATS,
+          'product_name,generic_name',
+          ctx,
+          'serve_row',
+        );
+
+        expect(read).toMatchObject({
+          source: 'off_mirror',
+          mirrorAsOf: AS_OF,
+          unread: { fields: ['generic_name'], outcome: 'skipped' },
+        });
+        expect(read?.product).toEqual({ product_name: 'Old Fashioned Oats' });
+        expect(global.fetch).not.toHaveBeenCalled();
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('serves a row holding every requested field as it is, naming nothing unread', async () => {
+        await writeMirror([mirrorFixture(OATS).line], { recordVersion: 1, sql: [VERSION_1_DOC] });
+        forbidFetch();
+
+        const read = await svc.getProductFields(
+          OATS,
+          'product_name,brands',
+          createMockContext(),
+          'serve_row',
+        );
+
+        expect(read?.source).toBe('off_mirror');
+        expect(read).not.toHaveProperty('unread');
+        expect(global.fetch).not.toHaveBeenCalled();
+      });
+
+      it('reads a barcode the mirror lacks live, once', async () => {
+        await writeMirror([mirrorFixture(OATS).line]);
+        const requests = stubLive([mirrorFixture(BOTH)]);
+
+        const read = await svc.getProductFields(
+          BOTH,
+          'product_name',
+          createMockContext(),
+          'serve_row',
+        );
+
+        expect(read?.source).toBe('off_api');
+        expect(requests).toEqual([`/api/v2/product/${BOTH}.json`]);
+      });
+
+      it('sends off_compare_products one product read per barcode the mirror lacks, and none for a row it holds at any record version', async () => {
+        /** As-sold; the store below lacks it. Its v2 read holds as-sold figures, so it is read once. */
+        const LACKED = '0008346800025';
+        const fixtures = [OATS, PER_100ML, NESQUIK, LACKED].map(mirrorFixture);
+        await writeMirror(
+          fixtures.slice(0, 3).map((fixture) => fixture.line),
+          {
+            sql: [
+              `UPDATE products SET doc = json_remove(doc, '$.generic_name', '$.nutrient_levels', '$.nutriscore_score', '$.ecoscore_score'), record_version = 1 WHERE code = '${OATS}'`,
+              `UPDATE products SET doc = json_remove(doc, '$.nutriscore_score', '$.ecoscore_score'), record_version = 2 WHERE code = '${PER_100ML}'`,
+            ],
+          },
+        );
+        const requests = stubLive(fixtures);
+
+        const result = await runToolContract(offCompareProductsTool, {
+          barcodes: [OATS, PER_100ML, NESQUIK, LACKED],
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(requests).toEqual([`/api/v2/product/${LACKED}.json`]);
+        const rows = (
+          result.structuredContent as {
+            products: { source?: string; mirror_fields_unread?: string }[];
+          }
+        ).products;
+        expect(rows.map((row) => [row.source, row.mirror_fields_unread])).toEqual([
+          ['off_mirror', POINTS_UNREAD],
+          ['off_mirror', POINTS_UNREAD],
+          ['off_mirror', undefined],
+          ['off_api', undefined],
+        ]);
+        const text = (result.content as { type: string; text?: string }[])
+          .map((block) => block.text ?? '')
+          .join('\n');
+        expect(text).toContain(
+          `**Unread fields:**\n- ${OATS}: ${POINTS_UNREAD}\n- ${PER_100ML}: ${POINTS_UNREAD}`,
+        );
+      });
+    });
+
+    describe('the brand check (#94)', () => {
+      /** A synthetic schema 1004 export line of one product stored under `brandTag`. */
+      const branded = (code: string, brandTag: string): Line => ({
+        code,
+        schema_version: 1004,
+        lc: 'en',
+        product_name: `Product ${code}`,
+        brands_tags: [brandTag],
+      });
+      const BRANDS: Line[] = [branded('90000001', 'xx:nestle'), branded('90000002', 'xx:café-bar')];
+
+      it.each([
+        ['the folded slug, when held', ['nestle', 'nestlé'], 'nestle'],
+        ['the accent-keeping slug, when only it is held', ['cafe-bar', 'café-bar'], 'café-bar'],
+        ['nothing, when no slug is held', ['kelloggs'], undefined],
+      ])('answers %s, sending nothing and logging nothing', async (_label, slugs, held) => {
+        await writeMirror(BRANDS);
+        forbidFetch();
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorHeldBrand(slugs, ctx)).resolves.toBe(held);
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('answers nothing, opening no store, with OFF_MIRROR_PATH unset', async () => {
+        forbidFetch();
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorHeldBrand(['nestle'], ctx)).resolves.toBeUndefined();
+        expect(getMirrorStore()).toBeUndefined();
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('answers nothing while the first full load runs, though the store holds the brand', async () => {
+        await writeMirror(BRANDS, { firstLoadRunning: true });
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorHeldBrand(['nestle'], ctx)).resolves.toBeUndefined();
+        expect(warnings(ctx)).toEqual([]);
+      });
+
+      it('answers nothing on a store error during the check, logging it', async () => {
+        await writeMirror(BRANDS, { sql: ['DROP TABLE tags'] });
+        const ctx = createMockContext();
+
+        await expect(svc.mirrorHeldBrand(['nestle'], ctx)).resolves.toBeUndefined();
+        expect(warnings(ctx)).toEqual([
+          {
+            level: 'warning',
+            msg: FAILED_READ,
+            data: expect.objectContaining({ operation: 'brand check' }),
+          },
+        ]);
+      });
+
+      it.each([
+        ['while it reads', false],
+        ['as the store fails', true],
+      ])('rethrows a caller abort raised during the check %s', async (_label, failToo) => {
+        await writeMirror(BRANDS);
+        const store = getMirrorStore();
+        if (!store) throw new Error('Expected a configured mirror');
+        const controller = new AbortController();
+        const raw = store.raw.bind(store);
+        vi.spyOn(store, 'raw').mockImplementation(async () => {
+          controller.abort();
+          if (failToo) throw new Error('disk gone');
+          return raw();
+        });
+        const ctx = createMockContext({ signal: controller.signal });
+
+        const error = await captureError(svc.mirrorHeldBrand(['nestle'], ctx));
+        expect(controller.signal.aborted).toBe(true);
+        expect(error).toBe(controller.signal.reason);
+        expect(warnings(ctx)).toEqual([]);
+      });
     });
 
     describe('cancellation', () => {
@@ -7940,6 +8600,396 @@ describe('OpenFoodFactsService', () => {
         expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
         expect(global.fetch).toHaveBeenCalledOnce();
       });
+    });
+  });
+});
+
+// ── #95: the text index's date ─────────────────────────────────────────────
+
+describe('text index date (#95)', () => {
+  const globalFetch = global.fetch;
+
+  /** The probe's answer, captured live 2026-11-24: the newest edit the text index holds. */
+  const PROBE_ANSWER = {
+    hits: [{ last_modified_t: 1734496021 }],
+    aggregations: null,
+    facets: {},
+    charts: {},
+    page: 1,
+    page_size: 1,
+    page_count: 10000,
+    took: 28,
+    timed_out: false,
+    count: 10000,
+    is_count_exact: false,
+    warnings: null,
+  };
+  /** `PROBE_ANSWER`'s `last_modified_t` as the service reports it. */
+  const INDEX_AS_OF = '2024-12-18T04:27:01.000Z';
+  const TEXT: ProductSearch = { query: 'nutella', page: 1, page_size: 2 };
+  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+  const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
+
+  type Answer = (init: RequestInit) => Promise<Response>;
+
+  /** The init of every probe the stubbed fetch received, in order. */
+  let probes: RequestInit[];
+
+  /**
+   * Routes the stubbed fetch: the probe to `probe`, a text search to `search` (the live hits by
+   * default), and a tag search to the live tag answer.
+   */
+  function route(probe: Answer, search: Answer = async () => mockResponse(TEXT_SEARCH_HITS)): void {
+    probes = [];
+    global.fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const request = init ?? {};
+      if (isTextIndexProbe([input, init])) {
+        probes.push(request);
+        return probe(request);
+      }
+      return String(input) === TEXT_SEARCH_URL ? search(request) : mockResponse(TAG_SEARCH_HITS);
+    }) as typeof fetch;
+  }
+
+  /** An answer that never comes: the request rejects once its signal aborts, as fetch's does. */
+  function unanswered(init: RequestInit): Promise<Response> {
+    return new Promise((_resolve, reject) => {
+      const signal = init.signal as AbortSignal;
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  }
+
+  /** A service with its own probe state and a search budget of `rateLimitSearch` a minute. */
+  function service(rateLimitSearch = 100): OpenFoodFactsService {
+    return new OpenFoodFactsService({
+      baseUrl: 'https://world.openfoodfacts.org',
+      rateLimitProduct: 100,
+      rateLimitSearch,
+      rateLimitTaxonomy: 100,
+    });
+  }
+
+  /** How a call settled, and how many fake milliseconds after it started; read as time runs. */
+  type Tracked = { settled: boolean; value?: SearchOutcome; error?: unknown; afterMs?: number };
+
+  function track(run: Promise<SearchOutcome>): Tracked {
+    const startedAt = Date.now();
+    const state: Tracked = { settled: false };
+    run.then(
+      (value) => Object.assign(state, { settled: true, value, afterMs: Date.now() - startedAt }),
+      (error: unknown) =>
+        Object.assign(state, { settled: true, error, afterMs: Date.now() - startedAt }),
+    );
+    return state;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    global.fetch = globalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('dates the first text search with one probe sent after its search, rows and total as they are', async () => {
+    route(async () => mockResponse(PROBE_ANSWER));
+    const svc = service();
+
+    const dated = served(await svc.searchProducts(TEXT, createMockContext()));
+
+    expect(dated.textIndexAsOf).toBe(INDEX_AS_OF);
+    const calls = vi.mocked(global.fetch).mock.calls;
+    expect(calls.map((call) => isTextIndexProbe(call))).toEqual([false, true]);
+    const [url, init] = calls[1] as [unknown, RequestInit];
+    expect(String(url)).toBe(TEXT_SEARCH_URL);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({
+      sort_by: '-last_modified_t',
+      page_size: 1,
+      fields: ['last_modified_t'],
+    });
+    expect((init.headers as Record<string, string>)['User-Agent']).toMatch(
+      /^openfoodfacts-mcp-server\//,
+    );
+
+    // The same search with a probe that finds nothing: the same answer, undated.
+    route(async () => mockResponse({ ...PROBE_ANSWER, hits: [], count: 0 }));
+    const undated = served(await service().searchProducts(TEXT, createMockContext()));
+    expect(undated).not.toHaveProperty('textIndexAsOf');
+    expect({ ...dated, textIndexAsOf: undefined }).toEqual(undated);
+    expect(dated).toMatchObject({ count: 631, page_count: 2 });
+  });
+
+  it('reuses the date for a later text search, sending no second probe', async () => {
+    route(async () => mockResponse(PROBE_ANSWER));
+    const svc = service();
+
+    await svc.searchProducts(TEXT, createMockContext());
+    const later = served(
+      await svc.searchProducts({ query: 'hummus', page: 1, page_size: 2 }, createMockContext()),
+    );
+
+    expect(later.textIndexAsOf).toBe(INDEX_AS_OF);
+    expect(probes).toHaveLength(1);
+  });
+
+  it('serves the search undated 3 s after the probe started when it has not answered, aborting it', async () => {
+    route(unanswered);
+    const call = track(service().searchProducts(TEXT, createMockContext()));
+
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(call.settled).toBe(false);
+    expect(probes[0]?.signal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(call).toMatchObject({ settled: true, afterMs: 3_000 });
+    expect(call.value).toMatchObject({ status: 'served', count: 631 });
+    expect(call.value).not.toHaveProperty('textIndexAsOf');
+    expect(probes[0]?.signal?.aborted).toBe(true);
+  });
+
+  it('shares one probe between concurrent text searches; one cancelling leaves it running for the other', async () => {
+    let answer: (response: Response) => void = () => undefined;
+    route(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const svc = service();
+    const owner = track(svc.searchProducts(TEXT, createMockContext()));
+    const controller = new AbortController();
+    const joiner = track(
+      svc.searchProducts(TEXT, createMockContext({ signal: controller.signal })),
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(probes).toHaveLength(1);
+    expect([owner.settled, joiner.settled]).toEqual([false, false]);
+
+    const cancelled = new DOMException('The joining caller went away.', 'AbortError');
+    controller.abort(cancelled);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(joiner).toMatchObject({ settled: true, afterMs: 100 });
+    expect(joiner.error).toBe(cancelled);
+    expect(probes[0]?.signal?.aborted).toBe(false);
+    expect(owner.settled).toBe(false);
+
+    answer(mockResponse(PROBE_ANSWER));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(owner.value).toMatchObject({ status: 'served', textIndexAsOf: INDEX_AS_OF });
+    expect(probes).toHaveLength(1);
+  });
+
+  it('ends a text search whose own request fails at once, never waiting on the probe', async () => {
+    route(unanswered, async () => mockResponse({ detail: 'Bad request' }, 400));
+    const call = track(service().searchProducts(TEXT, createMockContext()));
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(call).toMatchObject({ settled: true, afterMs: 0 });
+    expect((call.error as McpErrorish).data?.reason).toBe('upstream_rejected');
+    expect(probes).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+  });
+
+  it('ends a cancelled text search at once, leaving the probe to run on its own timer', async () => {
+    route(unanswered, unanswered);
+    const controller = new AbortController();
+    const call = track(
+      service().searchProducts(TEXT, createMockContext({ signal: controller.signal })),
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    controller.abort(new DOMException('The caller went away.', 'AbortError'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(call).toMatchObject({ settled: true, afterMs: 100 });
+    expect((call.error as McpErrorish).code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(probes[0]?.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_900);
+    expect(probes[0]?.signal?.aborted).toBe(true);
+  });
+
+  it.each<[string, Answer]>([
+    ['a 5xx', async () => mockResponse({ detail: 'Service unavailable' }, 503)],
+    [
+      'an HTML page',
+      async () =>
+        new Response('<!DOCTYPE html><html><body>Down for maintenance</body></html>', {
+          headers: { 'content-type': 'text/html' },
+        }),
+    ],
+    ['a 422', async () => mockResponse({ detail: [{ type: 'value_error', msg: 'Bad' }] }, 422)],
+    ['a timeout', unanswered],
+    ['an answer flagged timed_out', async () => mockResponse({ ...PROBE_ANSWER, timed_out: true })],
+    ['no hit', async () => mockResponse({ ...PROBE_ANSWER, hits: [], count: 0 })],
+    [
+      'a non-numeric last_modified_t',
+      async () => mockResponse({ ...PROBE_ANSWER, hits: [{ last_modified_t: '1734496021' }] }),
+    ],
+  ])('leaves the date off after %s, then sends no probe for 15 minutes', async (_shape, probe) => {
+    route(probe);
+    const svc = service();
+    const startedAt = Date.now();
+    const first = track(svc.searchProducts(TEXT, createMockContext()));
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    expect(first.value).toMatchObject({ status: 'served', count: 631, page_count: 2 });
+    expect(first.value).not.toHaveProperty('textIndexAsOf');
+    expect(probes).toHaveLength(1);
+
+    // The search settles as the probe does, so its settling time is when the probe failed.
+    const failedAt = startedAt + (first.afterMs ?? 0);
+    await vi.advanceTimersByTimeAsync(failedAt + FIFTEEN_MINUTES_MS - 1 - Date.now());
+    const during = served(await svc.searchProducts(TEXT, createMockContext()));
+    expect(during).not.toHaveProperty('textIndexAsOf');
+    expect(probes).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const after = track(svc.searchProducts(TEXT, createMockContext()));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(after.value).toMatchObject({ status: 'served' });
+    expect(probes).toHaveLength(2);
+  });
+
+  it('reuses a date for 6 hours, then probes again and reports what the index now holds', async () => {
+    const newer = { ...PROBE_ANSWER, hits: [{ last_modified_t: 1734496021 + 86_400 }] };
+    route(async () => mockResponse(probes.length === 1 ? PROBE_ANSWER : newer));
+    const svc = service();
+
+    await svc.searchProducts(TEXT, createMockContext());
+    await vi.advanceTimersByTimeAsync(SIX_HOURS_MS - 1);
+    const cached = served(await svc.searchProducts(TEXT, createMockContext()));
+    expect(cached.textIndexAsOf).toBe(INDEX_AS_OF);
+    expect(probes).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const reread = served(await svc.searchProducts(TEXT, createMockContext()));
+    expect(probes).toHaveLength(2);
+    expect(reread.textIndexAsOf).toBe('2024-12-19T04:27:01.000Z');
+  });
+
+  it('probes only while two search slots are free beside the search, never taking the last one', async () => {
+    route(async () => mockResponse(PROBE_ANSWER));
+    const svc = service(3);
+    const ctx = createMockContext();
+
+    // A tag search takes one of three slots; the text search takes a second, leaving one free.
+    await svc.searchProducts({ categories_tag: 'en:spreads', page: 1, page_size: 2 }, ctx);
+    const crowded = served(await svc.searchProducts(TEXT, ctx));
+    expect(crowded).not.toHaveProperty('textIndexAsOf');
+    expect(probes).toHaveLength(0);
+    // That last slot is still there for the next caller.
+    served(await svc.searchProducts(TEXT, ctx));
+
+    // Once the window has passed, a text search leaves two free, so it sends the probe.
+    await vi.advanceTimersByTimeAsync(60_001);
+    const roomy = served(await svc.searchProducts(TEXT, ctx));
+    expect(probes).toHaveLength(1);
+    expect(roomy.textIndexAsOf).toBe(INDEX_AS_OF);
+    // The probe left the last slot too.
+    served(await svc.searchProducts(TEXT, ctx));
+  });
+
+  it('asks for the date on a search’s first attempt only, so a retry never starts a probe', async () => {
+    let searches = 0;
+    route(
+      async () => mockResponse(PROBE_ANSWER),
+      async () => {
+        searches += 1;
+        return searches === 1
+          ? mockResponse({ detail: 'Service unavailable' }, 503)
+          : mockResponse(TEXT_SEARCH_HITS);
+      },
+    );
+    const svc = service(5);
+    const ctx = createMockContext();
+    const tagOnly: ProductSearch = { categories_tag: 'en:spreads', page: 1, page_size: 2 };
+
+    // Two slots taken at 0 s and one at 59 s: the text search's first attempt leaves one free.
+    await svc.searchProducts(tagOnly, ctx);
+    await svc.searchProducts(tagOnly, ctx);
+    await vi.advanceTimersByTimeAsync(59_000);
+    await svc.searchProducts(tagOnly, ctx);
+    await vi.advanceTimersByTimeAsync(500);
+    const call = track(svc.searchProducts(TEXT, ctx));
+    // Its retry lands past the minute, with the first two slots gone and two free beside it.
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(searches).toBe(2);
+    expect(call.value).toMatchObject({ status: 'served', count: 631 });
+    expect(call.value).not.toHaveProperty('textIndexAsOf');
+    expect(probes).toHaveLength(0);
+  });
+
+  it('sends no probe on a tag-only search, which carries no date', async () => {
+    route(async () => mockResponse(PROBE_ANSWER));
+
+    const result = served(
+      await service().searchProducts(
+        { categories_tag: 'en:spreads', page: 1, page_size: 2 },
+        createMockContext(),
+      ),
+    );
+
+    expect(result.source).toBe('off_api');
+    expect(result).not.toHaveProperty('textIndexAsOf');
+    expect(probes).toHaveLength(0);
+  });
+
+  describe('through off_search_products', () => {
+    beforeEach(() => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+    });
+
+    /** Every text block of a contract result, joined. */
+    function contentText(result: { content?: { type: string; text?: string }[] }): string {
+      return (result.content ?? []).map((block) => block.text ?? '').join('\n');
+    }
+
+    it('carries the same ISO time in text_index_as_of, the dated disclosure, and content[]', async () => {
+      route(async () => mockResponse(PROBE_ANSWER));
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'nutella' });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.text_index_as_of).toBe(INDEX_AS_OF);
+      const datedNote = `These results come from the text-search index, whose newest record is dated ${INDEX_AS_OF}, so a product contributed since is missing from them and one edited since is matched and shown as it was then. `;
+      expect(String(structured.text_index_snapshot).slice(0, datedNote.length)).toBe(datedNote);
+      const text = contentText(result);
+      expect(text).toContain(`**Text index as of:** ${INDEX_AS_OF}`);
+      expect(text).toContain(`whose newest record is dated ${INDEX_AS_OF}`);
+    });
+
+    it('leaves text_index_as_of off and the disclosure undated when the probe fails', async () => {
+      route(async () => mockResponse({ detail: 'Service unavailable' }, 503));
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'nutella' });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).not.toHaveProperty('text_index_as_of');
+      expect(String(structured.text_index_snapshot)).toMatch(
+        /^These results come from the text-search index, a snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them\. /,
+      );
+      expect(contentText(result)).not.toContain('Text index as of');
+    });
+
+    it('sends no probe and carries neither field on a tag-only search', async () => {
+      route(async () => mockResponse(PROBE_ANSWER));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:spreads',
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).not.toHaveProperty('text_index_as_of');
+      expect(structured).not.toHaveProperty('text_index_snapshot');
+      expect(contentText(result)).not.toContain('Text index as of');
+      expect(probes).toHaveLength(0);
     });
   });
 });

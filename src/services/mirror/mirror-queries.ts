@@ -1,5 +1,6 @@
 /**
- * @fileoverview The mirror's read queries — barcode lookup and tag-only search — over the store
+ * @fileoverview The mirror's read queries — barcode lookup, tag-only search, and whether a tag is
+ * held — over the store
  * `mirror-store.ts` defines. The one module that turns caller values into the store's keys and SQL:
  * a barcode through `normalizeCodeZeroes`, a tag filter through `toStoredTag` and `mirrorTagKey`.
  *
@@ -34,7 +35,7 @@ import {
 /** What the queries read the store through: `getMirrorStore()` satisfies it. */
 type MirrorReader = Pick<MirrorStore, 'raw'>;
 
-/** A stored product: the projected v2 JSON the record builder wrote. */
+/** A stored product: the projected v2 JSON the record builder wrote, dated from its row as read. */
 export type MirrorDoc = MirrorRecord['doc'];
 
 /** A tag facet the store indexes, named as `MIRROR_TAG_FACETS` names it. */
@@ -94,19 +95,40 @@ export interface MirrorTagSearch {
 
 /** One page of a tag-only search. */
 export interface MirrorTagPage {
-  /** The page's products, in sort order; empty on a page past the last. */
+  /** The page's products, each dated from its row (`datedDoc`), in sort order; empty on a page past the last. */
   docs: MirrorDoc[];
   /** Every product the filters match, exact. */
   total: number;
 }
 
 /**
- * A product row as a barcode lookup reads it: its doc, and the `MIRROR_RECORD_VERSION` the row was
- * built with, which a reload in progress leaves older on the rows it has not yet rewritten.
+ * A product row as a barcode lookup reads it: its doc, dated from the row (`datedDoc`), and the
+ * `MIRROR_RECORD_VERSION` the row was built with, which a reload in progress leaves older on the
+ * rows it has not yet rewritten.
  */
 export interface StoredProduct {
   doc: MirrorDoc;
   recordVersion: number;
+}
+
+/** A product row's document and date columns, as both reads select them. */
+interface DatedRow {
+  created_t: number | null;
+  doc: string;
+  last_modified_t: number | null;
+}
+
+/**
+ * A stored product as a v2 read returns it: the doc the record builder projected, plus `created_t`
+ * and `last_modified_t` from the row's columns, each where it holds a number. The doc never stores
+ * the dates, and every row has carried both columns since the store's first version, so a row of
+ * any record version is dated alike.
+ */
+function datedDoc(row: DatedRow): MirrorDoc {
+  const doc: MirrorDoc = JSON.parse(row.doc);
+  if (row.created_t !== null) doc.created_t = row.created_t;
+  if (row.last_modified_t !== null) doc.last_modified_t = row.last_modified_t;
+  return doc;
 }
 
 /**
@@ -123,13 +145,13 @@ export async function getByCodes(
   const keys = new Map(codes.map((code) => [code, normalizeCodeZeroes(code)]));
   const stored = new Map(
     handle
-      .prepare<{ code: string; doc: string; record_version: number }>(
-        'SELECT code, doc, record_version FROM products WHERE code IN (SELECT value FROM json_each(?))',
+      .prepare<DatedRow & { code: string; record_version: number }>(
+        'SELECT code, doc, record_version, created_t, last_modified_t FROM products WHERE code IN (SELECT value FROM json_each(?))',
       )
       .all(JSON.stringify([...new Set(keys.values())]))
       .map((row): [string, StoredProduct] => [
         row.code,
-        { doc: JSON.parse(row.doc), recordVersion: row.record_version },
+        { doc: datedDoc(row), recordVersion: row.record_version },
       ]),
   );
   const found = new Map<string, StoredProduct>();
@@ -217,12 +239,12 @@ export async function searchByTags(
           };
 
     /**
-     * The page is cut over sort keys alone, then joined to its documents: a document read inside
-     * the cut would be read for every product the cut passes over, not only the page's.
+     * The page is cut over sort keys alone, then joined to its documents and dates: a document
+     * read inside the cut would be read for every product the cut passes over, not only the page's.
      */
     const docs = handle
-      .prepare<{ doc: string }>(
-        `SELECT p.doc FROM (
+      .prepare<DatedRow>(
+        `SELECT p.doc, p.created_t, p.last_modified_t FROM (
            SELECT w.rowid AS rid, w.${column} AS sort_key, w.code AS code
            FROM ${cut.from}${whereOf(cut.clauses)}
            ORDER BY ${reverse ? `w.${column} ASC NULLS FIRST, w.code DESC` : `w.${column} DESC NULLS LAST, w.code`}
@@ -236,7 +258,7 @@ export async function searchByTags(
         reverse ? Math.min(search.pageSize, total - offset) : search.pageSize,
         reverse ? Math.max(0, total - offset - search.pageSize) : offset,
       )
-      .map((row): MirrorDoc => JSON.parse(row.doc));
+      .map(datedDoc);
     return { total, docs };
   });
 }
@@ -488,4 +510,23 @@ function postingCount(handle: SqliteHandle, tagId: number): number {
 /** Runs a `SELECT COUNT(*) AS n …`, which yields exactly one row. */
 function countOf(handle: SqliteHandle, sql: string, params: readonly SqlValue[]): number {
   return handle.prepare<{ n: number }>(sql).get(...params)?.n ?? 0;
+}
+
+/**
+ * The first of `values` (canonical, as `MirrorTagFilter.value` is) some stored product carries under
+ * `facet`, or `undefined` when none is: per value tried, one `tags` seek and one posting seek. A
+ * `tags` row is not enough, since the ingester keeps the row of a tag whose last product has left.
+ */
+export async function firstHeldTag(
+  store: MirrorReader,
+  facet: MirrorTagFacet,
+  values: readonly string[],
+): Promise<string | undefined> {
+  const handle = await store.raw();
+  const held = handle.prepare<{ held: number }>(
+    'SELECT EXISTS (SELECT 1 FROM product_tags WHERE tag_id = (SELECT id FROM tags WHERE key = ?)) AS held',
+  );
+  return values.find(
+    (value) => held.get(mirrorTagKey(facet, toStoredTag(facet, value)))?.held === 1,
+  );
 }

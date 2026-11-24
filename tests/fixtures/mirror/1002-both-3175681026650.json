@@ -2,8 +2,8 @@
   "schema": "1002",
   "shape": "both",
   "code": "3175681026650",
-  "capturedAt": "2026-11-08T17:00:46.181Z",
-  "request": "/api/v2/product/3175681026650.json?fields=product_name,generic_name,brands,quantity,ingredients_text,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nova_group,ecoscore_grade,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,completeness,data_quality_tags,code,last_modified_t",
+  "capturedAt": "2026-11-24T07:45:51.000Z",
+  "request": "/api/v2/product/3175681026650.json?fields=product_name,generic_name,brands,quantity,lang,ingredients_text,ingredients_text_languages,ingredients,allergens_tags,traces_tags,additives_tags,ingredients_analysis_tags,nutriscore_grade,nutriscore_score,nova_group,ecoscore_grade,ecoscore_score,nutrient_levels,nutriments,serving_size,serving_quantity,serving_quantity_unit,categories_tags,labels_tags,packaging_tags,origins_tags,countries_tags,image_url,image_ingredients_url,image_nutrition_url,completeness,data_quality_tags,code,last_modified_t,created_t",
   "lineSource": "openfoodfacts-products.jsonl.gz (ETag ad2fd53245eaf2e7428201ea1b72132a-797, Last-Modified 2026-11-01T05:24:25Z)",
   "line": {
     "_id": "3175681026650",
@@ -1808,6 +1808,7 @@
       "code": "3175681026650",
       "completeness": 0.5875,
       "countries_tags": [],
+      "created_t": 1498306372,
       "data_quality_tags": [
         "en:no-packaging-data",
         "en:ingredients-percent-analysis-ok",
@@ -1824,6 +1825,8 @@
       "ecoscore_grade": "unknown",
       "ecoscore_tags": ["unknown"],
       "generic_name": "",
+      "image_ingredients_url": "https://images.openfoodfacts.org/images/products/317/568/102/6650/ingredients_fr.13.400.jpg",
+      "image_nutrition_url": "https://images.openfoodfacts.org/images/products/317/568/102/6650/nutrition_fr.14.400.jpg",
       "image_url": "https://images.openfoodfacts.org/images/products/317/568/102/6650/front_fr.28.400.jpg",
       "ingredients": [
         {
@@ -2196,7 +2199,11 @@
         "en:vegetarian-status-unknown"
       ],
       "ingredients_text": "Chocolat noir de couverture 18 % (pâte de cacao, sucre, beurre de cacao, matière grasse de lait, émulsifiant : lécithines de soja, arôme naturel de vanille), Protéines de soja (lécithines de soja), Gluten de blé, Polydextrose, Stabilisant: sorbitols, Edulcorant : maltitols Protéines de lait, Dextrine de blé, Blanc d'œuf en poudre, Lactosérum en poudre, Stabilisant : glycérol d'origine végétale, Huile de colza, Arôme naturel de cacao, Cacao maigre en poudre (émulsifiant: lécithines de soja), Minéraux (magnésium, fer), Emulsifiant : lécithines de colza, Vitamines (C, E (lactose, protéines de lait), B6, B1), édulcorant: acésulfame-k.",
+      "ingredients_text_languages": {
+        "fr": "Chocolat noir de couverture 18 % (pâte de cacao, sucre, beurre de cacao, matière grasse de lait, émulsifiant : lécithines de soja, arôme naturel de vanille), Protéines de soja (lécithines de soja), Gluten de blé, Polydextrose, Stabilisant: sorbitols, Edulcorant : maltitols Protéines de lait, Dextrine de blé, Blanc d'œuf en poudre, Lactosérum en poudre, Stabilisant : glycérol d'origine végétale, Huile de colza, Arôme naturel de cacao, Cacao maigre en poudre (émulsifiant: lécithines de soja), Minéraux (magnésium, fer), Emulsifiant : lécithines de colza, Vitamines (C, E (lactose, protéines de lait), B6, B1), édulcorant: acésulfame-k."
+      },
       "labels_tags": ["en:source-of-proteins", "en:high-proteins"],
+      "lang": "fr",
       "last_modified_t": 1563289435,
       "nova_group": 4,
       "nutrient_levels": {},

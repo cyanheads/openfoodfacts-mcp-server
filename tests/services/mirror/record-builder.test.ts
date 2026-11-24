@@ -3,15 +3,21 @@
  * `tests/fixtures/mirror/` holds one export line and the live `GET /api/v2/product` read of the same
  * barcode (plus the live API v3.5 `nutrition.input_sets` read when that v2 read is prepared-only).
  * `off_get_product` and `off_compare_products` run twice against a URL-keyed fetch stub, once served
- * the built `doc` and once the live read, and must answer the same on both surfaces; the accepted
- * divergences of pre-1004 records are reconciled by named assertions first. Unit cases pin the
- * record key, the tag index, the serving re-parse, and the tag-value mapping the query layer uses.
+ * the doc a mirror read returns for the built record (written to a store and read back by
+ * `getByCodes`, dates included) and once the live read, and must answer the same on both surfaces;
+ * the accepted divergences of pre-1004 records are reconciled by named assertions first. Unit cases
+ * pin the record key, the tag index, the projections of single fields, the serving re-parse, and
+ * the tag-value mapping the query layer uses.
  * @module tests/services/mirror/record-builder.test
  */
 
 import { readdirSync, readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { MirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn(() => ({
@@ -25,6 +31,8 @@ vi.mock('@/config/server-config.js', () => ({
 import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import type { MirrorBuilder } from '@/services/mirror/mirror-ingester.js';
+import { getByCodes } from '@/services/mirror/mirror-queries.js';
+import { openMirrorStore } from '@/services/mirror/mirror-store.js';
 import * as recordBuilder from '@/services/mirror/record-builder.js';
 import {
   buildMirrorRecord,
@@ -106,15 +114,21 @@ const TAXONOMY_TAG_FIELDS = [
   'countries_tags',
 ] as const;
 
-/** The fields a v2 search row carries (`SEARCH_FIELDS` in `openfoodfacts-service.ts`). */
+/**
+ * The fields a v2 search row carries from the stored doc: `SEARCH_FIELDS` in
+ * `openfoodfacts-service.ts` less `last_modified_t` and `created_t`, which a mirror row takes from
+ * its product row's columns, never the doc.
+ */
 const SEARCH_ROW_FIELDS = [
   'code',
   'product_name',
   'brands',
+  'quantity',
   'nutriscore_grade',
   'nova_group',
   'ecoscore_grade',
   'categories_tags',
+  'completeness',
 ] as const;
 
 function strings(value: unknown): string[] {
@@ -154,13 +168,38 @@ function tagGaps(doc: Json, live: Json) {
   });
 }
 
-/** The divergences a pre-1004 fixture shows, for its test title. */
+/**
+ * Fixtures whose live read stopped deriving from their export line, and the fields where it did.
+ * Each listed field is served its live value and skips the stored ⊆ live tag check; every other
+ * field of the fixture, and every other fixture, is held to the same parity as before.
+ *
+ * `0070177248499`: its export line and `last_modified_t` (1774628911) are the same in the line and
+ * in the 2026-11-08 and 2026-11-24 captures, yet the 11-24 read files it under
+ * `en:teas-in-tea-bags` and `en:green-or-white-teas` where the line stores `en:tea-bags`, returns
+ * two of its three ingredients under unrecognized ids with new percent estimates (81 / 17.5 / 1.5
+ * for 82 / 17 / 1), and drops `en:ingredients-percent-analysis-ok`.
+ */
+const LIVE_DRIFT: ReadonlyMap<string, { fields: readonly string[]; why: string }> = new Map([
+  [
+    '0070177248499',
+    {
+      fields: ['categories_tags', 'ingredients', 'data_quality_tags'],
+      why: 'Open Food Facts changed them after the export without moving last_modified_t',
+    },
+  ],
+]);
+
+/** The divergences a fixture shows, for its test title. */
 function divergenceNote(f: MirrorFixture): string {
-  if (!isPre1004(f)) return 'unloosened';
+  const drift = LIVE_DRIFT.get(f.code);
+  const notes = drift ? [`live ${drift.fields.join(', ')} served: ${drift.why}`] : [];
+  if (!isPre1004(f)) return notes.length > 0 ? notes.join('; ') : 'unloosened';
   const doc = record(f.line).doc;
-  const notes = tagGaps(doc, f.live.product)
-    .filter((gap) => gap.liveOnly.length > 0)
-    .map((gap) => `live adds ${gap.field} ${gap.liveOnly.join(', ')}`);
+  notes.push(
+    ...tagGaps(doc, f.live.product)
+      .filter((gap) => gap.liveOnly.length > 0 && !drift?.fields.includes(gap.field))
+      .map((gap) => `live adds ${gap.field} ${gap.liveOnly.join(', ')}`),
+  );
   if (doc.brands !== f.live.product.brands) {
     notes.push(`live shows brands "${String(f.live.product.brands)}" for "${String(doc.brands)}"`);
   }
@@ -168,26 +207,30 @@ function divergenceNote(f: MirrorFixture): string {
 }
 
 /**
- * The doc a tool run is served: for a pre-1004 fixture, after asserting the accepted divergences
- * (stored tags ⊆ live, the same brands up to case), with the live values in their place; a 1004
- * fixture's doc as built.
+ * The doc a tool run is served, from the built `doc` by default: its `LIVE_DRIFT` fields replaced
+ * by the live ones; for a pre-1004 fixture, after asserting the accepted divergences (stored tags ⊆
+ * live, the same brands up to case), with the live values in their place.
  */
-function reconciledDoc(f: MirrorFixture): Json {
-  const doc = record(f.line).doc;
-  if (!isPre1004(f)) return doc;
+function reconciledDoc(f: MirrorFixture, doc: Json = record(f.line).doc): Json {
   const live = f.live.product;
+  const drift = LIVE_DRIFT.get(f.code)?.fields ?? [];
+  const served: Json = Object.fromEntries(
+    Object.entries(doc).filter(([field]) => !drift.includes(field)),
+  );
+  for (const field of drift) if (field in live) served[field] = live[field];
+  if (!isPre1004(f)) return served;
   for (const gap of tagGaps(doc, live)) {
+    if (drift.includes(gap.field)) continue;
     expect(gap.docOnly, `${gap.field}: stored tags the live read lacks`).toEqual([]);
     expect(gap.docHas, `${gap.field}: present on one side only`).toBe(gap.liveHas);
   }
   expect(String(doc.brands ?? '').toLowerCase(), 'brands up to case').toBe(
     String(live.brands ?? '').toLowerCase(),
   );
-  const out: Json = { ...doc };
   for (const field of [...TAXONOMY_TAG_FIELDS, 'brands'] as const) {
-    if (field in live) out[field] = live[field];
+    if (field in live) served[field] = live[field];
   }
-  return out;
+  return served;
 }
 
 /* --- Upstream stub --------------------------------------------------------------------------- */
@@ -235,13 +278,55 @@ function stubUpstream(bodies: ReadonlyMap<string, Upstream>) {
   return { requests, unexpected };
 }
 
-/** Each fixture served from its built doc, keyed by the record's own primary key. */
-function docBodies(fixtures: readonly MirrorFixture[]): Map<string, Upstream> {
+let fixtureStoreDir: string;
+let fixtureStore: MirrorStore;
+
+/**
+ * Writes every fixture's built record to a fresh store as a sync page does, so the doc side of a
+ * run is what a mirror read serves: the doc `getByCodes` parses from the row, with `created_t` and
+ * `last_modified_t` merged from the row's columns. Tag ids are left empty: a barcode lookup reads none.
+ */
+async function openFixtureStore(): Promise<void> {
+  fixtureStoreDir = await mkdtemp(join(tmpdir(), 'off-record-builder-'));
+  fixtureStore = openMirrorStore(join(fixtureStoreDir, 'store.sqlite'));
+  await fixtureStore.applyBatch(
+    FIXTURES.map((f) => {
+      const built = record(f.line);
+      return {
+        code: built.code,
+        popularity_key: built.popularityKey,
+        unique_scans_n: built.uniqueScansN,
+        created_t: built.createdT,
+        last_modified_t: built.lastModifiedT,
+        generation: 1,
+        record_version: MIRROR_RECORD_VERSION,
+        tag_ids: '[]',
+        doc: JSON.stringify(built.doc),
+      };
+    }),
+    [],
+  );
+}
+
+async function closeFixtureStore(): Promise<void> {
+  await fixtureStore.close();
+  await rm(fixtureStoreDir, { recursive: true, force: true });
+}
+
+/** Each fixture served from the doc a mirror read returns for it, keyed by the record's own primary key. */
+async function docBodies(fixtures: readonly MirrorFixture[]): Promise<Map<string, Upstream>> {
+  const stored = await getByCodes(
+    fixtureStore,
+    fixtures.map((f) => record(f.line).code),
+  );
   return new Map(
     fixtures.map((f) => {
-      const doc = reconciledDoc(f);
+      const { code } = record(f.line);
+      const read = stored.get(code);
+      if (!read) throw new Error(`The fixture store holds no row for ${code}.`);
+      const doc = reconciledDoc(f, read.doc);
       return [
-        record(f.line).code,
+        code,
         {
           v2: { status: 1, product: doc },
           v35: {
@@ -316,6 +401,9 @@ describe('buildMirrorRecord against live v2 reads', () => {
    */
   const NOT_IN_CORPUS = ['1001×both', '1001×prepared_only', '1002×prepared_only'];
 
+  beforeAll(openFixtureStore);
+  afterAll(closeFixtureStore);
+
   it('covers every schema × nutrition shape bucket except the three absent from the export sample', () => {
     const present = new Set(FIXTURES.map((f) => `${f.schema}×${f.shape}`));
     const missing = ['le1000', '1001', '1002', '1003', '1004'].flatMap((schema) =>
@@ -331,7 +419,7 @@ describe('buildMirrorRecord against live v2 reads', () => {
     '%s',
     (_, f) => {
       it(`off_get_product answers as live (${divergenceNote(f)})`, async () => {
-        const docRun = await getProduct(f.code, docBodies([f]));
+        const docRun = await getProduct(f.code, await docBodies([f]));
         const liveRun = await getProduct(f.code, liveBodies([f]));
         expectSameAnswer(docRun, liveRun);
         expect(Object.keys(structured(liveRun).product as Json).length).toBeGreaterThan(0);
@@ -369,7 +457,7 @@ describe('buildMirrorRecord against live v2 reads', () => {
     'off_compare_products answers as live, batch %i',
     async (_, chunk) => {
       const barcodes = chunk.map((f) => f.code);
-      const docRun = await compareProducts(barcodes, docBodies(chunk));
+      const docRun = await compareProducts(barcodes, await docBodies(chunk));
       const liveRun = await compareProducts(barcodes, liveBodies(chunk));
       expectSameAnswer(docRun, liveRun);
       expect(structured(liveRun).products).toHaveLength(chunk.length);
@@ -397,7 +485,7 @@ describe('buildMirrorRecord against live v2 reads', () => {
     expect(selection.status).toBe('read');
     expect(selection).toEqual(selectAsSoldSet(live));
 
-    const docRun = await getProduct(f.code, docBodies([f]));
+    const docRun = await getProduct(f.code, await docBodies([f]));
     const { nutriments } = structured(docRun).product as { nutriments: Json };
     expect(nutriments.stored_as_sold).toEqual({ status: 'read' });
     expect(nutriments.energy_kcal_100g).toEqual(expect.any(Number));
@@ -408,7 +496,7 @@ describe('buildMirrorRecord against live v2 reads', () => {
     expect(f.live.product.code).toBe('0030000010402');
     expect(record(f.line).code).toBe('0030000010402');
 
-    const docRun = await getProduct('030000010402', docBodies([f]));
+    const docRun = await getProduct('030000010402', await docBodies([f]));
     const liveRun = await getProduct('030000010402', liveBodies([f]));
     expectSameAnswer(docRun, liveRun);
     expect(docRun.requests).toEqual(['/api/v2/product/030000010402.json']);
@@ -460,7 +548,8 @@ describe('buildMirrorRecord', () => {
     expect(buildMirrorRecord(line)).toBeNull();
   });
 
-  it('builds a sparse line holding only a code into a doc holding only the code', () => {
+  it('builds a sparse line holding only a code into a doc holding the code and the read’s defaults', () => {
+    // normalize_product_data defaults the main language to en; a <field>_languages read is always an object.
     expect(buildMirrorRecord({ code: '3017620422003' })).toEqual({
       code: '3017620422003',
       popularityKey: null,
@@ -468,7 +557,7 @@ describe('buildMirrorRecord', () => {
       createdT: null,
       lastModifiedT: null,
       tags: [],
-      doc: { code: '3017620422003' },
+      doc: { code: '3017620422003', ingredients_text_languages: {}, lang: 'en' },
     });
   });
 
@@ -650,14 +739,6 @@ describe('generic_name and nutrient_levels (#87)', () => {
     );
   });
 
-  it('builds at record version 2, the version that added both fields, through the seam the sync reads', () => {
-    // The sync reloads a store whose last load is older than the builder it is handed
-    // (mirror-sync.test.ts); the production builder is this module, at 2 since #87.
-    const builder: MirrorBuilder = recordBuilder;
-    expect(builder.MIRROR_RECORD_VERSION).toBe(2);
-    expect(MIRROR_RECORD_VERSION).toBe(2);
-  });
-
   it.each<[string, number, string[], string[]]>([
     ['no field', 1, [], []],
     ['the fields off_compare_products reads', 1, ['product_name', 'brands', 'nutriments'], []],
@@ -676,14 +757,237 @@ describe('generic_name and nutrient_levels (#87)', () => {
   });
 });
 
+describe('main language, ingredient texts, label photos, and score points (#91, #93)', () => {
+  const CODE = '3017620422003';
+  const IMAGES = 'https://images.openfoodfacts.org/images/products/301/762/042/2003';
+  const doc = (fields: Json) => record({ code: CODE, schema_version: 1004, ...fields }).doc;
+
+  it('builds at record version 3, the version that added the six fields, through the seam the sync reads', () => {
+    // The sync reloads a store whose last load is older than the builder it is handed
+    // (mirror-sync.test.ts); the production builder is this module, at 3 since #91 and #93.
+    const builder: MirrorBuilder = recordBuilder;
+    expect(builder.MIRROR_RECORD_VERSION).toBe(3);
+    expect(MIRROR_RECORD_VERSION).toBe(3);
+  });
+
+  it.each<[string, Json, string]>([
+    ['lc over lang', { lc: 'fr', lang: 'de' }, 'fr'],
+    ['lang when lc is empty', { lc: '', lang: 'de' }, 'de'],
+    ['lang when no lc is stored', { lang: 'de' }, 'de'],
+    ['en when neither is stored', {}, 'en'],
+  ])('settles lang as normalize_product_data does: %s', (_label, fields, lang) => {
+    expect(doc(fields).lang).toBe(lang);
+  });
+
+  it('maps every listed language’s ingredients text, empty ones included, in key order', () => {
+    const { ingredients_text_languages: map } = doc({
+      lc: 'en',
+      languages_codes: { fr: 6, en: 2, ro: 0, ch: 0, de: 3 },
+      ingredients_text: 'sugar, palm oil',
+      ingredients_text_en: 'sugar, palm oil',
+      ingredients_text_fr: 'Sucre, huile de palme, NOISETTES 13%',
+      ingredients_text_ch: '',
+      ingredients_text_ro: null,
+      ingredients_text_it: 'Zucchero, olio di palma',
+    });
+    // de is listed with no text; ro's is undef; it has text but is not listed.
+    expect(map).toEqual({
+      ch: '',
+      en: 'sugar, palm oil',
+      fr: 'Sucre, huile de palme, NOISETTES 13%',
+    });
+    expect(Object.keys(map as Json)).toEqual(['ch', 'en', 'fr']);
+  });
+
+  it('maps no language when the record lists none', () => {
+    const built = doc({ ingredients_text: 'Sucre', ingredients_text_fr: 'Sucre' });
+    expect(built.ingredients_text_languages).toEqual({});
+  });
+
+  it('keeps a stored __proto__ language code as an own key of the map', () => {
+    const line = JSON.parse(
+      `{"code":"${CODE}","schema_version":1004,"languages_codes":{"__proto__":1},"ingredients_text___proto__":"x"}`,
+    );
+    const map = record(line).doc.ingredients_text_languages as Json;
+    expect(Object.hasOwn(map, '__proto__')).toBe(true);
+    expect(Object.getPrototypeOf(map)).toBe(Object.prototype);
+    expect(JSON.stringify(map)).toBe('{"__proto__":"x"}');
+  });
+
+  it.each<[string, Json, string | undefined]>([
+    [
+      'the English image over the product language’s',
+      { lc: 'fr', images: { selected: { ingredients: { fr: { rev: '4' }, en: { rev: '7' } } } } },
+      'ingredients_en.7.400.jpg',
+    ],
+    [
+      'the product language’s when no English one is selected',
+      { lc: 'fr', images: { selected: { ingredients: { fr: { rev: '4' }, de: { rev: '2' } } } } },
+      'ingredients_fr.4.400.jpg',
+    ],
+    [
+      'the first language in alphabetical order when neither is',
+      { lc: 'fr', images: { selected: { ingredients: { it: { rev: '3' }, de: { rev: '2' } } } } },
+      'ingredients_de.2.400.jpg',
+    ],
+    [
+      'nothing for the chosen language’s image without a rev, rather than another language',
+      { lc: 'en', images: { selected: { ingredients: { en: { imgid: '3' }, fr: { rev: '4' } } } } },
+      undefined,
+    ],
+    [
+      'nothing when only other image types are selected',
+      { lc: 'en', images: { selected: { front: { en: { rev: '2' } } } } },
+      undefined,
+    ],
+    [
+      'a schema 1001 record’s legacy ingredients_<lc> key',
+      {
+        schema_version: 1001,
+        lc: 'fr',
+        images: { front_en: { rev: '2' }, ingredients_fr: { rev: '6' } },
+      },
+      'ingredients_fr.6.400.jpg',
+    ],
+  ])('builds image_ingredients_url as image_url is built: %s', (_label, fields, file) => {
+    const built = doc(fields);
+    expect('image_ingredients_url' in built).toBe(file !== undefined);
+    expect(built.image_ingredients_url).toBe(file && `${IMAGES}/${file}`);
+  });
+
+  it('reads each photo from its own selection, on a current record and a schema 1001 one', () => {
+    const selected = {
+      front: { en: { rev: '2' } },
+      ingredients: { en: { rev: '5' } },
+      nutrition: { en: { rev: '9' } },
+    };
+    const legacy = {
+      front_en: { rev: '2' },
+      ingredients_en: { rev: '5' },
+      nutrition_en: { rev: '9' },
+    };
+    const expected = {
+      image_url: `${IMAGES}/front_en.2.400.jpg`,
+      image_ingredients_url: `${IMAGES}/ingredients_en.5.400.jpg`,
+      image_nutrition_url: `${IMAGES}/nutrition_en.9.400.jpg`,
+    };
+    expect(doc({ lc: 'en', images: { selected } })).toMatchObject(expected);
+    expect(doc({ schema_version: 1001, lc: 'en', images: legacy })).toMatchObject(expected);
+  });
+
+  it('builds 0011110135056’s photos from its schema 1001 keys as live does, with no front image', () => {
+    const built = record(fixture('0011110135056').line).doc;
+    const path = 'https://images.openfoodfacts.org/images/products/001/111/013/5056';
+    expect(built.image_ingredients_url).toBe(`${path}/ingredients_en.6.400.jpg`);
+    expect(built.image_nutrition_url).toBe(`${path}/nutrition_en.8.400.jpg`);
+    expect('image_url' in built).toBe(false);
+  });
+
+  it('stores nutriscore_score as the export holds it, and none where none is computed', () => {
+    expect(doc({ nutriscore_grade: 'a', nutriscore_score: -8 }).nutriscore_score).toBe(-8);
+    expect(doc({ nutriscore_grade: 'b', nutriscore_score: 0 }).nutriscore_score).toBe(0);
+    expect('nutriscore_score' in record(fixture('01723380').line).doc).toBe(false);
+  });
+
+  it('localizes 01723380’s Green-Score to the world score a live read returns, not the stored French one', () => {
+    const f = fixture('01723380');
+    expect(f.line.environmental_score_score).toBe(46);
+    expect(record(f.line).doc).toMatchObject({ ecoscore_score: 35, ecoscore_grade: 'd' });
+  });
+
+  it.each<[string, Json, number | undefined]>([
+    [
+      'the stored score when no world score is computed',
+      { environmental_score_grade: 'b', environmental_score_score: 62 },
+      62,
+    ],
+    [
+      'no score from a stale ecoscore_score on a schema 1000+ record',
+      { environmental_score_grade: 'b', ecoscore_score: 20 },
+      undefined,
+    ],
+    [
+      'environmental_score_score over ecoscore_score on a pre-1000 record',
+      { schema_version: 999, environmental_score_score: 62, ecoscore_score: 55 },
+      62,
+    ],
+    [
+      'ecoscore_score alone on a pre-1000 record',
+      { schema_version: 999, ecoscore_grade: 'b', ecoscore_score: 55 },
+      55,
+    ],
+    [
+      'the world score from a pre-1000 record’s ecoscore_data',
+      {
+        schema_version: 999,
+        ecoscore_score: 50,
+        ecoscore_data: { scores: { world: 41, fr: 50 }, grades: { world: 'c', fr: 'b' } },
+      },
+      41,
+    ],
+    ['nothing when no score is stored', { environmental_score_grade: 'unknown' }, undefined],
+  ])('reads ecoscore_score as the grade is read: %s', (_label, fields, score) => {
+    const built = doc(fields);
+    expect('ecoscore_score' in built).toBe(score !== undefined);
+    expect(built.ecoscore_score).toBe(score);
+  });
+
+  const ADDED_AT_3 = [
+    'lang',
+    'ingredients_text_languages',
+    'nutriscore_score',
+    'ecoscore_score',
+    'image_ingredients_url',
+    'image_nutrition_url',
+  ];
+
+  it.each(
+    ADDED_AT_3.flatMap((field) => [
+      [field, 1, [field]],
+      [field, 2, [field]],
+      [field, 3, []],
+    ]) as [string, number, string[]][],
+  )('names %s as lacking from a row stamped %i: %j', (field, version, lacks) => {
+    expect(fieldsNewerThan(version, ['product_name', field])).toEqual(lacks);
+  });
+
+  it('names every field a row lacks across both versions, in request order', () => {
+    const fields = ['generic_name', 'lang', 'nutriments', 'nutrient_levels', 'ecoscore_score'];
+    expect(fieldsNewerThan(1, fields)).toEqual([
+      'generic_name',
+      'lang',
+      'nutrient_levels',
+      'ecoscore_score',
+    ]);
+    expect(fieldsNewerThan(2, fields)).toEqual(['lang', 'ecoscore_score']);
+    expect(fieldsNewerThan(3, fields)).toEqual([]);
+  });
+});
+
 describe('serving_size re-parse', () => {
+  /**
+   * `parse_serving_size` tries a mass or volume first and a household measure (spoon, glass, cup,
+   * pinch) only when none parses, and the unit is the parsed serving's own (openfoodfacts-server
+   * d53c21be), whose documented examples read `2 tbsp (32 g)` as 32 g and `6 g (1 c. à soupe)` as 6 g.
+   */
   it.each([
-    ['1/2 cup (60 g)', 60, 'ml'],
+    // A mass or volume, the backward scan's last one or the one at the start.
+    ['1/2 cup (60 g)', 60, 'g'],
+    ['2 tbsp (32 g)', 32, 'g'],
+    ['6 g (1 c. à soupe)', 6, 'g'],
+    // The unit is the parsed serving's, never the first one in the text (`ml` here).
+    ['250 ml (240 g)', 240, 'g'],
     ['27 g', 27, 'g'],
     ['6 x 33 cl', 330, 'ml'],
     ['100 kcal', 418, 'kj'],
     ['14.000000000000002g', 14, 'g'],
     ['1,5 l', 1500, 'ml'],
+    // A household measure alone, at the start or after a space; `c. à c.` ends at a word boundary
+    // only without its last dot.
+    ['1 tbsp', 15, 'ml'],
+    ['1 cup', 240, 'ml'],
+    ['about 1 tsp', 5, 'ml'],
+    ['2 c. à c.', 10, 'ml'],
   ])('reads %j as %d %s', (servingSize, quantity, unit) => {
     const { doc } = record(
       aggregatedLine({
@@ -723,6 +1027,26 @@ describe('serving_size re-parse', () => {
     });
     expect(doc.nutriments).toEqual({ 'energy-kcal_100g': 100 });
   });
+
+  it.each([
+    // No space or parenthesis before a number, so no serving parses; parse_quantity_unit takes the
+    // mass over the household measure written before it, else the household measure.
+    ['serving:1cup=30g', 'g'],
+    ['serving:2tbsp', 'ml'],
+  ])(
+    'takes the unit of %j from parse_quantity_unit when no serving parses: %s',
+    (servingSize, unit) => {
+      const { doc } = record(
+        aggregatedLine({
+          serving_size: servingSize,
+          serving_quantity: 30,
+          serving_quantity_unit: 'kj',
+        }),
+      );
+      expect(doc.serving_quantity).toBeNull();
+      expect(doc.serving_quantity_unit).toBe(unit);
+    },
+  );
 
   it('drops an empty serving_size and the stored quantity, keeping the stored unit', () => {
     const { doc } = record(
@@ -869,7 +1193,7 @@ describe('the Green-Score facet', () => {
     expect(toStoredTag('environmental_score', canonical)).toBe(stored);
   });
 
-  it('starts at record version 2, which the builder writes now', () => {
+  it('starts at record version 2, at or below the version the builder writes', () => {
     expect(recordBuilder.GREEN_SCORE_RECORD_VERSION).toBe(2);
     expect(recordBuilder.GREEN_SCORE_RECORD_VERSION).toBeLessThanOrEqual(MIRROR_RECORD_VERSION);
   });
@@ -899,32 +1223,59 @@ function cpuMs(run: () => void): number {
 }
 
 describe('serving scanner timing', () => {
-  const shapes: [string, (units: number) => string][] = [
-    ['one long line ending in a break', (units) => `${'§1 x'.repeat(units)}\ny`],
-    ['breaks throughout', (units) => '  \r\n'.repeat(units)],
-    ['openers with a number and no unit', (units) => ' (1'.repeat(units)],
+  /**
+   * Each shape: its builder for a size, and its CPU budget per character. A number before the
+   * first character of a unit name makes `unitAt` look up every name length up to the longest (50
+   * characters) at each pass, the scan's costliest step, so that shape is built to the size in
+   * characters and gets a larger budget; a super-linear scan still exceeds it by orders of magnitude.
+   */
+  const shapes: [string, (size: number) => string, number][] = [
+    ['one long line ending in a break', (size) => `${'§1 x'.repeat(size)}\ny`, 0.002],
+    ['breaks throughout', (size) => '  \r\n'.repeat(size), 0.002],
+    ['openers with a number and no unit', (size) => ' (1'.repeat(size), 0.002],
     [
       'one number before a letter group of multiplier separators',
-      (units) => `1${' x'.repeat(units)}`,
+      (size) => `1${' x'.repeat(size)}`,
+      0.002,
+    ],
+    [
+      'numbers before an unfinished spoon name',
+      (size) => ' 1 c. à t'.repeat(Math.round(size / ' 1 c. à t'.length)),
+      0.01,
     ],
   ];
 
-  it.each(shapes)('re-parses serving_size in linear time: %s', (_, build) => {
-    const sizes = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
-    const times: number[] = [];
-    for (const units of sizes) {
-      const servingSize = build(units);
-      const line = aggregatedLine({ serving_size: servingSize });
-      const { doc } = record(line);
-      // The scan ran to the end: the downgrade re-derived the serving and found no number and unit.
-      expect(doc.serving_quantity).toBeNull();
-      const ms = cpuMs(() => {
-        buildMirrorRecord(line);
-      });
-      // 2 µs per character plus a fixed floor: generous for linear work, far under a quadratic's.
-      expect(ms).toBeLessThan(5 + servingSize.length * 0.002);
-      times.push(ms);
-    }
-    expect((times.at(-1) as number) / (times[0] as number)).toBeLessThan(256);
-  });
+  /**
+   * Linear on both unit passes. Each size doubles the last and meets an absolute CPU bound before
+   * the next runs, so a quadratic fails in seconds. The 64× span's growth divides the largest size
+   * by the 5k baseline timed again beside it, the least of up to three such pairs, so a baseline
+   * that ran on a faster core cannot make linear work read as super-linear. The body is
+   * synchronous, so vitest's timeout could only fail it after it returned: it is off.
+   */
+  it.each(shapes)(
+    're-parses serving_size in linear time: %s',
+    { timeout: 0 },
+    (_, build, msPerCharacter) => {
+      const sizes = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
+      const timed = (size: number) => {
+        const servingSize = build(size);
+        const line = aggregatedLine({ serving_size: servingSize });
+        // The scan ran to the end: the downgrade re-derived the serving and found no number and unit.
+        expect(record(line).doc.serving_quantity).toBeNull();
+        const ms = cpuMs(() => {
+          buildMirrorRecord(line);
+        });
+        // The shape's budget per character plus a fixed floor: generous for linear work, far under a quadratic's.
+        expect(ms).toBeLessThan(5 + servingSize.length * msPerCharacter);
+        return ms;
+      };
+      for (const size of sizes.slice(0, -1)) timed(size);
+      const [smallest, largest] = [sizes[0] as number, sizes.at(-1) as number];
+      let growth = Number.POSITIVE_INFINITY;
+      for (let pair = 0; pair < 3 && growth >= 256; pair += 1) {
+        growth = Math.min(growth, timed(largest) / timed(smallest));
+      }
+      expect(growth).toBeLessThan(256);
+    },
+  );
 });

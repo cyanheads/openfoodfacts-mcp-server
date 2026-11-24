@@ -7,6 +7,9 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import {
+  GREEN_SCORE_POINTS_DESCRIPTION,
+  gradeWithPoints,
+  NUTRISCORE_POINTS_DESCRIPTION,
   type StoredAsSold,
   settleStoredAsSold,
   storedAsSoldSchema,
@@ -15,12 +18,16 @@ import {
   mirrorCopyNote,
   mirrorSnapshotTrailer,
   sourceLine,
+  unreadFieldsNote,
 } from '@/mcp-server/tools/read-source.js';
-import { holdsOnlyPreparedFigures } from '@/services/openfoodfacts/nutrition-sets.js';
 import {
-  getOpenFoodFactsService,
-  type UnreadFields,
-} from '@/services/openfoodfacts/openfoodfacts-service.js';
+  completenessLabel,
+  completenessScore,
+  recordDates,
+  recordDatesLine,
+} from '@/mcp-server/tools/record-metadata.js';
+import { holdsOnlyPreparedFigures } from '@/services/openfoodfacts/nutrition-sets.js';
+import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import {
   BARCODE_PATTERN,
   BARCODE_PATTERN_MESSAGE,
@@ -39,10 +46,16 @@ import { mdCodeFence, mdInline } from '@/utils/markdown.js';
  * response's own claim about why something is missing true: an absent value is absent upstream,
  * never merely unasked-for. `serving_size` has no entry because the line it renders claims nothing
  * about a parsed quantity it was not asked for. `nutrient_levels` needs `nutriments`, whose
- * preparation state is the levels' basis. `expandFields` is not transitive, so each entry lists
- * its whole set.
+ * preparation state is the levels' basis. Ingredients text needs `lang`, the language it is
+ * written in or keyed against. A score's points need its grade: points read alone print beside
+ * `N/A`, which a grade the record holds would contradict. `expandFields` is not transitive, so each
+ * entry lists its whole set.
  */
 const FIELD_DEPENDENCIES: Record<string, readonly string[]> = {
+  ecoscore_score: ['ecoscore_grade'],
+  ingredients_text: ['lang'],
+  ingredients_text_languages: ['lang'],
+  nutriscore_score: ['nutriscore_grade'],
   nutriments: ['serving_size', 'serving_quantity', 'serving_quantity_unit'],
   nutrient_levels: ['nutriments', 'serving_size', 'serving_quantity', 'serving_quantity_unit'],
   serving_quantity_unit: ['serving_quantity', 'serving_size'],
@@ -61,6 +74,30 @@ function expandFields(fields: readonly string[]): string[] {
   return [...expanded];
 }
 
+/**
+ * Fields `product` names apart from the upstream field they read, keyed by the upstream name: the
+ * record's dates, which Open Food Facts sends as epoch seconds under `_t` names and `product`
+ * carries as ISO 8601 times. A `fields` value is the output name; the request asks for the
+ * upstream one.
+ */
+const RENAMED_FIELDS = { last_modified_t: 'last_modified', created_t: 'created' } as const;
+
+type UpstreamField = (typeof PRODUCT_FIELD_NAMES)[number];
+type RenamedField = keyof typeof RENAMED_FIELDS;
+
+const isRenamed = (field: string): field is RenamedField => Object.hasOwn(RENAMED_FIELDS, field);
+
+/** The `fields` enum: every field a full read requests, in request order, under its output name. */
+const FIELD_OPTIONS = PRODUCT_FIELD_NAMES.map(
+  (field): Exclude<UpstreamField, RenamedField> | (typeof RENAMED_FIELDS)[RenamedField] =>
+    isRenamed(field) ? RENAMED_FIELDS[field] : field,
+);
+
+/** The upstream field a `fields` value is requested as: the one renamed to it, or its own name. */
+function upstreamField(field: string): string {
+  return Object.entries(RENAMED_FIELDS).find(([, name]) => name === field)?.[0] ?? field;
+}
+
 /** One nutrient from the open map: the figure plus the unit Open Food Facts normalized it to. */
 type NutrimentEntry = { value: number; unit?: string };
 
@@ -69,6 +106,7 @@ type NamedNutriments = {
   fat_100g?: number;
   saturated_fat_100g?: number;
   carbohydrates_100g?: number;
+  carbohydrates_total_100g?: number;
   sugars_100g?: number;
   fiber_100g?: number;
   proteins_100g?: number;
@@ -85,12 +123,17 @@ type NormalizedNutriments = NamedNutriments & {
   stored_as_sold?: StoredAsSold;
 };
 
-/** Maps raw hyphenated nutriment keys → named output schema keys. */
+/**
+ * Maps raw hyphenated nutriment keys → named output schema keys. `carbohydrates-total` (total
+ * carbohydrates including fiber) is a nutrient of its own in Open Food Facts' taxonomy, beside
+ * `carbohydrates`, so each keeps its own field and neither is derived from the other.
+ */
 const NUTRIMENT_MAP: [string, keyof NamedNutriments][] = [
   ['energy-kcal_100g', 'energy_kcal_100g'],
   ['fat_100g', 'fat_100g'],
   ['saturated-fat_100g', 'saturated_fat_100g'],
   ['carbohydrates_100g', 'carbohydrates_100g'],
+  ['carbohydrates-total_100g', 'carbohydrates_total_100g'],
   ['sugars_100g', 'sugars_100g'],
   ['fiber_100g', 'fiber_100g'],
   ['proteins_100g', 'proteins_100g'],
@@ -198,18 +241,6 @@ function normalizeNutriments(raw: RawNutriments | undefined): NormalizedNutrimen
   if (additional_serving) result.additional_serving = additional_serving;
 
   return Object.keys(result).length > 0 ? result : undefined;
-}
-
-/**
- * Format a completeness score with its exact value and a human-readable label. The rounded
- * percentage alone is lossy and unrecoverable — a text-only client reading "79%" cannot get back to
- * 0.7875, and re-calling returns the same rounded string — so the scalar is rendered alongside it.
- */
-function completenessLabel(score: number): string {
-  const pct = Math.round(score * 100);
-  if (score >= 0.8) return `${pct}% (exact ${score}, high)`;
-  if (score >= 0.5) return `${pct}% (exact ${score}, moderate)`;
-  return `${pct}% (exact ${score}, low — many fields missing)`;
 }
 
 /**
@@ -438,31 +469,10 @@ function servingSizeLine(
   return `**Serving size:** ${printed}${parsed}`;
 }
 
-/**
- * The `mirror_fields_unread` note: which fields an answer from the local copy lacks because its
- * row predates them, and how the live read that tried them first ended. A failure's reason and
- * message are carried as the service raised them, so the note says what a caller would have been
- * told had the call failed.
- */
-function unreadFieldsNote(unread: UnreadFields, mirrorAsOf: string): string {
-  const one = unread.fields.length === 1;
-  const them = one ? 'it' : 'them';
-  const named = new Intl.ListFormat('en', { type: 'conjunction' }).format(unread.fields);
-  let outcome: string;
-  if (unread.outcome === 'not_found') {
-    outcome = `found no product under this barcode, which Open Food Facts may have removed since ${mirrorAsOf}.`;
-  } else {
-    const { reason } = unread.error.data ?? {};
-    const quoted = `"${unread.error.message}"`;
-    outcome = `failed (${typeof reason === 'string' ? `${reason}: ${quoted}` : quoted}). Retry later to read ${them}.`;
-  }
-  return `${named} ${one ? 'is' : 'are'} absent because ${one ? 'it was' : 'they were'} not read, not because Open Food Facts lacks ${them}: this server's local copy of this product predates ${them}, and the live read for ${them} ${outcome}`;
-}
-
 export const offGetProductTool = tool('off_get_product', {
   title: 'Get Food Product by Barcode',
   description:
-    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name and generic name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), the low/moderate/high levels of fat, saturated fat, sugars, and salt Open Food Facts computes, nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Nutrition is the exception: Open Food Facts returns one preparation state per read, so a read of prepared figures (_prepared keys under nutriments) omits as-sold figures the record can still hold; when that happens, one more product read fetches the as-sold set the record stores into the as-sold fields, and nutriments.stored_as_sold says whether it was read, the record stores none, or it could not be read. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name and generic name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e and Green-Score, each with the points behind its grade, and NOVA 1–4), the low/moderate/high levels of fat, saturated fat, sugars, and salt Open Food Facts computes, nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, data completeness, and when the record was last modified and created. The ingredients text is in the record\'s main language, named by lang, and can be a contributor\'s translation rather than what the pack prints; ingredients_text_languages carries the text in every language entered, and image_ingredients_url and image_nutrition_url link the label photos to check it against. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Nutrition is the exception: Open Food Facts returns one preparation state per read, so a read of prepared figures (_prepared keys under nutriments) omits as-sold figures the record can still hold; when that happens, one more product read fetches the as-sold set the record stores into the as-sold fields, and nutriments.stored_as_sold says whether it was read, the record stores none, or it could not be read. Computed scores carry regional formula caveats and are indicators, not absolute rankings; Nutri-Score points rank products of one kind only. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -473,14 +483,10 @@ export const offGetProductTool = tool('off_get_product', {
         'Product barcode, digits only: 4–40 digits after any leading zeros. The primary key for Open Food Facts — the barcode of an off_search_products row works as is. Example: "3017620422003" (Nutella FR).',
       ),
     fields: z
-      .array(
-        z
-          .enum(PRODUCT_FIELD_NAMES)
-          .describe('A specific product field to include in the response.'),
-      )
+      .array(z.enum(FIELD_OPTIONS).describe('A specific product field to include in the response.'))
       .optional()
       .describe(
-        'Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed. A field that cannot be read on its own arrives with what it depends on: nutriments brings serving_size, serving_quantity, and serving_quantity_unit so per-serving figures carry their denominator, serving_quantity and serving_quantity_unit each bring the other plus serving_size, since a quantity reads only with its unit, and nutrient_levels brings nutriments and the same serving fields, since the figures nutriments holds decide its basis. requested_fields echoes the full set that was fetched.',
+        'Subset of fields to return. Omitting returns all standard fields. Use to reduce payload when only scores or ingredients are needed. A field that cannot be read on its own arrives with what it depends on: nutriments brings serving_size, serving_quantity, and serving_quantity_unit so per-serving figures carry their denominator, serving_quantity and serving_quantity_unit each bring the other plus serving_size, since a quantity reads only with its unit, and nutrient_levels brings nutriments and the same serving fields, since the figures nutriments holds decide its basis. ingredients_text and ingredients_text_languages each bring lang, which names the main language. nutriscore_score brings nutriscore_grade and ecoscore_score brings ecoscore_grade, the grade its points stand behind. requested_fields echoes the full set that was fetched.',
       ),
   }),
 
@@ -507,10 +513,27 @@ export const offGetProductTool = tool('off_get_product', {
           .string()
           .optional()
           .describe('Net quantity as printed on packaging (e.g. "400g").'),
+        lang: z
+          .string()
+          .optional()
+          .describe(
+            'Language code of the record\'s main language (e.g. "en"), the language ingredients_text is in. Absent when mirror_fields_unread names it as not read.',
+          ),
         ingredients_text: z
           .string()
           .optional()
-          .describe('Raw ingredients text from the label, in the source language.'),
+          .describe(
+            "Raw ingredients text in the record's main language, the one lang names. It can be a contributor's translation rather than the text printed on the pack, so when it is short or disagrees with allergens_tags, read ingredients_text_languages and the image_ingredients_url photo.",
+          ),
+        ingredients_text_languages: z
+          .record(
+            z.string().describe('Language code (e.g. "fr").'),
+            z.string().describe('The ingredients text entered in that language.'),
+          )
+          .optional()
+          .describe(
+            'Ingredients text in every language contributors entered, keyed by language code, the main language included. Languages entered empty are left out. Absent when no language holds any text, or when mirror_fields_unread names it as not read.',
+          ),
         ingredients: z
           .array(
             z
@@ -559,6 +582,7 @@ export const offGetProductTool = tool('off_get_product', {
           .describe(
             'Nutri-Score grade, lowercase: "a" (highest nutritional quality) through "e", "unknown" when the nutrition data entered is not enough to compute it, or "not-applicable" for product categories the score does not cover. Absent when Open Food Facts sent none. Regional formula variants exist.',
           ),
+        nutriscore_score: z.number().optional().describe(NUTRISCORE_POINTS_DESCRIPTION),
         nova_group: z
           .number()
           .optional()
@@ -571,6 +595,7 @@ export const offGetProductTool = tool('off_get_product', {
           .describe(
             'Green-Score (formerly Eco-Score) environmental impact grade: "a-plus" (lowest impact), then "a" through "f"; "unknown" when the data it needs is missing, or "not-applicable" for product categories the score does not cover. Highly variable — depends on packaging, origins, and transport data completeness.',
           ),
+        ecoscore_score: z.number().optional().describe(GREEN_SCORE_POINTS_DESCRIPTION),
         nutrient_levels: z
           .object({
             basis: z
@@ -604,7 +629,15 @@ export const offGetProductTool = tool('off_get_product', {
             carbohydrates_100g: z
               .number()
               .optional()
-              .describe('Total carbohydrates in grams per 100 g, or per 100 ml for liquids.'),
+              .describe(
+                "Carbohydrates in grams per 100 g, or per 100 ml for liquids: Open Food Facts' carbohydrates nutrient. Records entered from US labels often hold the label's total, fiber included, here; carbohydrates_total_100g is the separate total including fiber.",
+              ),
+            carbohydrates_total_100g: z
+              .number()
+              .optional()
+              .describe(
+                "Total carbohydrates including fiber, in grams per 100 g, or per 100 ml for liquids: a separate Open Food Facts nutrient from carbohydrates_100g, never derived from it or merged into it. A record can hold either, both, or neither. Its per-serving figure is additional_serving's carbohydrates_total.",
+              ),
             sugars_100g: z
               .number()
               .optional()
@@ -675,7 +708,7 @@ export const offGetProductTool = tool('off_get_product', {
               )
               .optional()
               .describe(
-                "The same nutrients per serving. Also carries the per-serving figures for macros that have a named _100g field but no named per-serving one (saturated_fat, carbohydrates, fiber, proteins, salt, sodium). Percent, % vol, and unitless figures are concentrations, so they equal the per-100 figure. Check serving_size for the denominator the other figures are measured against. A key ending in _prepared is a prepared-product figure that Open Food Facts scales from the per-100 figure by serving_quantity, which is often a powder's dry portion rather than the prepared serving, so it can describe a fraction of what is consumed.",
+                "The same nutrients per serving. Also carries the per-serving figures for macros that have a named _100g field but no named per-serving one (saturated_fat, carbohydrates, carbohydrates_total, fiber, proteins, salt, sodium). Percent, % vol, and unitless figures are concentrations, so they equal the per-100 figure. Check serving_size for the denominator the other figures are measured against. A key ending in _prepared is a prepared-product figure that Open Food Facts scales from the per-100 figure by serving_quantity, which is often a powder's dry portion rather than the prepared serving, so it can describe a fraction of what is consumed.",
               ),
             stored_as_sold: storedAsSoldSchema('this product'),
           })
@@ -726,11 +759,23 @@ export const offGetProductTool = tool('off_get_product', {
             'Countries where the product is sold — the same values off_search_products accepts as countries_tag. Distinct from origins_tags, which is where the ingredients come from.',
           ),
         image_url: z.string().optional().describe('Front image URL (CDN-hosted JPEG).'),
+        image_ingredients_url: z
+          .string()
+          .optional()
+          .describe(
+            "Photo of the ingredients panel (CDN-hosted JPEG): the one selected for English, else for the record's main language, else the first by language code. Absent when contributors have selected none, or when mirror_fields_unread names it as not read.",
+          ),
+        image_nutrition_url: z
+          .string()
+          .optional()
+          .describe(
+            "Photo of the nutrition table (CDN-hosted JPEG): the one selected for English, else for the record's main language, else the first by language code. Absent when contributors have selected none, or when mirror_fields_unread names it as not read.",
+          ),
         completeness: z
           .number()
           .optional()
           .describe(
-            'Data completeness score from 0–1. Below 0.5 indicates many fields are missing.',
+            'Data completeness score as Open Food Facts reports it: higher means more of the record is filled in, and it can exceed 1 (e.g. 1.0875). Below 0.5 indicates many fields are missing.',
           ),
         data_quality_tags: z
           .array(
@@ -742,6 +787,18 @@ export const offGetProductTool = tool('off_get_product', {
           )
           .optional()
           .describe('Crowd-sourced data quality flags. Absence means not yet checked.'),
+        last_modified: z
+          .string()
+          .optional()
+          .describe(
+            'When the record was last edited on Open Food Facts, as an ISO 8601 time (e.g. "2026-05-26T19:35:02.000Z") — how current the record is. When source is "off_mirror", the edit time of the revision the local copy holds. Absent when the record holds none.',
+          ),
+        created: z
+          .string()
+          .optional()
+          .describe(
+            'When the record was created on Open Food Facts, as an ISO 8601 time (e.g. "2014-11-09T21:02:13.000Z"). Absent when the record holds none.',
+          ),
       })
       .describe(
         'Product data. Always present on a successful call — a barcode with no contributor record raises the not_found error instead of returning an empty result.',
@@ -767,7 +824,7 @@ export const offGetProductTool = tool('off_get_product', {
       .string()
       .optional()
       .describe(
-        'Present only when source is "off_mirror" and the local copy holds this product from before it stored generic_name or nutrient_levels, and the live read for them failed or found no product. Names the fields this answer lacks for that reason, which are not read rather than not entered, and gives the live read\'s failure or says it found no product under the barcode.',
+        'Present only when source is "off_mirror", the local copy holds this product from before it stored some of the requested fields, and the live read for them failed or found no product. Names the fields this answer lacks for that reason, which are not read rather than not entered, and gives the live read\'s failure or says it found no product under the barcode.',
       ),
   }),
 
@@ -838,7 +895,7 @@ export const offGetProductTool = tool('off_get_product', {
     // The subset is expanded first, so a requested field arrives with whatever it needs to be read.
     const fields = input.fields && input.fields.length > 0 ? expandFields(input.fields) : undefined;
     const read = fields
-      ? await svc.getProductFields(input.barcode, fields.join(','), ctx)
+      ? await svc.getProductFields(input.barcode, fields.map(upstreamField).join(','), ctx)
       : await svc.getProduct(input.barcode, ctx);
 
     if (!read) {
@@ -913,6 +970,8 @@ export const offGetProductTool = tool('off_get_product', {
       : 'Unknown product';
     lines.push(`## ${p.product_name === undefined ? missingName : mdInline(p.product_name)}`);
     lines.push(`**Barcode:** ${result.barcode}`);
+    const dates = recordDatesLine(p);
+    if (dates) lines.push(dates);
     if (requested && requested.length > 0) {
       lines.push(
         `**Requested fields:** ${requested.join(', ')} — sections outside this subset were not requested (not missing from Open Food Facts).`,
@@ -921,15 +980,20 @@ export const offGetProductTool = tool('off_get_product', {
     if (p.generic_name) lines.push(`**Generic name:** ${mdInline(p.generic_name)}`);
     if (p.brands) lines.push(`**Brand:** ${mdInline(p.brands)}`);
     if (p.quantity) lines.push(`**Quantity:** ${mdInline(p.quantity)}`);
+    if (p.lang) lines.push(`**Main language:** ${mdInline(p.lang)}`);
     if (p.serving_size !== undefined || p.serving_quantity !== undefined) {
       lines.push(servingSizeLine(p.serving_size, p.serving_quantity, p.serving_quantity_unit));
     }
 
     // Scores
     const scores: string[] = [];
-    if (p.nutriscore_grade) scores.push(`Nutri-Score: ${mdInline(p.nutriscore_grade)}`);
+    if (p.nutriscore_grade !== undefined || p.nutriscore_score !== undefined) {
+      scores.push(`Nutri-Score: ${gradeWithPoints(p.nutriscore_grade, p.nutriscore_score)}`);
+    }
     if (p.nova_group !== undefined) scores.push(`NOVA: ${p.nova_group}`);
-    if (p.ecoscore_grade) scores.push(`Green-Score: ${mdInline(p.ecoscore_grade)}`);
+    if (p.ecoscore_grade !== undefined || p.ecoscore_score !== undefined) {
+      scores.push(`Green-Score: ${gradeWithPoints(p.ecoscore_grade, p.ecoscore_score)}`);
+    }
     if (scores.length > 0) lines.push(`**Scores:** ${scores.join(' | ')}`);
 
     const levels = p.nutrient_levels;
@@ -953,14 +1017,32 @@ export const offGetProductTool = tool('off_get_product', {
 
       // Open Food Facts stores liquids per 100 ml under the same _100g keys and no field reliably
       // says which basis a record is on, so the heading names both rather than asserting one.
+      // A sub-nutrient nests only under its own parent: Saturated fat under Fat, Sugars under
+      // Carbohydrates, else under Total carbohydrates. With no parent line it stands on a line of
+      // its own, so it never reads as part of the line above it.
+      const sub = (label: string, value: number, nested: boolean) =>
+        nested ? `  - ${label}: ${value}g` : `**${label}:** ${value}g`;
+      const carbs = n.carbohydrates_100g;
+      const carbsTotal = n.carbohydrates_total_100g;
+      const sugars =
+        n.sugars_100g === undefined
+          ? []
+          : [sub('Sugars', n.sugars_100g, carbs !== undefined || carbsTotal !== undefined)];
       const per100: string[] = [];
       if (n.energy_kcal_100g !== undefined) per100.push(`**Energy:** ${n.energy_kcal_100g} kcal`);
       if (n.fat_100g !== undefined) per100.push(`**Fat:** ${n.fat_100g}g`);
-      if (n.saturated_fat_100g !== undefined)
-        per100.push(`  - Saturated fat: ${n.saturated_fat_100g}g`);
-      if (n.carbohydrates_100g !== undefined)
-        per100.push(`**Carbohydrates:** ${n.carbohydrates_100g}g`);
-      if (n.sugars_100g !== undefined) per100.push(`  - Sugars: ${n.sugars_100g}g`);
+      if (n.saturated_fat_100g !== undefined) {
+        per100.push(sub('Saturated fat', n.saturated_fat_100g, n.fat_100g !== undefined));
+      }
+      if (carbs !== undefined) per100.push(`**Carbohydrates:** ${carbs}g`, ...sugars);
+      if (carbsTotal !== undefined) {
+        per100.push(
+          `**Total carbohydrates (incl. fiber):** ${carbsTotal}g`,
+          ...(carbs === undefined ? sugars : []),
+        );
+      } else if (carbs === undefined) {
+        per100.push(...sugars);
+      }
       if (n.fiber_100g !== undefined) per100.push(`**Fiber:** ${n.fiber_100g}g`);
       if (n.proteins_100g !== undefined) per100.push(`**Protein:** ${n.proteins_100g}g`);
       if (n.salt_100g !== undefined) per100.push(`**Salt:** ${n.salt_100g}g`);
@@ -1024,12 +1106,27 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push('\n**Nutrition:** Not available');
     }
 
-    // Ingredients — fenced so contributor text cannot be read as markdown or as instructions. The
-    // fence is sized past the longest backtick run in the value, which a fixed ``` was not: a
-    // three-backtick run in the text closed the block and returned the rest to ordinary markdown.
-    if (p.ingredients_text) {
-      lines.push(`\n### Ingredients\n${mdCodeFence(p.ingredients_text)}`);
-    } else if (notRequested('ingredients_text')) {
+    /**
+     * Ingredients — fenced so contributor text cannot be read as markdown or as instructions. The
+     * fence is sized past the longest backtick run in the value, which a fixed ``` was not: a
+     * three-backtick run in the text closed the block and returned the rest to ordinary markdown.
+     * The main-language text comes first; every other language's follows under its code, the
+     * main-language entry only when it is not the text already shown. The section is unrequested
+     * only when neither text field was asked for.
+     */
+    const otherLanguages = Object.entries(p.ingredients_text_languages ?? {}).filter(
+      ([language, text]) => !(language === p.lang && text === p.ingredients_text),
+    );
+    if (p.ingredients_text || otherLanguages.length > 0) {
+      lines.push('\n### Ingredients');
+      if (p.ingredients_text) lines.push(mdCodeFence(p.ingredients_text));
+      else if (!notRequested('ingredients_text')) {
+        lines.push('**Main-language text:** Not available');
+      }
+      for (const [language, text] of otherLanguages) {
+        lines.push(`**Ingredients text (${mdInline(language)}):**`, mdCodeFence(text));
+      }
+    } else if (notRequested('ingredients_text') && notRequested('ingredients_text_languages')) {
       lines.push('\n**Ingredients:** Not requested');
     } else {
       lines.push('\n**Ingredients:** Not available');
@@ -1096,8 +1193,14 @@ export const offGetProductTool = tool('off_get_product', {
       lines.push(`**Ingredients analysis:** ${tagList(p.ingredients_analysis_tags)}`);
     }
 
-    // Image
-    if (p.image_url) lines.push(`\n${markdownImage('Product image', p.image_url)}`);
+    // Images
+    const photos: [alt: string, url: string | undefined][] = [
+      ['Product image', p.image_url],
+      ['Ingredients photo', p.image_ingredients_url],
+      ['Nutrition photo', p.image_nutrition_url],
+    ];
+    const images = photos.flatMap(([alt, url]) => (url ? [markdownImage(alt, url)] : []));
+    if (images.length > 0) lines.push(`\n${images.join('\n')}`);
 
     // Completeness
     if (p.completeness !== undefined) {
@@ -1129,15 +1232,19 @@ type ProductOutput = {
   generic_name?: string;
   brands?: string;
   quantity?: string;
+  lang?: string;
   ingredients_text?: string;
+  ingredients_text_languages?: Record<string, string>;
   ingredients?: IngredientOutput[];
   allergens_tags?: string[];
   traces_tags?: string[];
   additives_tags?: string[];
   ingredients_analysis_tags?: string[];
   nutriscore_grade?: string;
+  nutriscore_score?: number;
   nova_group?: number;
   ecoscore_grade?: string;
+  ecoscore_score?: number;
   nutrient_levels?: NutrientLevels;
   nutriments?: NormalizedNutriments;
   serving_size?: string;
@@ -1149,8 +1256,12 @@ type ProductOutput = {
   origins_tags?: string[];
   countries_tags?: string[];
   image_url?: string;
+  image_ingredients_url?: string;
+  image_nutrition_url?: string;
   completeness?: number;
   data_quality_tags?: string[];
+  last_modified?: string;
+  created?: string;
 };
 
 /**
@@ -1163,6 +1274,20 @@ function servingQuantity(raw: number | string | undefined): number | undefined {
   if (typeof raw !== 'string' || raw.trim() === '') return;
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * The languages that hold ingredients text, in the order the read lists them. Open Food Facts
+ * keeps an empty entry for every language a record lists, so those are dropped, and a map left
+ * with none is `undefined`. `Object.fromEntries` keeps a stored language code an own key.
+ */
+function enteredLanguages(
+  map: RawProduct['ingredients_text_languages'],
+): Record<string, string> | undefined {
+  const entered = Object.entries(map ?? {}).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1] !== '',
+  );
+  return entered.length > 0 ? Object.fromEntries(entered) : undefined;
 }
 
 /**
@@ -1186,7 +1311,10 @@ function buildProductOutput(
   if (raw.generic_name) product.generic_name = raw.generic_name;
   if (raw.brands) product.brands = raw.brands;
   if (raw.quantity) product.quantity = raw.quantity;
+  if (raw.lang) product.lang = raw.lang;
   if (raw.ingredients_text) product.ingredients_text = raw.ingredients_text;
+  const languages = enteredLanguages(raw.ingredients_text_languages);
+  if (languages) product.ingredients_text_languages = languages;
   if (raw.ingredients && raw.ingredients.length > 0) {
     product.ingredients = buildIngredients(raw.ingredients);
   }
@@ -1200,8 +1328,11 @@ function buildProductOutput(
     product.ingredients_analysis_tags = raw.ingredients_analysis_tags;
   }
   if (raw.nutriscore_grade) product.nutriscore_grade = raw.nutriscore_grade;
+  // Points are passed through as Open Food Facts computed them, never derived from a grade.
+  if (typeof raw.nutriscore_score === 'number') product.nutriscore_score = raw.nutriscore_score;
   if (typeof raw.nova_group === 'number') product.nova_group = raw.nova_group;
   if (raw.ecoscore_grade) product.ecoscore_grade = raw.ecoscore_grade;
+  if (typeof raw.ecoscore_score === 'number') product.ecoscore_score = raw.ecoscore_score;
   const levels = normalizeNutrientLevels(raw.nutrient_levels, levelBasis);
   if (levels) product.nutrient_levels = levels;
 
@@ -1231,8 +1362,12 @@ function buildProductOutput(
   if (raw.origins_tags) product.origins_tags = raw.origins_tags;
   if (raw.countries_tags) product.countries_tags = raw.countries_tags;
   if (raw.image_url) product.image_url = raw.image_url;
-  if (typeof raw.completeness === 'number') product.completeness = raw.completeness;
+  if (raw.image_ingredients_url) product.image_ingredients_url = raw.image_ingredients_url;
+  if (raw.image_nutrition_url) product.image_nutrition_url = raw.image_nutrition_url;
+  const completeness = completenessScore(raw.completeness);
+  if (completeness !== undefined) product.completeness = completeness;
   if (raw.data_quality_tags) product.data_quality_tags = raw.data_quality_tags;
+  Object.assign(product, recordDates(raw));
 
   return {
     barcode,
