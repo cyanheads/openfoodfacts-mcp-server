@@ -7,8 +7,9 @@
  * gap) with their sweep and the checkpoint they move back, a load that stamps no product refused
  * before its sweep, the as-of a reload cites while it rewrites rows (interrupted and resumed
  * included), the age and gap reloads an unchanged export ETag skips, a refresh at a path naming no
- * file refused before it opens anything, and a run whose lease another run reclaimed writing
- * nothing over that run's completed state.
+ * file refused before it opens anything, a run whose lease another run reclaimed writing nothing
+ * over that run's completed state, and the record version a load records when it was resumed under
+ * a newer builder (cursors written before they carried one included).
  * @module tests/services/mirror/mirror-sync.test
  */
 
@@ -39,6 +40,8 @@ import {
 import {
   decodeCheckpoint,
   encodeCheckpoint,
+  indexesBrandKeys,
+  indexesGreenScore,
   isMirrorReady,
   mirrorAsOf,
   openMirrorStore,
@@ -48,6 +51,7 @@ import {
   sortIndexName,
 } from '@/services/mirror/mirror-store.js';
 import { runMirrorSync } from '@/services/mirror/mirror-sync.js';
+import { MIRROR_RECORD_VERSION } from '@/services/mirror/record-builder.js';
 import { USER_AGENT as SERVER_USER_AGENT } from '@/services/openfoodfacts/user-agent.js';
 
 const USER_AGENT =
@@ -338,10 +342,17 @@ async function runJob(): Promise<{ code: number | null; lines: unknown[]; stderr
   return { code, lines, stderr };
 }
 
-/** Runs `mode` over the served export and aborts it once the builder reaches `code`. */
-async function interruptedIngest(mode: 'init' | 'refresh', code: string): Promise<void> {
+/**
+ * Runs `mode` over the served export with a builder at `version`, and aborts it once the builder
+ * reaches `code`.
+ */
+async function interruptedIngest(
+  mode: 'init' | 'refresh',
+  code: string,
+  version = 1,
+): Promise<void> {
   const controller = new AbortController();
-  const builder = fakeBuilder(1, (built) => {
+  const builder = fakeBuilder(version, (built) => {
     if (built === code) controller.abort(new Error('interrupted'));
   });
   await expect(sync(mode, builder, controller.signal)).rejects.toThrow('interrupted');
@@ -2247,5 +2258,210 @@ describe('the as-of a reload cites', () => {
       { generation: 2, asOfSeconds: T },
     ]);
     await expectReloaded();
+  });
+});
+
+describe('the record version a full load records (#98)', () => {
+  /** Product rows per record version that built them. */
+  async function versions(): Promise<Record<number, number>> {
+    const handle = await probe.raw();
+    return Object.fromEntries(
+      handle
+        .prepare<{ record_version: number; n: number }>(
+          'SELECT record_version, COUNT(*) AS n FROM products GROUP BY record_version',
+        )
+        .all()
+        .map((row) => [row.record_version, row.n]),
+    );
+  }
+
+  /** The persisted cursor, as a build that predates cursors carrying a record version wrote it. */
+  async function dropCursorVersion(): Promise<void> {
+    const handle = await probe.raw();
+    const { cursor: raw } = await probe.readState();
+    const cursor: Record<string, unknown> = JSON.parse(raw as string);
+    expect(cursor.recordVersion).toEqual(expect.any(Number));
+    delete cursor.recordVersion;
+    handle.prepare('UPDATE mirror_sync_state SET cursor = ?').run(JSON.stringify(cursor));
+  }
+
+  it('records the version of the builder that loaded every row, a load resumed under that builder included', async () => {
+    host.exportBody = jsonl(products(4_500));
+    await interruptedIngest('init', 'P02500', 2);
+    expect(await versions()).toEqual({ 2: 2_000 });
+
+    const report = await sync('init', fakeBuilder(2));
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 1 });
+    expect(await versions()).toEqual({ 2: 4_500 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ recordVersion: 2 });
+  });
+
+  it('records the older version when a load is resumed under a newer builder, and the next refresh reloads for it', async () => {
+    host.exportBody = jsonl(products(4_500));
+    await interruptedIngest('init', 'P02500', 1);
+    expect(await versions()).toEqual({ 1: 2_000 });
+
+    await sync('init', fakeBuilder(2));
+
+    // The rows of the first run's page keep the version that built them until a load rewrites them.
+    expect(await versions()).toEqual({ 1: 2_000, 2: 2_500 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 1, recordVersion: 1 });
+
+    const report = await sync('refresh', fakeBuilder(2));
+
+    expect(report.fullLoad).toMatchObject({ reason: 'record_version', generation: 2 });
+    expect(await versions()).toEqual({ 2: 4_500 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 2, recordVersion: 2 });
+  });
+
+  it('records the version its cursor carries for a record-version reload resumed under the same builder, not the older completed load’s', async () => {
+    host.exportBody = jsonl(products(4_500));
+    await sync('init', fakeBuilder(1));
+    await interruptedIngest('refresh', 'P02500', 2);
+    expect(await versions()).toEqual({ 1: 2_500, 2: 2_000 });
+    expect(parseExportCursor((await probe.readState()).cursor)).toMatchObject({
+      generation: 2,
+      line: 2_000,
+      recordVersion: 2,
+    });
+
+    const report = await sync('refresh', fakeBuilder(2));
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2 });
+    expect(await versions()).toEqual({ 2: 4_500 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 2, recordVersion: 2 });
+    expect((await sync('refresh', fakeBuilder(2))).fullLoad).toBeUndefined();
+  });
+
+  it('keeps the lowest version across several resumes under newer builders', async () => {
+    host.exportBody = jsonl(products(6_500));
+    await interruptedIngest('init', 'P02500', 1);
+    const controller = new AbortController();
+    await expect(
+      sync(
+        'init',
+        fakeBuilder(2, (code) => {
+          if (code === 'P04500') controller.abort(new Error('interrupted'));
+        }),
+        controller.signal,
+      ),
+    ).rejects.toThrow('interrupted');
+    expect(parseExportCursor((await probe.readState()).cursor)).toMatchObject({
+      line: 4_000,
+      recordVersion: 1,
+    });
+
+    await sync('init', fakeBuilder(3));
+
+    expect(await versions()).toEqual({ 1: 2_000, 2: 2_000, 3: 2_500 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ recordVersion: 1 });
+  });
+
+  it('records the resuming builder’s version for a load interrupted before it stamped a row', async () => {
+    host.exportBody = jsonl(noisy(products(3_000)));
+    await interruptedDownload(30_000);
+    expect(parseExportCursor((await probe.readState()).cursor)).toMatchObject({
+      phase: 'download',
+      line: 0,
+    });
+
+    await sync('init', fakeBuilder(2));
+
+    expect(await versions()).toEqual({ 2: 3_000 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ recordVersion: 2 });
+  });
+
+  it('records the older version for a load whose cursor had consumed only its first line', async () => {
+    host.exportBody = jsonl(products(4_500));
+    await interruptedIngest('init', 'P02500', 1);
+    // Wind the cursor back to the first line, as a run that had consumed only that line left it.
+    const handle = await probe.raw();
+    const cursor = parseExportCursor((await probe.readState()).cursor);
+    expect(cursor).toMatchObject({ phase: 'ingest', line: 2_000, recordVersion: 1 });
+    handle
+      .prepare('UPDATE mirror_sync_state SET cursor = ?')
+      .run(JSON.stringify({ ...cursor, line: 1, maxModifiedT: 1_793_000_000 }));
+
+    await sync('init', fakeBuilder(2));
+
+    // The first line's row keeps the version that built it until a load rewrites it.
+    expect(await versions()).toEqual({ 1: 1, 2: 4_499 });
+    expect(readMirrorLoad(handle)).toMatchObject({ recordVersion: 1 });
+  });
+
+  it('starts the version over when the export changed after part of the load was stamped', async () => {
+    host.exportBody = jsonl(products(4_500, 1_793_000_000, 'OLD'));
+    await interruptedIngest('init', 'OLD02500', 1);
+    await truncate(`${path}.export.jsonl.gz`, 100);
+    host.exportBody = jsonl(products(1_000, 1_793_100_000, 'NEW'));
+    host.etag = '"e2"';
+
+    const report = await sync('init', fakeBuilder(2));
+
+    // The abandoned export's rows were swept, so every row left was built by the resuming builder.
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2 });
+    expect(await versions()).toEqual({ 2: 1_000 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ generation: 2, recordVersion: 2 });
+  });
+
+  it('reads a cursor written before cursors carried a version as the last completed load’s version', async () => {
+    host.exportBody = jsonl(products(100));
+    await sync('init', fakeBuilder(2));
+    const handle = await probe.raw();
+    handle.prepare('UPDATE mirror_load SET loaded_at = ?').run('2000-01-01T00:00:00.000Z');
+    host.exportBody = jsonl(products(4_500, 1_793_100_000, 'NEW'));
+    host.etag = '"e2"';
+    await interruptedIngest('refresh', 'NEW02500', 2);
+    await dropCursorVersion();
+
+    const report = await sync('refresh', fakeBuilder(3));
+
+    expect(report.fullLoad).toMatchObject({ reason: 'resume', generation: 2 });
+    expect(await versions()).toEqual({ 2: 2_000, 3: 2_500 });
+    expect(readMirrorLoad(handle)).toMatchObject({ generation: 2, recordVersion: 2 });
+    await expect(sync('refresh', fakeBuilder(3))).resolves.toMatchObject({
+      fullLoad: { reason: 'record_version', generation: 3 },
+    });
+  });
+
+  it('reads such a cursor as version 1, the lowest any build wrote, when no load has completed', async () => {
+    host.exportBody = jsonl(products(4_500));
+    await interruptedIngest('init', 'P02500', 2);
+    await dropCursorVersion();
+
+    await sync('init', fakeBuilder(3));
+
+    expect(await versions()).toEqual({ 2: 2_000, 3: 2_500 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ recordVersion: 1 });
+  });
+
+  it('reads such a cursor as the resuming builder’s version while the load has stamped no row', async () => {
+    host.exportBody = jsonl(noisy(products(3_000)));
+    await interruptedDownload(30_000);
+    await dropCursorVersion();
+
+    await sync('init', fakeBuilder(2));
+
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ recordVersion: 2 });
+  });
+
+  it('reloads a store whose last load was built at 3 for the production builder, and only then indexes brand keys', async () => {
+    host.exportBody = jsonl(products(100));
+    await sync('init', fakeBuilder(3));
+    expect(await indexesBrandKeys(probe)).toBe(false);
+    expect(await indexesGreenScore(probe)).toBe(true);
+    host.requests = [];
+
+    const report = await sync('refresh', fakeBuilder(MIRROR_RECORD_VERSION));
+
+    expect(MIRROR_RECORD_VERSION).toBe(4);
+    expect(report.fullLoad).toMatchObject({ reason: 'record_version', generation: 2 });
+    // A record-version reload runs whatever the export: it sends no ETag check.
+    expect(host.requests.filter((r) => r.method === 'HEAD')).toEqual([]);
+    expect(await versions()).toEqual({ 4: 100 });
+    expect(readMirrorLoad(await probe.raw())).toMatchObject({ recordVersion: 4 });
+    expect(await indexesBrandKeys(probe)).toBe(true);
+    expect(await indexesGreenScore(probe)).toBe(true);
   });
 });

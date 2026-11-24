@@ -24,7 +24,6 @@ import {
   MIRROR_SEARCH_RESULT_WINDOW,
   type ProductSearch,
   TAG_SEARCH_MAX_PAGE,
-  TEXT_SEARCH_LANGS,
   TEXT_SEARCH_RESULT_WINDOW,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import {
@@ -37,15 +36,15 @@ import {
   type NutrientOperator,
   type SearchParams,
   type TagValue,
-  WHOLE_NUMBER_NUTRIENTS,
 } from '@/services/openfoodfacts/types.js';
+import { brandKeys } from '@/services/taxonomy/brand-keys.js';
 import {
-  brandSlugs,
-  brandTextSlugs,
+  brandLiveIds,
+  brandTextIds,
   type CanonicalTag,
   getTaxonomyService,
+  type LiveFacet,
   type LookupFailure,
-  type TagFacet,
   taxonomyTextIds,
 } from '@/services/taxonomy/taxonomy-service.js';
 import { mdInline } from '@/utils/markdown.js';
@@ -67,15 +66,17 @@ const NUTRIENT_OPERATOR_SYMBOLS: Record<NutrientOperator, string> = {
 
 /**
  * The string tag filters, the facet whose vocabulary each draws on, and the label the empty-result
- * notice echoes it under. On the text path each value is canonicalized before it is sent;
- * `additives_tag` is absent because the text path refuses it. Trace tags are allergen tags, so
- * `traces_tag` resolves against the allergen vocabulary. `allOf` marks a filter that also takes an
+ * notice echoes it under. On the text path each value is canonicalized before it is sent.
+ * `additives_tag` is canonicalized the same way but is not listed here: the service takes one
+ * additive ID, never the any-of IDs a value here can be sent under. Trace tags are allergen tags,
+ * so `traces_tag` resolves against the allergen vocabulary. A brand has no vocabulary: it is sent
+ * under its keys (`brandKeys`), in each backend's form. `allOf` marks a filter that also takes an
  * array of values, all of which must apply (`allOfTagInput`). `ingredients_tag` is served only by
  * the text path, so a search carrying it is always canonicalized.
  */
 const TAG_FILTERS = [
   { key: 'categories_tag', facet: 'categories', label: 'category' },
-  { key: 'brands_tag', facet: 'brands', label: 'brand' },
+  { key: 'brands_tag', label: 'brand' },
   { key: 'labels_tag', facet: 'labels', label: 'label', allOf: true },
   { key: 'ingredients_tag', facet: 'ingredients', label: 'ingredient', allOf: true },
   { key: 'allergens_tag', facet: 'allergens', label: 'allergen' },
@@ -83,7 +84,7 @@ const TAG_FILTERS = [
   { key: 'countries_tag', facet: 'countries', label: 'country' },
 ] as const satisfies readonly {
   key: keyof SearchParams;
-  facet: TagFacet;
+  facet?: LiveFacet;
   label: string;
   allOf?: true;
 }[];
@@ -100,19 +101,37 @@ function allOfTagInput(item: string, list: string) {
 }
 
 /**
- * A tag filter value as supplied and as sent. `canonical` is set on the text path, and on the tag
- * path when the mirror is ready. `alsoSent` is the second ID a value nothing confirmed goes to the
- * text index under, either of the two matching: a brand's final-ς slug (`brandTextSlugs`) or a
- * taxonomy value's final-ς ID (`taxonomyTextIds`).
+ * A tag filter value as supplied and as sent, the additive's included. `sent` is every ID the value
+ * went to its backend under, any of which matches: one, the final-ς ID beside it of a taxonomy
+ * value nothing confirmed (`taxonomyTextIds`), or a brand's, in the backend's form — the keys the
+ * mirror holds it under, `brandLiveIds` on the live tag path, `brandTextIds` on the text path.
+ * `canonical` is set on a taxonomy value canonicalized: on the text path, and on the tag path when
+ * the mirror is ready.
  */
 type AppliedTagFilter = {
-  key: (typeof TAG_FILTERS)[number]['key'];
+  key: (typeof TAG_FILTERS)[number]['key'] | 'additives_tag';
   label: string;
   given: string;
-  sent: string;
-  alsoSent?: string;
+  sent: readonly [string, ...string[]];
   canonical?: CanonicalTag;
 };
+
+/**
+ * A brand that keeps a search off the ready mirror, and why: the mirror holds no product under any
+ * of its keys (`not_held`), or its last full load predates brand keys (`unindexed`), so the keys it
+ * holds count only part of the brand's products.
+ */
+type OffMirrorBrand = { value: string; reason: 'not_held' | 'unindexed' };
+
+/** Why a brand kept a search off the ready mirror, in a refusal's words. */
+function offMirrorBrandReason({ value, reason }: OffMirrorBrand): string {
+  return reason === 'not_held'
+    ? `brands_tag "${value}" names no brand it holds a product under, in any of its spellings or Open Food Facts synonyms`
+    : `brands_tag "${value}" is matched there only once a full reload of it has keyed every brand, and that reload has not completed`;
+}
+
+/** The retry half of a refusal's hint when a brand the ready mirror has not keyed kept it live. */
+const BRAND_RELOAD_HINT = `Once this server's local copy of the export completes the full reload that keys every brand, it serves pages past ${TAG_SEARCH_MAX_PAGE} of a search whose every value it confirms.`;
 
 /**
  * The exclusion filters, the label each is echoed under, and the kind of data a product needs
@@ -201,35 +220,13 @@ function omittedSentence(count: number): string {
 }
 
 /**
- * The disclosure for rows that failed a nutrient constraint, shared by the notice and the text
- * surface. They are not matches, so they never read as `omittedSentence` rows do.
+ * What to do after a page every match left, shared by the notice and the text surface. `reachable`
+ * is the deepest page the search can request, so a page named here is one the window serves. An
+ * unservable code is no reason to change the search, so nothing here suggests narrowing it.
  */
-function outsideConstraintsSentence(count: number): string {
-  return count === 1
-    ? '1 row on this page was left off: its indexed value falls outside nutrient_filters. The text index compares some nutrients as whole numbers, so it returns such rows, and total still counts them.'
-    : `${count} rows on this page were left off: their indexed values fall outside nutrient_filters. The text index compares some nutrients as whole numbers, so it returns such rows, and total still counts them.`;
-}
-
-/**
- * What to do after a page every row left, shared by the notice and the text surface. `reachable` is
- * the deepest page the search can request, so a page named here is one the window serves.
- * `moreBeyond` is whether rows lie past this page. Narrowing advice goes only with rows outside the
- * constraints: an unservable code is no reason to change the search, and on the last page of the
- * answer there is nothing further for narrowing to bring forward.
- */
-function emptyPageNextStep(
-  page: number,
-  reachable: number,
-  moreBeyond: boolean,
-  outsideConstraints: boolean,
-): string {
-  if (page < reachable) {
-    return outsideConstraints
-      ? `Request page ${page + 1} for the next rows, or add query or tag filters to narrow what the index returns.`
-      : `Request page ${page + 1} for further matches.`;
-  }
-  return outsideConstraints && moreBeyond
-    ? `No further page of matches can be requested: text search serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so add query or tag filters to bring other rows into them.`
+function emptyPageNextStep(page: number, reachable: number): string {
+  return page < reachable
+    ? `Request page ${page + 1} for further matches.`
     : 'No further page of matches can be requested.';
 }
 
@@ -237,17 +234,19 @@ function emptyPageNextStep(
 type UnconfirmedTag = Extract<CanonicalTag, { resolution: 'normalized' }>;
 
 /**
- * Why an unconfirmed tag value was sent as it was, in the empty-result notice's words. A brand
- * (`no_vocabulary`) is sent as its slug, which the text path matches exactly. A failed lookup is
- * worded by its cause, with the wait when one is known: only an unavailable vocabulary is blamed on
- * the vocabulary.
+ * How a brand is matched, in the empty-result notice's words: it has no vocabulary to confirm it,
+ * so it goes under its keys (`brandKeys`), any of which matches, and never under part of a name.
+ */
+const BRAND_MATCH_REASON =
+  'as given, under its slug, and under every other name of its Open Food Facts brand entry, any of which matches, never as part of a name';
+
+/**
+ * Why an unconfirmed tag value was sent as it was, in the empty-result notice's words. A failed
+ * lookup is worded by its cause, with the wait when one is known: only an unavailable vocabulary is
+ * blamed on the vocabulary.
  */
 function unconfirmedTagReason(canonical: UnconfirmedTag): string {
-  if (canonical.reason !== 'lookup_failed') {
-    return canonical.reason === 'no_vocabulary'
-      ? 'brand synonyms are not resolved on this path'
-      : 'no matching Open Food Facts tag was found';
-  }
+  if (canonical.reason === 'no_match') return 'no matching Open Food Facts tag was found';
   switch (canonical.cause) {
     case 'budget_spent':
       return `this server's own per-minute taxonomy budget was spent, so it went unchecked; a lookup slot frees in about ${canonical.retryAfter} s`;
@@ -322,23 +321,23 @@ function livePagesHint(pageSize: number, total?: number): string {
 /**
  * The refusal of a tag-only page past `TAG_SEARCH_MAX_PAGE` that the ready mirror could not take
  * because a value went unconfirmed, so the search would read live, where that page is refused.
- * Like the exclusion refusal, it names each value and why, and `unheldBrand`, a brand the mirror
- * holds no product under, beside them. It is retryable, with the longest wait known, when every
- * value went unconfirmed only because its lookup failed and no brand is unheld: the same call is
- * then served from the mirror once the lookup succeeds. Otherwise the hint goes by each value's
- * reason: one no tag matches has no canonical ID to replace it, so it is to be corrected or dropped,
- * and one whose lookup failed is retried.
+ * Like the exclusion refusal, it names each value and why, and `offMirrorBrand`, a brand the
+ * mirror cannot match, beside them. It is retryable, with the longest wait known, when every value
+ * went unconfirmed only because its lookup failed and no brand keeps the search off the mirror: the
+ * same call is then served from the mirror once the lookup succeeds. Otherwise the hint goes by
+ * each value's reason: one no tag matches has no canonical ID to replace it, so it is to be
+ * corrected or dropped, and one whose lookup failed is retried.
  */
 function unconfirmedPageRefusal(
   page: number,
   pageSize: number,
   unconfirmed: readonly UnconfirmedValue[],
-  unheldBrand: string | undefined,
+  offMirrorBrand: OffMirrorBrand | undefined,
 ): { message: string; data: Record<string, unknown> } {
   const failed = unconfirmed.flatMap(({ canonical }) =>
     canonical.reason === 'lookup_failed' ? [canonical] : [],
   );
-  const retryable = unheldBrand === undefined && failed.length === unconfirmed.length;
+  const retryable = offMirrorBrand === undefined && failed.length === unconfirmed.length;
   const wait = longestWait(failed);
   const retryAfter = retryable ? wait : undefined;
   const values = unconfirmed.length === 1 ? 'the value' : 'the values';
@@ -358,15 +357,15 @@ function unconfirmedPageRefusal(
       ({ field, value, canonical }) =>
         `${field} "${value}" went unconfirmed (${unconfirmedTagReason(canonical)})`,
     ),
-    ...(unheldBrand === undefined
-      ? []
-      : [`brands_tag "${unheldBrand}" names no brand it holds a product under`]),
+    ...(offMirrorBrand === undefined ? [] : [offMirrorBrandReason(offMirrorBrand)]),
   ].join('; ');
   const hint = retryable
     ? `${retryAfter === undefined ? 'Retry shortly' : `Retry after ${retryAfter} s`} — once ${values} can be confirmed, this server's local copy of the export serves page ${page}. Request page ${TAG_SEARCH_MAX_PAGE} or lower to read the live database now.`
-    : unheldBrand === undefined
+    : offMirrorBrand === undefined
       ? `No Open Food Facts tag matches ${named(unmatched, 'disjunction')}: correct or drop ${unmatched.length === 1 ? 'it' : 'them'}${retryUnchecked} so this server's local copy of the export can serve page ${page}, or request page ${TAG_SEARCH_MAX_PAGE} or lower — at page_size ${pageSize} that reaches the first ${TAG_SEARCH_MAX_PAGE * pageSize} matches.`
-      : livePagesHint(pageSize);
+      : offMirrorBrand.reason === 'not_held'
+        ? livePagesHint(pageSize)
+        : `${livePagesHint(pageSize)} ${BRAND_RELOAD_HINT}`;
   return {
     message: `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only when it reads the live database, and page ${page} was requested: this server's local copy of the export serves deeper pages only when it confirms every value, and ${listed}.`,
     data: {
@@ -380,9 +379,9 @@ function unconfirmedPageRefusal(
           reason: canonical.reason,
           ...(canonical.reason === 'lookup_failed' && { cause: canonical.cause }),
         })),
-        ...(unheldBrand === undefined
+        ...(offMirrorBrand === undefined
           ? []
-          : [{ field: 'brands_tag', value: unheldBrand, reason: 'not_held' }]),
+          : [{ field: 'brands_tag', value: offMirrorBrand.value, reason: offMirrorBrand.reason }]),
       ],
       retryable,
       ...(retryAfter !== undefined && { retryAfter }),
@@ -393,26 +392,31 @@ function unconfirmedPageRefusal(
 
 /**
  * The refusal of a tag-only page past `TAG_SEARCH_MAX_PAGE` whose only value the ready mirror
- * cannot match is a brand it holds no product under: the search reads live, where that page is
- * refused, and the live count read says how many products it would match there, `liveTotal`,
- * which reaches into the page and so past every page the live database serves.
+ * cannot match is a brand (`OffMirrorBrand`): the search reads live, where that page is refused,
+ * and the live count read says how many products it would match there, `liveTotal`, which reaches
+ * into the page and so past every page the live database serves.
  */
-function unheldBrandPageRefusal(
+function offMirrorBrandPageRefusal(
   page: number,
   pageSize: number,
-  brand: string,
+  brand: OffMirrorBrand,
   liveTotal: number,
 ): { message: string; data: Record<string, unknown> } {
+  const why =
+    brand.reason === 'not_held'
+      ? `holds no product under brands_tag "${brand.value}", in any of its spellings or Open Food Facts synonyms`
+      : `matches brands_tag "${brand.value}" only once a full reload of it has keyed every brand, and that reload has not completed`;
+  const hint = livePagesHint(pageSize, liveTotal);
   return {
-    message: `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only when it reads the live database, and page ${page} was requested: this server's local copy of the export holds no product under brands_tag "${brand}", so the search reads the live database, where it matches ${liveTotal} products.`,
+    message: `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only when it reads the live database, and page ${page} was requested: this server's local copy of the export ${why}, so the search reads the live database, where it matches ${liveTotal} products.`,
     data: {
       page,
       page_size: pageSize,
       max_page: TAG_SEARCH_MAX_PAGE,
-      brand,
+      brand: brand.value,
       live_total: liveTotal,
       retryable: false,
-      recovery: { hint: livePagesHint(pageSize, liveTotal) },
+      recovery: { hint: brand.reason === 'not_held' ? hint : `${hint} ${BRAND_RELOAD_HINT}` },
     },
   };
 }
@@ -459,17 +463,20 @@ function liveDatabaseRoute(search: {
 
 /**
  * The freshness disclosure of a search the mirror answered, citing its as-of time where a live
- * tag-only answer reads the live database. The mirror orders `popularity_key` (the default) and
- * `unique_scans_n` by the values stored with each record, while the live search ranks both by its
- * own current scan counts, so those orders can differ page for page; the timestamps sort alike.
+ * tag-only answer reads the live database. Its filters matched the values stored with each record,
+ * so a computed one (a grade, an allergen, an additive, an ingredient-analysis tag) is matched as
+ * the note bounds it. The mirror orders `popularity_key` (the default) and `unique_scans_n` by the
+ * values stored with each record, while the live search ranks both by its own current scan counts,
+ * so those orders can differ page for page; scan counts also move without an edit, so the stored
+ * ones are no newer than the record's last edit or the last full reload. The timestamps sort alike.
  */
 function mirrorSnapshotNote(mirrorAsOf: string, sortBy: SearchParams['sort_by']): string {
   const scanSort = sortBy ?? 'popularity_key';
   const order =
     scanSort === 'popularity_key' || scanSort === 'unique_scans_n'
-      ? ` ${sortBy === undefined ? 'The default order follows' : 'The order follows'} the ${scanSort} value stored with each record as of then, which can differ page for page from a live search, where Open Food Facts orders it by its current scan counts.`
+      ? ` ${sortBy === undefined ? 'The default order follows' : 'The order follows'} each record's stored ${scanSort}, which can differ page for page from a live search, where Open Food Facts orders it by its current scan counts.`
       : '';
-  return `${mirrorCopyNote('These results come', mirrorAsOf, 'a product contributed or edited since then is missing or shown as it was')}${order}`;
+  return `${mirrorCopyNote('These results come', mirrorAsOf, 'a product contributed or edited since then is missing or shown as it was')} The filters matched the values stored with each record, computed ones included.${order}`;
 }
 
 /** The unit an indexed nutrient value is in: energy in kcal, everything else in grams. */
@@ -496,11 +503,6 @@ const INDEXED_NUTRIMENTS_SHAPE = Object.fromEntries(
     ];
   }),
 ) as Record<IndexedNutrientKey, z.ZodOptional<z.ZodNumber>>;
-
-/** The `indexed_nutriments` keys of the nutrients the text index compares as whole numbers. */
-const WHOLE_NUMBER_KEYS: ReadonlySet<string> = new Set(
-  [...WHOLE_NUMBER_NUTRIENTS].map(indexedNutrientKey),
-);
 
 /** The constraints as the caller wrote them, for echoing: `sugars < 8, proteins >= 5`. */
 function constraintEcho(filters: readonly NutrientFilter[]): string {
@@ -535,7 +537,7 @@ function textIndexSnapshotNote(asOf: string | undefined): string {
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, quantity (which tells pack sizes of one product apart), Nutri-Score, NOVA group, Green-Score, categories, data completeness, and when each record was last modified and created — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, and combine the same way, and each row then carries the indexed values the thresholds were checked against; ingredients_tag takes canonical ingredient IDs (e.g. "en:inulin") that must all appear among the ingredients Open Food Facts parsed from the label, and combines the same way; additives_tag is the one exception, filtering only on searches carrying none of query, nutrient_filters, or ingredients_tag. nutrition_grade, nova_group, and ecoscore_grade (Green-Score) each take one grade or an array matching any of them. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query, nutrient_filters, or ingredients_tag is answered by the text index, a snapshot that lags the live database and whose newest record text_index_as_of dates, while a tag-only search reads the live database and is current, or, where this server keeps a local copy of the Open Food Facts export, can be served from that copy, which source and mirror_as_of then report and whose default order and popularity_key or unique_scans_n sort follow the values stored with each record, so they can differ from a live search, which ranks by its current scan counts — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, quantity (which tells pack sizes of one product apart), Nutri-Score, NOVA group, Green-Score, categories, data completeness, and when each record was last modified and created — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name or generic name, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France). The query searches names only, so express a category, label, or brand as categories_tag, labels_tag, or brands_tag rather than as query words. Numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, each compared as given, and combine the same way; they reach only products whose text-index entry carries the constrained nutrient, and each row then carries the indexed values the thresholds were compared against. ingredients_tag takes canonical ingredient IDs (e.g. "en:inulin") that must all appear among the ingredients Open Food Facts parsed from the label, and combines the same way. nutrition_grade, nova_group, and ecoscore_grade (Green-Score) each take one grade or an array matching any of them. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query, nutrient_filters, or ingredients_tag is answered by the text index, a snapshot that lags the live database and whose newest record text_index_as_of dates, while a tag-only search reads the live database and is current, or, where this server keeps a local copy of the Open Food Facts export, can be served from that copy, which source and mirror_as_of then report and whose default order and popularity_key or unique_scans_n sort follow the values stored with each record, so they can differ from a live search, which ranks by its current scan counts — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -543,7 +545,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database and whose newest record text_index_as_of dates; drop it, and nutrient_filters and ingredients_tag, which route there too, to run the same tag filters against the live database or, where this server keeps one, its local copy of the export.`,
+        `Words to find. Every word must match the product name or generic name, in the product's main language or any of the major languages the text index analyzes, so a product named only in French is found by its French name. Categories, labels, brand, ingredients, and quantity are not searched, so express a category, label, or brand as categories_tag, labels_tag, or brands_tag (off_browse_taxonomy resolves category and label IDs), and put here only words the product name would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words such as "with", "the", "de", and "mit" are not required, and neither is a word that is a stop word in one of the languages searched (such as Spanish "soy"). At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database and whose newest record text_index_as_of dates; drop it, and nutrient_filters and ingredients_tag, which route there too, to run the same tag filters against the live database or, where this server keeps one, its local copy of the export.`,
       ),
     categories_tag: z
       .string()
@@ -555,7 +557,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Brand name as printed, or its slug (lowercased, hyphenated). Example: "nutella", "kellogg-s". A brand name is slugged the way Open Food Facts slugs it — lowercased, common Latin accents dropped, punctuation and spaces hyphenated ("Ben & Jerry\'s" → "ben-jerry-s", "Nestlé" → "nestle") — and then matched exactly; a search by tag filters alone that reads the live database also resolves brand synonyms. A partial or misspelled brand matches nothing rather than falling back to a near match, so put open-ended brand wording in query instead.',
+        'Brand name as printed, or its slug (lowercased, hyphenated). Example: "nutella", "kellogg-s". A brand is matched as a whole name: as given, under its slug — lowercased, common Latin accents dropped, punctuation and spaces hyphenated ("Ben & Jerry\'s" → "ben-jerry-s", "Nestlé" → "nestle"), the form older Open Food Facts records store it under — and under every other name its Open Food Facts brand entry lists, so "7-Up", "7up", and "Seven Up" match the same products. A partial or misspelled brand matches nothing rather than falling back to a near match. Query words reach product names only, so a brand is matched through this filter, never through query.',
       ),
     labels_tag: allOfTagInput(
       'One canonical label tag ID.',
@@ -605,13 +607,13 @@ export const offSearchProductsTool = tool('off_search_products', {
     )
       .optional()
       .describe(
-        `Canonical ingredient tag ID, or an array of up to 10 that must all appear among the ingredients Open Food Facts parsed from the label. Example: "en:inulin", or ["en:inulin", "en:oat"] for products listing both. IDs are singular ("en:oat", not "en:oats"); use off_browse_taxonomy with facet="ingredients" to resolve them, and use ingredients_analysis_tag instead for a vegan, vegetarian, or palm-oil verdict. Each parsed ingredient also carries its taxonomy parents, so "en:vegetable" matches a product listing carrot. Served only by the text index, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the ${TEXT_SEARCH_RESULT_WINDOW}-result page window, and additives_tag cannot be combined with it.`,
+        `Canonical ingredient tag ID, or an array of up to 10 that must all appear among the ingredients Open Food Facts parsed from the label. Example: "en:inulin", or ["en:inulin", "en:oat"] for products listing both. IDs are singular ("en:oat", not "en:oats"); use off_browse_taxonomy with facet="ingredients" to resolve them, and use ingredients_analysis_tag instead for a vegan, vegetarian, or palm-oil verdict. Each parsed ingredient also carries its taxonomy parents, so "en:vegetable" matches a product listing carrot. Served only by the text index, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the ${TEXT_SEARCH_RESULT_WINDOW}-result page window.`,
       ),
     additives_tag: z
       .string()
       .optional()
       .describe(
-        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives". Available only on searches carrying none of query, nutrient_filters, or ingredients_tag — each routes to a backend with no additives field, so combining them is rejected instead of silently returning nothing.',
+        'Canonical additive (E-number) tag ID. Example: "en:e322", "en:e330". Use off_browse_taxonomy with facet="additives".',
       ),
     nutrition_grade: z
       .union([
@@ -683,7 +685,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .max(18)
       .optional()
       .describe(
-        `Numeric constraints on nutrient values per 100 g, or per 100 ml for liquids, combined as AND with each other and with every other filter. Pair two entries on the same nutrient to express a range (e.g. sugars gte 2 and sugars lte 8). Served only by the text backend, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the 10,000-result page window, and additives_tag cannot be combined with it. The text index compares ${[...WHOLE_NUMBER_NUTRIENTS].join(', ')} as whole numbers, so every returned row is checked against these constraints: a row outside them leaves the page and counts in outside_constraints, and a nutrient the index holds no value for does not count against a row. A page can come back short or empty while later pages hold matches, and a range inside one whole number (sugars gt 3.9 and lt 4) can pass few rows of the 10,000 reachable, so add query or tag filters to narrow it. Per-serving and prepared-product values are not searchable.`,
+        `Numeric constraints on nutrient values per 100 g, or per 100 ml for liquids, combined as AND with each other and with every other filter. Each bound is compared as given, decimals included: sugars gt 3.5 excludes 3.5 and keeps 3.6. Pair two entries on the same nutrient to express a range (e.g. sugars gte 2 and sugars lte 8). A constraint reaches only products whose text-index entry carries that nutrient, and many entries carry no nutrient values even when the record off_get_product reads has them, so a product meeting the constraint can be missing from the results, and an empty result does not show that none exists. Served only by the text backend, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the ${TEXT_SEARCH_RESULT_WINDOW}-result page window. Per-serving and prepared-product values are not searchable.`,
       ),
     sort_by: z
       .enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'])
@@ -697,7 +699,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .min(1)
       .default(1)
       .describe(
-        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size ${2 * SEARCH_PAGE_SIZE_CAP} is results ${SEARCH_PAGE_SIZE_CAP + 1}–${2 * SEARCH_PAGE_SIZE_CAP}). A search by tag filters alone that reads the live database is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches; where this server keeps a local copy of the export, a tag-only search whose every value it confirms (canonical IDs from off_browse_taxonomy, and a brand it holds products under) is served from that copy through its first ${MIRROR_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${MIRROR_SEARCH_RESULT_WINDOW} there. One carrying ecoscore_grade is served from that copy only once a full reload of it has indexed Green-Score. A search carrying query, nutrient_filters, or ingredients_tag serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past any of these bounds is rejected rather than sent; narrow the filters or change sort_by to bring other products forward. A brand the local copy holds no product under is the exception on a page past ${TAG_SEARCH_MAX_PAGE}: one live count answers it empty, with that total, when the live matches end before the page, and rejects it when they reach into it.`,
+        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size ${2 * SEARCH_PAGE_SIZE_CAP} is results ${SEARCH_PAGE_SIZE_CAP + 1}–${2 * SEARCH_PAGE_SIZE_CAP}). A search by tag filters alone that reads the live database is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches; where this server keeps a local copy of the export, a tag-only search whose every value it confirms (canonical IDs from off_browse_taxonomy, and a brand it holds products under in any of its spellings or Open Food Facts synonyms) is served from that copy through its first ${MIRROR_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${MIRROR_SEARCH_RESULT_WINDOW} there. One carrying ecoscore_grade is served from that copy only once a full reload of it has indexed Green-Score, and one carrying brands_tag only once a full reload of it has keyed every brand. A search carrying query, nutrient_filters, or ingredients_tag serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past any of these bounds is rejected rather than sent; narrow the filters or change sort_by to bring other products forward. A brand the local copy cannot match — one it holds no product under, or any brand before that reload — is the exception on a page past ${TAG_SEARCH_MAX_PAGE}: one live count answers it empty, with that total, when the live matches end before the page, and rejects it when they reach into it.`,
       ),
     page_size: z
       .number()
@@ -719,12 +721,12 @@ export const offSearchProductsTool = tool('off_search_products', {
     total: z
       .number()
       .describe(
-        'Matching products in the database for this search. Exact unless total_is_lower_bound is true, in which case at least this many match and the real figure is unknown. On a search constraining a nutrient the text index compares as a whole number (see nutrient_filters) this is its whole-number answer, which can include rows those constraints rule out.',
+        'Matching products in the database for this search. Exact unless total_is_lower_bound is true, in which case at least this many match and the real figure is unknown.',
       ),
     total_is_lower_bound: z
       .boolean()
       .describe(
-        'True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count. On a search constraining a whole-number nutrient the floor is on the whole-number answer, not on the products that meet the constraints.',
+        'True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count.',
       ),
     page: z.number().describe('Current page number (1-based).'),
     page_size: z
@@ -735,25 +737,19 @@ export const offSearchProductsTool = tool('off_search_products', {
     page_count: z
       .number()
       .describe(
-        'Products returned on this page — page_size except on the last page, or when a match stored under a code Open Food Facts cannot serve or a row outside nutrient_filters was left off. Not the total number of pages.',
+        'Products returned on this page — page_size except on the last page, or when a match stored under a code Open Food Facts cannot serve was left off. Not the total number of pages.',
       ),
     last_page: z
       .number()
       .optional()
       .describe(
-        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone that read the live database, by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers, and by the local copy's ${MIRROR_SEARCH_RESULT_WINDOW}-result window when source is "off_mirror". Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all. On a search constraining a whole-number nutrient it counts pages of the whole-number answer, so a page up to it can list few products or none.`,
+        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone that read the live database, by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers, and by the local copy's ${MIRROR_SEARCH_RESULT_WINDOW}-result window when source is "off_mirror". Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all.`,
       ),
     omitted: z
       .number()
       .optional()
       .describe(
         'Matches on this page left off because Open Food Facts stores them under a code it cannot serve (not 4–40 digits once leading zeros are stripped), so off_get_product could not look them up either. Absent when none was. total still counts them.',
-      ),
-    outside_constraints: z
-      .number()
-      .optional()
-      .describe(
-        'Rows the text index returned on this page that fail nutrient_filters on their indexed values, compared at the 32-bit precision the index uses, and so left off. The index returns them because it compares some nutrients as whole numbers. Separate from omitted, whose rows are matches; a row both unservable and outside counts only in omitted. total, total_is_lower_bound, and last_page still count these rows, and each page keeps its place in the result set. Absent when none was.',
       ),
     source: z
       .enum(['off_api', 'off_mirror'])
@@ -788,7 +784,9 @@ export const offSearchProductsTool = tool('off_search_products', {
             brands: z
               .string()
               .optional()
-              .describe('Brand name(s), comma-separated. Absent when not yet entered.'),
+              .describe(
+                'Brand name(s), comma-separated. Absent when not yet entered. On a search the text index answers, the brands as that index stores them — each a brand\'s slug or its name as a contributor typed it (e.g. "heinz", "Member\'s Mark") — rather than the display name off_get_product returns.',
+              ),
             quantity: z
               .string()
               .optional()
@@ -827,7 +825,7 @@ export const offSearchProductsTool = tool('off_search_products', {
               .string()
               .optional()
               .describe(
-                'When the record was last edited, as an ISO 8601 time (e.g. "2026-05-26T19:35:02.000Z") — the value sort_by "last_modified_t" orders by. On a search the text index answers, the edit time of the revision it indexed, which can be years older than the live record off_get_product reads; when source is "off_mirror", that of the revision the local copy holds. Absent when the record holds none.',
+                'When the record was last edited, as an ISO 8601 time (e.g. "2026-05-26T19:35:02.000Z") — the value sort_by "last_modified_t" orders by. On a search the text index answers, the edit time of the revision it indexed: the index lags the live database, so off_get_product can read a later revision; when source is "off_mirror", that of the revision the local copy holds. Absent when the record holds none.',
               ),
             created: z
               .string()
@@ -839,7 +837,7 @@ export const offSearchProductsTool = tool('off_search_products', {
               .object(INDEXED_NUTRIMENTS_SHAPE)
               .optional()
               .describe(
-                'Present on every row of a search carrying nutrient_filters, and only there: the values the text index holds for the constrained nutrients, per 100 g, or per 100 ml for liquids — the values the filters were checked against. Keyed as off_get_product keys them (sugars_100g, energy_kcal_100g). A nutrient the index holds no value for is left out, never zero-filled, so the object can be empty, and it does not count against the row. off_get_product returns the current record, whose values can differ.',
+                'Present on every row of a search carrying nutrient_filters, and only there: the values the text index holds for the constrained nutrients, per 100 g, or per 100 ml for liquids — the values the filters were compared against. Keyed as off_get_product keys them (sugars_100g, energy_kcal_100g). A nutrient the index holds no numeric value for is left out, never zero-filled. off_get_product returns the current record, whose values can differ.',
               ),
           })
           .describe('A single matching product summary row.'),
@@ -852,19 +850,19 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, names the current page and how far the backend will actually paginate when more results exist, or, on a page that returned no rows because it lies past the last match or every row was left off, says which page to request instead. When rows outside nutrient_filters emptied the page and more rows can be reached or lie past the window, it also suggests adding query or tag filters.',
+        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, names the current page and how far the backend will actually paginate when more results exist, or, on a page that returned no rows because it lies past the last match or every match on it was left off, says which page to request instead.',
       ),
     text_index_snapshot: z
       .string()
       .optional()
       .describe(
-        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a product can be missing from them while the tag-only path still returns it: when text_index_as_of is present it names that time and says a product contributed since is missing and one edited since is matched and shown as it was then; otherwise it says a recently contributed product can be missing. On a search carrying nutrition_grade, nova_group, or ecoscore_grade it also says those filters were matched against the grades the index holds, which each row shows and which can differ from what off_get_product returns. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. When a constraint falls on a whole-number nutrient (see nutrient_filters) it also says that total, total_is_lower_bound, and last_page describe the whole-number answer and that rows outside the constraints count in outside_constraints. Absent on tag-only searches, which read the live database or, when source is "off_mirror", the local copy mirror_snapshot describes.',
+        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a product can be missing from them while the tag-only path still returns it: when text_index_as_of is present it names that time and says a product contributed since is missing and one edited since is matched and shown as it was then; otherwise it says a recently contributed product can be missing. On a search carrying nutrition_grade, nova_group, or ecoscore_grade it also says those filters were matched against the grades the index holds, which each row shows and which can differ from what off_get_product returns. On a search carrying nutrient_filters it also echoes the constraints and says they were compared as given against the index values each row carries as indexed_nutriments, so they reach only products whose index entry carries each constrained nutrient, and that those values can differ from what off_get_product returns. Absent on tag-only searches, which read the live database or, when source is "off_mirror", the local copy mirror_snapshot describes.',
       ),
     mirror_snapshot: z
       .string()
       .optional()
       .describe(
-        'Present only when source is "off_mirror". States that the results come from the local copy as of mirror_as_of, so a product contributed or edited since is missing or shown as it was, and, under the default order or a popularity_key or unique_scans_n sort, that the order follows the values stored with each record and can differ from a live search.',
+        "Present only when source is \"off_mirror\". States that the results come from the local copy, which reflects contributor edits through mirror_as_of, so a product contributed or edited since is missing or shown as it was; that computed values (grades, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; that a product removed since that reload can still be shown; that the filters matched the values stored with each record, computed ones included; and, under the default order or a popularity_key or unique_scans_n sort, that the order follows each record's stored value and can differ from a live search.",
       ),
     exclusion_coverage: z
       .string()
@@ -919,26 +917,17 @@ export const offSearchProductsTool = tool('off_search_products', {
         'Resolve each excluded value to its canonical allergen tag ID with off_browse_taxonomy (facet "allergens"), such as "en:nuts" or "en:milk", and search again.',
     },
     {
-      reason: 'additives_filter_needs_tag_search',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'additives_tag was combined with a query, nutrient_filters, or ingredients_tag, which route to a backend that cannot filter by additive',
-      retryable: false,
-      severity: 'warning',
-      recovery:
-        'Drop query, nutrient_filters, and ingredients_tag to search by tags alone and keep the additive filter, or drop additives_tag to keep them. Every other filter combines freely.',
-    },
-    {
       reason: 'query_too_long',
       code: JsonRpcErrorCode.ValidationError,
-      when: `query carries more than ${MAX_QUERY_WORDS} words, more than the text backend can require at once`,
+      when: `query carries more than ${MAX_QUERY_WORDS} words, the most one text search accepts`,
       retryable: false,
       severity: 'warning',
-      recovery: `Keep only the few distinctive words the product's name, brand, or category would carry (at most ${MAX_QUERY_WORDS}, and every one must match), and move brand, category, label, allergen, or country wording into the matching tag filter.`,
+      recovery: `Keep only the few distinctive words of the product's name (at most ${MAX_QUERY_WORDS}, and every one must match), and move brand, category, label, allergen, or country wording into the matching tag filter.`,
     },
     {
       reason: 'page_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE} and would read the live database — this server keeps no ready local copy of the export, a tag value is one it cannot confirm, the brand is one it holds no product under and the live database matches enough products to reach into the requested page, or the search carries ecoscore_grade before a full reload of that copy has indexed Green-Score — or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, or one the local copy serves beyond its ${MIRROR_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
+      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE} and would read the live database — this server keeps no ready local copy of the export, a tag value is one it cannot confirm, the brand is one it holds no product under, or one it has not yet keyed in a full reload, and the live database matches enough products to reach into the requested page, or the search carries ecoscore_grade before a full reload of that copy has indexed Green-Score — or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, or one the local copy serves beyond its ${MIRROR_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
       retryable: false,
       severity: 'warning',
       recovery:
@@ -968,8 +957,10 @@ export const offSearchProductsTool = tool('off_search_products', {
       when: 'Open Food Facts refuses the request with a 4xx other than 408, 425, or 429, or with 501 Not Implemented — the request as formed will be refused again',
       retryable: false,
       thrownBy: 'service',
+      // Static: the service throws this reason with no hint, and a handler that rewrote it per call
+      // would have to catch. The wording covers both paths without asserting any input is wrong.
       recovery:
-        'Do not retry. Read data.status and the upstream explanation in the message, then correct the filter values.',
+        'Do not resend the same request. Read data.status and the upstream explanation in the message, and change an input only when that explanation names a value this call supplied; otherwise Open Food Facts refused the request as this server built it, and when the call carried query, nutrient_filters, or ingredients_tag, the same tag filters without them are answered by a different backend.',
     },
     {
       reason: 'rate_limited',
@@ -988,8 +979,8 @@ export const offSearchProductsTool = tool('off_search_products', {
     const hasIngredients = tagValues(input.ingredients_tag).length > 0;
     // Nutrient constraints are served only by the text backend, and an ingredient filter only from
     // it (the mirror indexes no ingredients, and the live tag path stops at page 10), so either
-    // carries every property of that path — the result window, the lagging index, the absent
-    // additives facet — with or without a query.
+    // carries every property of that path — the result window, the lagging index — with or
+    // without a query.
     const servedByTextBackend = Boolean(query) || nutrientFilters.length > 0 || hasIngredients;
     // Every page computation below — what is sent, the page bounds, last_page, truncation — runs at
     // the size served, so a repeated over-cap page_size pages contiguously in pages of the cap.
@@ -1020,24 +1011,12 @@ export const offSearchProductsTool = tool('off_search_products', {
       throw ctx.fail('no_filters', 'At least one search parameter is required.');
     }
 
-    // Only the tag-filter backend indexes additives. The text backend accepts an additives clause
-    // and answers zero hits for every value, so honoring the combination would report "no such
-    // product" about products that plainly exist. Refuse it instead of returning that lie.
-    if (servedByTextBackend && additive) {
-      throw ctx.fail(
-        'additives_filter_needs_tag_search',
-        'additives_tag filters only on searches the tag backend answers — a query, a nutrient constraint, or an ingredient filter moves the search to a backend with no additives field, so pairing them would match nothing regardless of the additive.',
-        { additives_tag: input.additives_tag },
-      );
-    }
-
-    // Every word costs clauses in the backend's query, and past its clause ceiling the backend
-    // answers with an error in place of results. Refuse before spending a request on it.
+    // A longer query is refused before a request is spent on it.
     const wordCount = query ? countQueryWords(query) : 0;
     if (wordCount > MAX_QUERY_WORDS) {
       throw ctx.fail(
         'query_too_long',
-        `query has ${wordCount} words; the text backend can require at most ${MAX_QUERY_WORDS} at once.`,
+        `query has ${wordCount} words; a text search accepts at most ${MAX_QUERY_WORDS}.`,
         { word_count: wordCount, max_words: MAX_QUERY_WORDS },
       );
     }
@@ -1054,6 +1033,13 @@ export const offSearchProductsTool = tool('off_search_products', {
       grades.some(({ key }) => key === 'ecoscore_grade') &&
       !(await svc.mirrorIndexesGreenScore(ctx));
     const mirror = mirrorReady && !greenScoreUnindexed;
+    // Rows built before the mirror keyed brands hold a brand under the spelling their record
+    // carries, so a brand's keys there count part of its products. Until a full load has keyed
+    // every brand, a search carrying brands_tag reads live, as one the mirror holds no product
+    // under does, with the live count answering a page past TAG_SEARCH_MAX_PAGE.
+    const brand = tagValues(input.brands_tag)[0];
+    const brandUnindexed =
+      mirror && brand !== undefined && !(await svc.mirrorIndexesBrandKeys(ctx));
 
     // Product Opener refuses every anonymous page past 10 with an HTTP 401, whatever the page_size
     // and however few products match. Reject such a page with the bound instead of sending a
@@ -1139,26 +1125,25 @@ export const offSearchProductsTool = tool('off_search_products', {
     // recognizes is a negation that matches nothing, so it would exclude nothing and return every
     // product as though the exclusion held.
     //
-    // A brand has no vocabulary: the mirror matches it under a slug some product it holds carries,
-    // its own `brandSlug` first, and with neither held the search reads live, where Product Opener
-    // resolves the brand as given, synonyms included.
+    // A brand has no vocabulary and is never looked up: it goes under its keys (`brandKeys`, its
+    // spellings and its Open Food Facts synonyms). The mirror matches it under the keys some
+    // product it holds carries, and with none held the search reads live.
     //
     // Every lookup runs in this one parallel batch, so a call's longest chain stays one lookup
     // deadline plus one search read.
     const canonicalize = servedByTextBackend || mirror;
     const taxonomy = getTaxonomyService();
-    const brand = tagValues(input.brands_tag)[0];
     const [resolvedTags, exclusions, canonicalAdditive, heldBrand] = await Promise.all([
       Promise.all(
-        TAG_FILTERS.flatMap(({ key, facet, label }) =>
-          tagValues(input[key]).map(
-            (given): Promise<Omit<AppliedTagFilter, 'sent'>> =>
-              canonicalize
-                ? taxonomy
-                    .canonicalizeTag(facet, given, ctx)
-                    .then((canonical) => ({ key, label, given, canonical }))
-                : Promise.resolve({ key, label, given }),
-          ),
+        TAG_FILTERS.flatMap((filter) =>
+          tagValues(input[filter.key]).map((given): Promise<Omit<AppliedTagFilter, 'sent'>> => {
+            const { key, label } = filter;
+            return canonicalize && 'facet' in filter
+              ? taxonomy
+                  .canonicalizeTag(filter.facet, given, ctx)
+                  .then((canonical) => ({ key, label, given, canonical }))
+              : Promise.resolve({ key, label, given });
+          }),
         ),
       ),
       Promise.all(
@@ -1171,8 +1156,10 @@ export const offSearchProductsTool = tool('off_search_products', {
           ),
         ),
       ),
-      mirror && additive ? taxonomy.canonicalizeTag('additives', additive, ctx) : undefined,
-      mirror && brand !== undefined ? svc.mirrorHeldBrand(brandSlugs(brand), ctx) : undefined,
+      canonicalize && additive ? taxonomy.canonicalizeTag('additives', additive, ctx) : undefined,
+      mirror && brand !== undefined && !brandUnindexed
+        ? svc.mirrorHeldBrand(brandKeys(brand), ctx)
+        : undefined,
     ]);
 
     const refused = exclusions.flatMap(({ key, given, canonical }) =>
@@ -1218,28 +1205,29 @@ export const offSearchProductsTool = tool('off_search_products', {
     const unconfirmed: UnconfirmedValue[] = mirror
       ? [
           ...resolvedTags.flatMap(({ key, given, canonical }) =>
-            key !== 'brands_tag' && canonical?.resolution === 'normalized'
-              ? [{ field: key, value: given, canonical }]
-              : [],
+            canonical?.resolution === 'normalized' ? [{ field: key, value: given, canonical }] : [],
           ),
           ...(additive && canonicalAdditive?.resolution === 'normalized'
             ? [{ field: 'additives_tag', value: additive, canonical: canonicalAdditive }]
             : []),
         ]
       : [];
-    const unheldBrand = mirror && heldBrand === undefined ? brand : undefined;
-    const allConfirmed = mirror && unconfirmed.length === 0 && unheldBrand === undefined;
+    const offMirrorBrand: OffMirrorBrand | undefined =
+      mirror && brand !== undefined && heldBrand === undefined
+        ? { value: brand, reason: brandUnindexed ? 'unindexed' : 'not_held' }
+        : undefined;
+    const allConfirmed = mirror && unconfirmed.length === 0 && offMirrorBrand === undefined;
     // The mirror is ready (an earlier check refused this page without it) but cannot match a value,
     // so the search would read live, which cannot serve this page. The refusal names each such
     // value, since one whose lookup failed is served from the mirror on a retry. When the only such
-    // value is a brand the mirror holds no product under, a live count settles the page below.
+    // value is the brand, a live count settles the page below.
     const pastLivePages = !servedByTextBackend && input.page > TAG_SEARCH_MAX_PAGE;
     if (pastLivePages && unconfirmed.length > 0) {
       const { message, data } = unconfirmedPageRefusal(
         input.page,
         pageSize,
         unconfirmed,
-        unheldBrand,
+        offMirrorBrand,
       );
       throw ctx.fail('page_out_of_range', message, data);
     }
@@ -1248,20 +1236,26 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     // Canonical values reach the text backend always, and the tag path only on a search the mirror
-    // serves, the brand under the slug the mirror holds; any other tag-only search sends each value
-    // as given, as it did before the mirror. A confirmed value goes under its entry's ID. The text
-    // index holds a value nothing confirmed under the ID the text each record carries gives it, so
-    // one ending in a capital sigma goes there under both IDs it can take (`brandTextSlugs`,
-    // `taxonomyTextIds`): `ΌΛΥΜΠΟΣ` matches its records under `όλυμπος`.
+    // serves; any other tag-only search sends each value as given, as it did before the mirror. A
+    // confirmed value goes under its entry's ID. The text index holds a value nothing confirmed
+    // under the ID the text each record carries gives it, so one ending in a capital sigma goes
+    // there under both IDs it can take (`taxonomyTextIds`). A brand goes under its keys in each
+    // backend's form: the ones the mirror holds, `brandLiveIds` on the live tag path, and
+    // `brandTextIds` on the text path.
     const sendCanonical = servedByTextBackend || allConfirmed;
-    const tagFilters: AppliedTagFilter[] = resolvedTags.map((filter) => {
+    const tagFilters: AppliedTagFilter[] = resolvedTags.map((filter): AppliedTagFilter => {
       const { key, given, canonical } = filter;
-      if (!sendCanonical || canonical === undefined) return { ...filter, sent: given };
-      if (canonical.resolution === 'vocabulary') return { ...filter, sent: canonical.value };
-      if (key === 'brands_tag' && heldBrand !== undefined) return { ...filter, sent: heldBrand };
-      const [sent, alsoSent] =
-        key === 'brands_tag' ? brandTextSlugs(given) : taxonomyTextIds(given);
-      return { ...filter, sent, ...(alsoSent !== undefined && { alsoSent }) };
+      if (key === 'brands_tag') {
+        const sent = servedByTextBackend
+          ? brandTextIds(given)
+          : allConfirmed && heldBrand !== undefined
+            ? heldBrand
+            : brandLiveIds(given);
+        return { ...filter, sent };
+      }
+      if (!sendCanonical || canonical === undefined) return { ...filter, sent: [given] };
+      if (canonical.resolution === 'vocabulary') return { ...filter, sent: [canonical.value] };
+      return { ...filter, sent: taxonomyTextIds(given) };
     });
 
     const searchParams: ProductSearch = {
@@ -1272,12 +1266,13 @@ export const offSearchProductsTool = tool('off_search_products', {
     for (const filter of TAG_FILTERS) {
       const values = tagFilters
         .filter(({ key }) => key === filter.key)
-        .map(({ sent, alsoSent }): TagValue => (alsoSent === undefined ? sent : [sent, alsoSent]));
+        .map(({ sent }): TagValue => (sent.length === 1 ? sent[0] : [...sent]));
       const [first] = values;
       if (first === undefined) continue;
-      // A value sent under two IDs goes as both, any of which matches. An all-of list stays a list
-      // for the service, even of one, and so does a single value sent under two IDs, since two IDs
-      // as the list itself would each be required; any other string stays a string.
+      // A value sent under several IDs goes as all of them, any of which matches. An all-of list
+      // stays a list for the service, even of one, and so does a single value sent under several
+      // IDs, since several IDs as the list itself would each be required; any other string stays a
+      // string.
       if ('allOf' in filter && (Array.isArray(input[filter.key]) || typeof first !== 'string')) {
         searchParams[filter.key] = values;
       } else {
@@ -1288,10 +1283,19 @@ export const offSearchProductsTool = tool('off_search_products', {
       const sent = exclusions.filter((e) => e.key === key).map((e) => e.canonical.value);
       if (sent.length > 0) searchParams[key] = sent;
     }
-    if (additive) {
-      searchParams.additives_tag =
-        allConfirmed && canonicalAdditive ? canonicalAdditive.value : additive;
-    }
+    // The additive is canonicalized and sent as the values above are, under one ID: the service
+    // takes one additive. It joins them wherever the sent tag values are named.
+    const additiveFilter: AppliedTagFilter | undefined = additive
+      ? {
+          key: 'additives_tag',
+          label: 'additive',
+          given: additive,
+          sent: [sendCanonical && canonicalAdditive ? canonicalAdditive.value : additive],
+          ...(canonicalAdditive && { canonical: canonicalAdditive }),
+        }
+      : undefined;
+    if (additiveFilter) searchParams.additives_tag = additiveFilter.sent[0];
+    const sentTags = additiveFilter ? [...tagFilters, additiveFilter] : tagFilters;
     if (input.ingredients_analysis_tag) {
       searchParams.ingredients_analysis_tag = input.ingredients_analysis_tag;
     }
@@ -1304,11 +1308,11 @@ export const offSearchProductsTool = tool('off_search_products', {
     if (input.sort_by) searchParams.sort_by = input.sort_by;
     if (allConfirmed) searchParams.tags_confirmed = true;
 
-    // A page past the live bound that only a brand the mirror holds no product under keeps off it
-    // reads live, which serves no such page, so the same filters are counted there instead: a total
-    // that ends before the page starts answers the page empty with that total, as the mirror would
-    // answer it, and one reaching into the page is refused.
-    const countFirst = pastLivePages && unheldBrand !== undefined;
+    // A page past the live bound that only a brand the mirror cannot match keeps off it reads live,
+    // which serves no such page, so the same filters are counted there instead: a total that ends
+    // before the page starts answers the page empty with that total, as the mirror would answer
+    // it, and one reaching into the page is refused.
+    const countFirst = pastLivePages && offMirrorBrand !== undefined;
     let response = await svc.searchProducts(
       countFirst ? { ...searchParams, page: 1, page_size: 1 } : searchParams,
       ctx,
@@ -1318,10 +1322,10 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
     if (countFirst) {
       if (response.count > (input.page - 1) * pageSize) {
-        const { message, data } = unheldBrandPageRefusal(
+        const { message, data } = offMirrorBrandPageRefusal(
           input.page,
           pageSize,
-          unheldBrand,
+          offMirrorBrand,
           response.count,
         );
         throw ctx.fail('page_out_of_range', message, data);
@@ -1345,15 +1349,11 @@ export const offSearchProductsTool = tool('off_search_products', {
       ingredients: hasIngredients,
       query: Boolean(query),
       tagPathFilters:
-        tagFilters.some(({ key }) => key !== 'ingredients_tag') ||
+        sentTags.some(({ key }) => key !== 'ingredients_tag') ||
         exclusions.length > 0 ||
         Boolean(input.ingredients_analysis_tag) ||
         grades.length > 0,
     });
-    // Once each, since a range pair names its nutrient twice.
-    const wholeNumber = [...new Set(nutrientFilters.map(({ nutrient }) => nutrient))].filter(
-      (nutrient) => WHOLE_NUMBER_NUTRIENTS.has(nutrient),
-    );
     if (servedByTextBackend) {
       // The index's grades lag the live records as its product set does, and a grade filter
       // matches them, so a row's grade can differ from the product's current one.
@@ -1363,16 +1363,14 @@ export const offSearchProductsTool = tool('off_search_products', {
         gradeKeys.length > 0
           ? ` The ${gradeSubject} ${gradeKeys.length === 1 ? 'filter was' : 'filters were'} matched against the grades this index holds, which each row shows; off_get_product returns the current record, whose grades can differ.`
           : '';
-      const checkedAgainst =
+      // Many index entries carry no nutrient values, and a constraint cannot reach a record whose
+      // entry lacks its nutrient, whatever the live record holds.
+      const comparedAgainst =
         nutrientFilters.length > 0
-          ? ` The nutrient constraints (${constraintEcho(nutrientFilters)}) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.`
-          : '';
-      const wholeNumberAnswer =
-        wholeNumber.length > 0
-          ? ` The index compares ${wholeNumber.join(', ')} as whole numbers, so total, total_is_lower_bound, and last_page describe its whole-number answer, and rows of that answer outside these constraints are left off each page and counted in outside_constraints.`
+          ? ` The nutrient constraints (${constraintEcho(nutrientFilters)}) were compared as given against this index's values, shown on each row as indexed_nutriments, so they reach only products whose index entry carries each constrained nutrient, which many entries do not; off_get_product returns the current record, whose values can differ.`
           : '';
       ctx.enrich({
-        text_index_snapshot: `${textIndexSnapshotNote(response.textIndexAsOf)} ${liveRoute.note}${gradesMatched}${checkedAgainst}${wholeNumberAnswer}`,
+        text_index_snapshot: `${textIndexSnapshotNote(response.textIndexAsOf)} ${liveRoute.note}${gradesMatched}${comparedAgainst}`,
       });
     }
     const exclusionCoverage = exclusionCoverageNote(exclusions);
@@ -1382,7 +1380,6 @@ export const offSearchProductsTool = tool('off_search_products', {
       total: response.count,
       total_is_lower_bound: !response.count_is_exact,
       returned: response.products.length,
-      outside_constraints: response.outside_constraints,
       page: response.page,
       source: response.source,
     });
@@ -1402,8 +1399,8 @@ export const offSearchProductsTool = tool('off_search_products', {
     const lastPage = response.count_is_exact && response.count > 0 ? reachablePages : undefined;
     // Matches exist past this page when the backend stopped counting, or when the pages up to and
     // including this one, at the size served, end before the total. Keyed on the page's offset,
-    // never on the rows it delivered: a row left off for an unservable code or a failed constraint
-    // shortens the page without leaving anything beyond it.
+    // never on the rows it delivered: a row left off for an unservable code shortens the page
+    // without leaving anything beyond it.
     const moreBeyond = !response.count_is_exact || response.page * pageSize < response.count;
 
     if (pageSize < input.page_size) {
@@ -1420,17 +1417,14 @@ export const offSearchProductsTool = tool('off_search_products', {
       });
     }
 
-    const outside = response.outside_constraints;
-    if (response.products.length === 0 && (response.dropped > 0 || outside !== undefined)) {
-      // Every row on this page was left off, for a code no product lookup can serve or for failing
-      // a nutrient constraint. The page is not past the end, and the search is matching rows, so
-      // neither notice applies. Truncation follows the same offset rule as a page that kept its
-      // rows.
+    if (response.products.length === 0 && response.dropped > 0) {
+      // Every match on this page was left off, for a code no product lookup can serve. The page is
+      // not past the end, and the search is matching rows, so neither notice applies. Truncation
+      // follows the same offset rule as a page that kept its rows.
       const notice = [
         `Page ${response.page} lists no products:`,
-        ...(response.dropped > 0 ? [omittedSentence(response.dropped)] : []),
-        ...(outside === undefined ? [] : [outsideConstraintsSentence(outside)]),
-        emptyPageNextStep(response.page, reachablePages, moreBeyond, outside !== undefined),
+        omittedSentence(response.dropped),
+        emptyPageNextStep(response.page, reachablePages),
       ].join(' ');
       if (moreBeyond) {
         ctx.enrich.truncated({ shown: response.page_count, cap: pageSize, guidance: notice });
@@ -1451,13 +1445,8 @@ export const offSearchProductsTool = tool('off_search_products', {
             ? `Request page ${lastPage} or lower — at page_size ${pageSize} that reaches the first ${lastPage * pageSize} of the ${response.count} matches — or narrow the filters or change sort_by to bring the products you need forward.`
             : `Request page ${lastPage} or lower to reach ${single ? 'it' : 'them'}.`;
 
-      // A whole-number answer counts rows the constraints can rule out, so it is no product count.
-      const [one, many] =
-        wholeNumber.length > 0
-          ? ['whole-number match exists', 'whole-number matches exist']
-          : ['matching product exists', 'matching products exist'];
       ctx.enrich.notice(
-        `Page ${response.page} is past the end of this result set — ${response.count} ${single ? one : many}, but no page this deep holds any. ${bound}`,
+        `Page ${response.page} is past the end of this result set — ${response.count} ${single ? 'matching product exists' : 'matching products exist'}, but no page this deep holds any. ${bound}`,
       );
     } else if (response.products.length === 0) {
       // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend.
@@ -1487,22 +1476,24 @@ export const offSearchProductsTool = tool('off_search_products', {
       }
 
       const echo = `No products found for ${filterParts.join(', ')}.`;
-      // off_browse_taxonomy holds no brands, so a brand is pointed at query instead.
-      const brandAdvice = 'put brand wording in query to match it as words';
       /**
        * Beside a brand, off_browse_taxonomy helps only with the other tag IDs the search sent, which
        * a caller can hold wrong: an inclusion tag filter or the additive. A grade or ingredients
        * analysis comes from a closed list, and an exclusion was confirmed before the search.
+       * off_browse_taxonomy holds no brands, so a brand's spelling is the caller's to check.
        */
-      const otherTagIds = tagFilters.some(({ key }) => key !== 'brands_tag') || Boolean(additive);
+      const otherTagIds = sentTags.some(({ key }) => key !== 'brands_tag');
       if (!servedByTextBackend) {
         const checks =
           brand === undefined
             ? 'check tag IDs via off_browse_taxonomy'
             : otherTagIds
-              ? `check the other tag IDs via off_browse_taxonomy, ${brandAdvice}`
-              : brandAdvice;
-        ctx.enrich.notice(`${echo} Try broader terms, ${checks}, or remove some filters.`);
+              ? "check the other tag IDs via off_browse_taxonomy and the brand's spelling"
+              : "check the brand's spelling";
+        const brandMatch = brand === undefined ? '' : ` A brand is matched ${BRAND_MATCH_REASON}.`;
+        ctx.enrich.notice(
+          `${echo} Try broader terms, ${checks}, or remove some filters.${brandMatch}`,
+        );
       } else {
         // A text-path zero has three possible causes, and the caller needs the ones that apply to
         // this search named: a word no product carries, a tag value matched exactly, and index
@@ -1511,7 +1502,7 @@ export const offSearchProductsTool = tool('off_search_products', {
         const causes: string[] = [];
         if (query) {
           causes.push(
-            'Every word of query must match — in a product name, generic name, category, label, or brand — so one word no product carries empties the result; drop or change words the product may not carry.',
+            'Every word of query must match the product name or generic name, so one word the name does not carry empties the result; drop or change such words, and express a category, label, or brand as categories_tag, labels_tag, or brands_tag.',
           );
           // A field:value form is matched as words, so its field name is required as a word too.
           const fieldName = /([\p{L}_]+):/u.exec(query)?.[1];
@@ -1521,15 +1512,20 @@ export const offSearchProductsTool = tool('off_search_products', {
             );
           }
         }
-        if (tagFilters.length > 0) {
-          const unconfirmed = tagFilters.flatMap(({ label, given, sent, alsoSent, canonical }) => {
-            if (canonical?.resolution !== 'normalized') return [];
-            const spellings = alsoSent === undefined ? [sent] : [sent, alsoSent];
+        if (sentTags.length > 0) {
+          const unconfirmed = sentTags.flatMap(({ key, label, given, sent, canonical }) => {
+            const reason =
+              key === 'brands_tag'
+                ? BRAND_MATCH_REASON
+                : canonical?.resolution === 'normalized'
+                  ? unconfirmedTagReason(canonical)
+                  : undefined;
+            if (reason === undefined) return [];
             const asSent =
-              spellings.length === 1 && sent === given
+              sent.length === 1 && sent[0] === given
                 ? ''
-                : ` was sent as ${spellings.map((spelling) => `"${spelling}"`).join(' or ')}`;
-            return [`${label}="${given}"${asSent} (${unconfirmedTagReason(canonical)})`];
+                : ` was sent as ${sent.map((id) => `"${id}"`).join(' or ')}`;
+            return [`${label}="${given}"${asSent} (${reason})`];
           });
           const browse =
             brand === undefined
@@ -1616,7 +1612,6 @@ export const offSearchProductsTool = tool('off_search_products', {
       page_count: response.page_count,
       ...(lastPage !== undefined && { last_page: lastPage }),
       ...(response.dropped > 0 && { omitted: response.dropped }),
-      ...(outside !== undefined && { outside_constraints: outside }),
       source: response.source,
       ...(response.source === 'off_mirror' && { mirror_as_of: response.mirrorAsOf }),
       ...(response.textIndexAsOf !== undefined && { text_index_as_of: response.textIndexAsOf }),
@@ -1642,30 +1637,15 @@ export const offSearchProductsTool = tool('off_search_products', {
       ];
     }
 
-    const outside = result.outside_constraints;
-    // format() has no input. A page that lost rows, or whose rows carry a whole-number nutrient
-    // (only a constrained nutrient reaches a row), shows the total is the index's whole-number
-    // answer, not a product count. A page with neither keeps the plain wording, past-end pages too.
-    const wholeNumberAnswer =
-      outside !== undefined ||
-      result.products.some((p) =>
-        Object.keys(p.indexed_nutriments ?? {}).some((key) => WHOLE_NUMBER_KEYS.has(key)),
-      );
-    const [one, many] = wholeNumberAnswer
-      ? ['whole-number match', 'whole-number matches']
-      : ['total product', 'total products'];
-    const totalLabel = `${result.total}${result.total_is_lower_bound ? '+' : ''} ${result.total === 1 ? one : many}`;
+    const totalLabel = `${result.total}${result.total_is_lower_bound ? '+' : ''} ${result.total === 1 ? 'total product' : 'total products'}`;
     /** The clipped-total caveat, rendered wherever a total is shown so neither branch flattens it. */
-    const lowerBoundCaveat = wholeNumberAnswer
-      ? `*Open Food Facts stops counting its whole-number answer at ${result.total} and does not report how many products meet these constraints. Add query or tag filters for an exact count of that answer.*`
-      : `*At least ${result.total} products match — Open Food Facts stops counting there and does not report the true total. Add filters for an exact count.*`;
+    const lowerBoundCaveat = `*At least ${result.total} products match — Open Food Facts stops counting there and does not report the true total. Add filters for an exact count.*`;
 
-    if (result.products.length === 0 && (result.omitted !== undefined || outside !== undefined)) {
+    if (result.products.length === 0 && result.omitted !== undefined) {
       const leftOff = [
         `**Page ${result.page}${result.last_page === undefined ? '' : ` of ${result.last_page}`} lists no products** (${totalLabel}, ${result.page_size} per page)`,
+        `*${omittedSentence(result.omitted)}*`,
       ];
-      if (result.omitted !== undefined) leftOff.push(`*${omittedSentence(result.omitted)}*`);
-      if (outside !== undefined) leftOff.push(`*${outsideConstraintsSentence(outside)}*`);
       if (result.total_is_lower_bound) leftOff.push(lowerBoundCaveat);
       // The handler's reachable bound, rebuilt from the output: last_page when the count is exact,
       // and otherwise the text backend's result window — only that backend stops counting.
@@ -1675,14 +1655,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           Math.ceil(result.total / result.page_size),
           Math.floor(TEXT_SEARCH_RESULT_WINDOW / result.page_size),
         );
-      const moreBeyond =
-        result.total_is_lower_bound || result.page * result.page_size < result.total;
-      leftOff.push(
-        '',
-        emptyPageNextStep(result.page, reachable, moreBeyond, outside !== undefined),
-        '',
-        source,
-      );
+      leftOff.push('', emptyPageNextStep(result.page, reachable), '', source);
       return [{ type: 'text' as const, text: leftOff.join('\n') }];
     }
 
@@ -1690,7 +1663,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       // A positive total with an empty page is an exhausted page. Preserve the total, say which
       // page holds results, and say nothing about broadening filters that are matching products.
       const exhausted = [
-        `**Page ${result.page} is past the end of this result set** (${totalLabel})`,
+        `**Page ${result.page} is past the end of this result set** (${totalLabel}, ${result.page_size} per page)`,
       ];
       if (result.total_is_lower_bound) exhausted.push(lowerBoundCaveat);
       exhausted.push(
@@ -1713,7 +1686,6 @@ export const offSearchProductsTool = tool('off_search_products', {
       lines.push(lowerBoundCaveat);
     }
     if (result.omitted !== undefined) lines.push(`*${omittedSentence(result.omitted)}*`);
-    if (outside !== undefined) lines.push(`*${outsideConstraintsSentence(outside)}*`);
     lines.push('');
 
     for (const p of result.products) {

@@ -41,7 +41,10 @@ import {
   readMirrorLoad,
 } from './mirror-store.js';
 
-/** Full loads are repeated this often: deltas never report deleted products, only a reload does. */
+/**
+ * Full loads are repeated this often: deltas select records by `last_modified_t`, so they never
+ * carry a deleted product or a value Open Food Facts recomputes without an edit; only a reload does.
+ */
 const FULL_RELOAD_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** WAL size SQLite truncates back to after each checkpoint. */
@@ -238,6 +241,7 @@ async function sync(
             skippedLines = completed.skippedLines;
           },
           previousCheckpoint: state.checkpoint,
+          previousRecordVersion: load?.recordVersion,
         }),
       'init',
     );

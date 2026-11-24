@@ -1,8 +1,9 @@
 /**
  * @fileoverview Genuine 2xx (and 404) response envelopes from the four Open Food Facts reads, taken
- * from live captures on 2026-10-13. Hit lists and nested product objects are trimmed and the
- * search-a-licious `debug` echo is dropped; every remaining key and value is as the upstream sent
- * it. Tests that tighten envelope validation run these to prove a real answer is still accepted.
+ * from live captures on 2026-10-13, the two text searches on 2026-11-24 from search-a-licious 2.x.
+ * Hit lists and nested product objects are trimmed; every remaining key and value is as the
+ * upstream sent it. Tests that tighten envelope validation run these to prove a real answer is
+ * still accepted.
  * The two `*_TIMED_OUT` envelopes are the exception: no live answer has carried the flag, so they
  * are built from the fields search-a-licious v1.4.0's `postprocessing.py` emits.
  * @module tests/fixtures/upstream-envelopes
@@ -84,25 +85,59 @@ export const TAG_SEARCH_EMPTY = {
   skip: 0,
 };
 
-/** POST https://search.openfoodfacts.org/search for `nutella`, page_size 2. */
+/**
+ * POST https://search.openfoodfacts.org/search for `nutella`, page_size 2, with the summary fields
+ * under their 2.x names. Brands come back as stored tag IDs, and a field a record lacks
+ * (`categories` on the first hit) is left out of that hit.
+ */
 export const TEXT_SEARCH_HITS = {
   hits: [
     {
-      code: '0009800800049',
-      brands: ['Nutella'],
-      product_name: 'Nutella & go! hazelnut spread + breadsticks',
+      code: '9416470242016',
+      brands: ['xx:ferrero', 'xx:nutella'],
+      quantity: '750 g',
+      environmental_score_grade: 'unknown',
+      nova_group: 4,
+      nutriscore_grade: 'unknown',
+      completeness: 0.5625,
+      created_t: 1532452361,
+      last_modified_t: 1700446560,
+      product_name: 'Pâte à tartiner aux noisettes et au cacao',
+      _score: 15.07292,
     },
-    { code: '0098008952506', brands: ['Nutella'], product_name: 'Nutella' },
+    {
+      code: '8000500179864',
+      categories: [
+        'en:breakfasts',
+        'en:spreads',
+        'en:sweet-spreads',
+        'fr:pates-a-tartiner',
+        'en:hazelnut-spreads',
+        'en:chocolate-spreads',
+        'en:cocoa-and-hazelnuts-spreads',
+      ],
+      brands: ['xx:Ferrero'],
+      quantity: '600g',
+      environmental_score_grade: 'd',
+      nova_group: 4,
+      nutriscore_grade: 'e',
+      completeness: 0.7875,
+      created_t: 1486386459,
+      last_modified_t: 1793195422,
+      product_name: 'Nutella',
+      _score: 13.627446,
+    },
   ],
   aggregations: null,
   facets: {},
   charts: {},
   page: 1,
   page_size: 2,
-  page_count: 316,
-  took: 5,
+  page_count: 472,
+  debug: null,
+  took: 50,
   timed_out: false,
-  count: 631,
+  count: 943,
   is_count_exact: true,
   warnings: null,
 };
@@ -116,7 +151,8 @@ export const TEXT_SEARCH_EMPTY = {
   page: 1,
   page_size: 2,
   page_count: 0,
-  took: 2,
+  debug: null,
+  took: 24,
   timed_out: false,
   count: 0,
   is_count_exact: true,

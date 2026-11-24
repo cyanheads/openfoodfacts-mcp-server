@@ -159,7 +159,7 @@ export type RawSearchProduct = RawProduct & { code?: string };
  * A search result row the service hands on: its barcode matches `BARCODE_PATTERN`. Rows without
  * one are dropped before the page is counted — a row with nothing a product lookup can serve is not
  * a usable result. `indexed_nutriments` is set on every row of a search carrying nutrient
- * constraints, and on no other; those are the values the row was checked against.
+ * constraints, and on no other; those are the index values the constraints were matched against.
  */
 export type SearchRow = RawProduct & { code: string; indexed_nutriments?: IndexedNutriments };
 
@@ -185,8 +185,10 @@ export type RawSearchResponse = {
  */
 export type RawTextSearchResponse = {
   /**
-   * Present, with no `hits` or `count`, when the backend's Elasticsearch query failed. The endpoint
-   * still answers HTTP 200 in that case, so this list is the only failure signal.
+   * Present, with no `hits` or `count`, when the backend refused or failed the search: each entry
+   * names the error (`QueryCheckError`) and explains it. search-a-licious 2.x sends this list with
+   * a 4xx or 5xx status, where the error path reads it (`upstreamDetail`); a 2xx body carrying it
+   * is read as a failure too, never as zero matches.
    */
   errors?: { title?: string; description?: string }[];
   count?: number;
@@ -210,27 +212,39 @@ export type RawTextSearchResponse = {
   hits?: RawTextSearchHit[];
 };
 
-/** A product hit from the search.openfoodfacts.org endpoint. */
+/**
+ * A product hit from search.openfoodfacts.org (search-a-licious 2.x). Two summary fields go by other
+ * names than on a v2 read: `categories` holds the category tag IDs a v2 read calls
+ * `categories_tags`, and `environmental_score_grade` the Green-Score grade it calls
+ * `ecoscore_grade`, spelled the same (`a-plus`, `a`, …). A requested field the index does not know
+ * is left out of every hit without an error.
+ */
 export type RawTextSearchHit = {
   code?: string;
+  /** The name in the product's main language. */
   product_name?: string;
-  /** brands is an array here, unlike the /api/v2 string field. */
-  brands?: string | string[];
+  /**
+   * Brand tag IDs as the index stores them, not display names: a taxonomy brand under its `xx:` ID
+   * (`xx:heinz`), an off-taxonomy brand under its slug and the spellings contributors typed
+   * (`xx:member-s-mark`, `xx:Member's Mark`), and a record last indexed before Product Opener wrote
+   * the prefix under the bare slug (`heinz`).
+   */
+  brands?: string[];
   quantity?: string;
   /** A number, or on some records a numeric string, as on `RawProduct`. */
   completeness?: number | string;
   nutriscore_grade?: string;
   nova_group?: number;
-  ecoscore_grade?: string;
-  categories_tags?: string[];
+  environmental_score_grade?: string;
+  categories?: string[];
   /** The indexed revision's edit time, in epoch seconds, which can be older than the live record's. */
   last_modified_t?: number;
   created_t?: number;
   /**
    * The index's per-100 g / 100 ml nutrient map (`sugars_100g`, `energy-kcal_100g`, …), returned
-   * only when `nutriments` is among the requested `fields`. A dotted field such as
-   * `nutriments.sugars_100g` is silently ignored, so the whole map is the only form the endpoint
-   * returns.
+   * when `nutriments` is among the requested `fields` and the indexed record holds one. Many do not
+   * (live 2026-11-24: 47 of 1,447 `en:skyrs` records), including records whose live read carries
+   * nutrition figures.
    */
   nutriments?: RawNutriments;
 };
@@ -261,9 +275,10 @@ export type RawAutocompleteResponse = {
 
 /**
  * Nutrients the text index carries as numeric per-100 g / 100 ml fields, under
- * `nutriments.<name>_100g`. Closed because the index answers a clause naming an unindexed field
- * with HTTP 200 and zero hits rather than an error: every name here was live-verified to return
- * matches, and the per-serving variants were verified not to, so only the per-100 basis is offered.
+ * `nutriments.<name>_100g`. search-a-licious 2.x maps all nine as `float` in its Open Food Facts
+ * configuration, so a bound compares as the decimal it is (live 2026-11-24:
+ * `energy-kcal_100g:{54 TO 55}` matched 1,312 records at 54.2 to 54.8). Only the per-100 basis is
+ * offered: the index maps no per-serving field.
  */
 export const NUTRIENT_FIELDS = [
   'energy-kcal',
@@ -276,22 +291,6 @@ export const NUTRIENT_FIELDS = [
   'salt',
   'sodium',
 ] as const;
-
-/**
- * Nutrients the text index compares as truncated whole numbers (`long`), so `sugars lte 3` matches
- * a row at 3.53 while `indexed_nutriments` shows the full value. Fitted against the complete
- * `en:skyrs` corpus, 94 exact-count probes of the live index, 2026-10-30; the other four compare as
- * 32-bit floats. The mapping is dynamic, so a re-import can change this set, which is why the row
- * check covers every nutrient. Upstream `main` maps all nine as `float`
- * (openfoodfacts/search-a-licious#301), and once that is deployed this set comes out.
- */
-export const WHOLE_NUMBER_NUTRIENTS: ReadonlySet<NutrientField> = new Set([
-  'energy-kcal',
-  'fat',
-  'saturated-fat',
-  'carbohydrates',
-  'sugars',
-]);
 
 /** Comparisons a nutrient constraint may express, each mapping to one Lucene range form. */
 export const NUTRIENT_OPERATORS = ['lt', 'lte', 'gt', 'gte'] as const;
@@ -366,10 +365,11 @@ export type NutrientFilter = {
 };
 
 /**
- * One tag filter value: its tag ID, or the IDs one value can be stored under, any of which
- * matches. A text search sends both IDs of a value nothing confirmed whose whole-string lowercase
- * spells it differently, which turns a word-final capital sigma into `ς`: a brand's two slugs
- * (`brandTextSlugs`) or a taxonomy value's two IDs (`taxonomyTextIds`).
+ * One tag filter value: its tag ID, or the several IDs one value can be stored under, any of which
+ * matches. Each search path sends every ID verbatim, several as one any-of group; the caller
+ * composes them — a brand's IDs in the backend's form (`brandLiveIds`, `brandTextIds`, or the keys
+ * the mirror holds), or both IDs of a value nothing confirmed whose whole-string lowercase turns a
+ * word-final capital sigma into `ς` (`taxonomyTextIds`).
  */
 export type TagValue = string | string[];
 
@@ -406,9 +406,9 @@ export type SearchParams = {
   exclude_allergens?: string[];
   exclude_traces?: string[];
   /**
-   * Applied only on the tag-filter path (/api/v2/search). search-a-licious does not index
-   * `additives_tags`, so the tool rejects this filter alongside a text query rather than sending a
-   * clause that would silently match nothing.
+   * One additive tag (`en:e330`). The tag path sends it as `additives_tags`; the text path as an
+   * exact `additives` clause, which search-a-licious 2.x indexes (live 2026-11-24:
+   * `additives:"en:e330"` and its exclusion partition the `en:hummus` records exactly).
    */
   additives_tag?: string;
   /** One Nutri-Score grade, or several matching any of them: a product carries one grade. */
@@ -451,19 +451,10 @@ export type SearchResult = {
    */
   count_is_exact: boolean;
   page: number;
-  /**
-   * Rows on this page after rows without a servable barcode are dropped and rows outside the
-   * nutrient constraints leave — always `products.length`.
-   */
+  /** Rows on this page after rows without a servable barcode are dropped — always `products.length`. */
   page_count: number;
   page_size: number;
   products: SearchRow[];
   /** Rows the upstream returned on this page that were dropped for lacking a servable barcode. */
   dropped: number;
-  /**
-   * Servable rows the text index returned on this page that fail a nutrient constraint at its own
-   * 32-bit precision, which left the page. Distinct from `dropped`, whose rows are matches: `count`
-   * includes these only because the index compares whole numbers. Absent when none left.
-   */
-  outside_constraints?: number;
 };

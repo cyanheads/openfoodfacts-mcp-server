@@ -1,6 +1,7 @@
 /**
  * @fileoverview Tests for the tag-value canonicalizer the text search path runs every tag filter
- * through (GH issue #39): brand slugging, offline-sample and live-autocomplete resolution under the
+ * through (GH issue #39), the IDs a brand is sent under on each search path (GH issue #98),
+ * offline-sample and live-autocomplete resolution under the
  * exact-match rule, best-effort fallback (timed-out answers from GH issue #68, the retry deadline
  * from GH issue #72), the in-process cache, and caller cancellation (GH issue #60), including the
  * deadline of a caller that restarts a cancelled shared lookup (GH issue #75). Driven through
@@ -13,10 +14,10 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { brandKeys } from '@/services/taxonomy/brand-keys.js';
 import {
-  brandSlug,
-  brandSlugs,
-  brandTextSlugs,
+  brandLiveIds,
+  brandTextIds,
   slugTagValue,
   TaxonomyService,
   taxonomyTextIds,
@@ -83,75 +84,6 @@ describe('TaxonomyService.canonicalizeTag', () => {
   afterEach(() => {
     global.fetch = globalFetch;
     vi.restoreAllMocks();
-  });
-
-  describe('brands', () => {
-    it.each([
-      ['Nutella', 'nutella'],
-      ['  Nutella  ', 'nutella'],
-      ['nutella', 'nutella'],
-      ["Ben & Jerry's", 'ben-jerry-s'],
-      ['Côte d’Or', 'cote-d-or'],
-      ['M.&M.', 'm-m'],
-      ['nutell', 'nutell'],
-    ])('slugs %j to %j the way Product Opener does, with no lookup', async (input, slug) => {
-      await expect(taxonomy.canonicalizeTag('brands', input, ctx)).resolves.toEqual({
-        value: slug,
-        resolution: 'normalized',
-        reason: 'no_vocabulary',
-      });
-      expect(global.fetch).not.toHaveBeenCalled();
-    });
-
-    // The text index's `brands_tags` for each brand as printed (2026-11-24): the `xx` slug folds
-    // a fixed list of Latin letters and keeps every other mark.
-    it.each([
-      ['Nestlé', 'nestle'],
-      ['Häagen-Dazs', 'haagen-dazs'],
-      ['Meßmer', 'messmer'],
-      ['Kærgården', 'kaergarden'],
-      ['Cœur de Lion', 'coeur-de-lion'],
-      ['Côte d’Or', 'cote-d-or'],
-      ['Çaykur', 'caykur'],
-      ['Kinh Đô', 'kinh-đo'],
-      ['ΟΛΥΜΠΟΣ', 'ολυμποσ'],
-      ['Løgismose', 'løgismose'],
-      ['Łowicz', 'łowicz'],
-      ['Vĩnh Hảo', 'vĩnh-hảo'],
-      ['Δέλτα', 'δέλτα'],
-      ['Красный Октябрь', 'красный-октябрь'],
-      ['Весёлый молочник', 'весёлый-молочник'],
-      ['ブルボン', 'ブルボン'],
-      ['농심', '농심'],
-      ['康师傅', '康师傅'],
-      ['المراعي', 'المراعي'],
-      ["Kellogg's", 'kellogg-s'],
-      ["M&M's", 'm-m-s'],
-      ['Dr. Oetker', 'dr-oetker'],
-      ['Ţară Şcoală Ăla', 'tara-scoala-ala'],
-    ])('sends %j as %j, the tag Product Opener stores', async (input, stored) => {
-      await expect(taxonomy.canonicalizeTag('brands', input, ctx)).resolves.toEqual({
-        value: stored,
-        resolution: 'normalized',
-        reason: 'no_vocabulary',
-      });
-    });
-
-    it.each([
-      ['xx:nutella', 'nutella'],
-      ['en:nutella', 'nutella'],
-      ["FR:Ben & Jerry's", 'ben-jerry-s'],
-    ])(
-      'drops the language prefix of %j and slugs the rest to %j, as Product Opener matches a brand filter',
-      async (input, slug) => {
-        await expect(taxonomy.canonicalizeTag('brands', input, ctx)).resolves.toEqual({
-          value: slug,
-          resolution: 'normalized',
-          reason: 'no_vocabulary',
-        });
-        expect(global.fetch).not.toHaveBeenCalled();
-      },
-    );
   });
 
   describe('offline sample', () => {
@@ -1460,107 +1392,152 @@ describe('slugTagValue', () => {
   });
 });
 
-describe('brandSlug', () => {
-  it('composes before folding, so a decomposed accent folds like a precomposed one', () => {
-    expect(brandSlug('Nestlé')).toBe('nestle');
-    expect(brandSlug('Häagen-Dazs')).toBe('haagen-dazs');
-  });
+/**
+ * Brands as printed and the tag Product Opener stores each under (the text index's `brands`,
+ * 2026-11-24): the `xx` slug folds a fixed list of Latin letters and keeps every other mark.
+ */
+const STORED_BRAND_TAGS: [string, string][] = [
+  ['Nutella', 'nutella'],
+  ["Ben & Jerry's", 'ben-jerry-s'],
+  ['M.&M.', 'm-m'],
+  ['Nestlé', 'nestle'],
+  ['Häagen-Dazs', 'haagen-dazs'],
+  ['Meßmer', 'messmer'],
+  ['Kærgården', 'kaergarden'],
+  ['Cœur de Lion', 'coeur-de-lion'],
+  ['Côte d’Or', 'cote-d-or'],
+  ['Çaykur', 'caykur'],
+  ['Kinh Đô', 'kinh-đo'],
+  ['ΟΛΥΜΠΟΣ', 'ολυμποσ'],
+  ['Løgismose', 'løgismose'],
+  ['Łowicz', 'łowicz'],
+  ['Vĩnh Hảo', 'vĩnh-hảo'],
+  ['Δέλτα', 'δέλτα'],
+  ['Красный Октябрь', 'красный-октябрь'],
+  ['Весёлый молочник', 'весёлый-молочник'],
+  ['ブルボン', 'ブルボン'],
+  ['농심', '농심'],
+  ['康师傅', '康师傅'],
+  ['المراعي', 'المراعي'],
+  ["Kellogg's", 'kellogg-s'],
+  ["M&M's", 'm-m-s'],
+  ['Dr. Oetker', 'dr-oetker'],
+  ['Ţară Şcoală Ăla', 'tara-scoala-ala'],
+  ['xx:nutella', 'nutella'],
+  ['en:nutella', 'nutella'],
+  ["FR:Ben & Jerry's", 'ben-jerry-s'],
+];
 
-  it('keeps the marks of letters outside the folded list, decomposed ones included', () => {
-    expect(brandSlug('ブルボン')).toBe('ブルボン');
-    expect(brandSlug('Йогурт')).toBe('йогурт');
-    expect(brandSlug('Δέλτα')).toBe('δέλτα');
-    expect(brandSlug('Vĩnh Hảo')).toBe('vĩnh-hảo');
-  });
-
-  it('folds a capital sharp s, which lowercases to ß', () => {
-    expect(brandSlug('MEẞMER')).toBe('messmer');
-  });
-
-  it('folds every letter of the fold list, capital and small', () => {
-    // One word per fold group, its letters capital then small, in fold-list order.
-    expect(
-      brandSlug(
-        'ÀÁÂÃÄÅĂàáâãäåă Çç ÈÉÊËèéêë ÌÍÎÏìíîï Ññ ÒÓÔÕÖòóôõö ÙÚÛÜùúûü ÝŸýÿ ȘŞșş ȚŢțţ Œœ Ææ ẞß',
-      ),
-    ).toBe(
-      'aaaaaaaaaaaaaa-cc-eeeeeeee-iiiiiiii-nn-oooooooooo-uuuuuuuu-yyyy-ssss-tttt-oeoe-aeae-ssss',
-    );
-  });
-
-  it.each([
-    ['xx:nutella', 'nutella'],
-    ['en:nutella', 'nutella'],
-    [' XX:Nestlé ', 'nestle'],
-  ])('drops the language prefix of %j', (input, slug) => {
-    expect(brandSlug(input)).toBe(slug);
-  });
+describe('brand IDs on both search paths (#98)', () => {
+  it.each(STORED_BRAND_TAGS)(
+    'reaches %j under %j, the tag Product Opener stores, on the live tag path and the text path',
+    (input, stored) => {
+      expect(brandLiveIds(input)).toContain(stored === input ? input : `xx:${stored}!`);
+      expect(brandTextIds(input)).toEqual(expect.arrayContaining([stored, `xx:${stored}`]));
+    },
+  );
 });
 
-describe('brandSlugs', () => {
-  it('tries the folded slug first, then the accent-keeping one when it differs', () => {
-    expect(brandSlugs('Nestlé')).toEqual(['nestle', 'nestlé']);
-    expect(brandSlugs('café-bar')).toEqual(['cafe-bar', 'café-bar']);
-    expect(brandSlugs('xx:Meßmer')).toEqual(['messmer', 'meßmer']);
-  });
-
-  it('names a slug the normalizations agree on once', () => {
-    expect(brandSlugs('Nutella')).toEqual(['nutella']);
-    expect(brandSlugs('Løgismose')).toEqual(['løgismose']);
-    expect(brandSlugs('Όλυμπος')).toEqual(['όλυμπος']);
-  });
-
-  it('tries last the final-ς slug a whole-string lowercase gives an all-caps name, as 0.4.4 slugged it', () => {
-    expect(brandSlugs('ΟΛΥΜΠΟΣ')).toEqual(['ολυμποσ', 'ολυμπος']);
-    expect(brandSlugs('ΌΛΥΜΠΟΣ')).toEqual(['όλυμποσ', 'όλυμπος']);
-    expect(brandSlugs('CAFÉ ΣΟΦΟΣ')).toEqual(['cafe-σοφοσ', 'café-σοφοσ', 'café-σοφος']);
-  });
-
-  it('names nothing for a brand that slugs to nothing', () => {
-    expect(brandSlugs('™')).toEqual([]);
-    expect(brandSlugs('  ')).toEqual([]);
-  });
-
-  it.each([
-    ['en:en:foo', ['en-foo']],
-    ['xx:xx:Nestlé', ['xx-nestle', 'xx-nestlé']],
-    ['xx:en:ΣΟΦΟΣ', ['en-σοφοσ', 'en-σοφος']],
-  ])('drops one language prefix from %j, as brandSlug does', (input, slugs) => {
-    expect(brandSlugs(input)).toEqual(slugs);
-    expect(brandSlugs(input)[0]).toBe(brandSlug(input));
-  });
-});
-
-describe('brandTextSlugs', () => {
-  /**
-   * The text index holds a brand under whichever slug its records' brand text gave: an all-caps
-   * name slugs with `σ` (`ΟΛΥΜΠΟΣ` → `ολυμποσ`), one typed in lowercase keeps `ς` (`όλυμπος`, 29
-   * matches live 2026-11-24, where `όλυμποσ` matched none and the two as an OR group matched 29).
-   */
-  it.each([
-    ['ΌΛΥΜΠΟΣ', ['όλυμποσ', 'όλυμπος']],
-    ['ΟΛΥΜΠΟΣ', ['ολυμποσ', 'ολυμπος']],
-    ['xx:ΣΟΦΟΣ ΚΑΦΕΣ', ['σοφοσ-καφεσ', 'σοφος-καφες']],
-    // Both slugs fold, so neither keeps an accent the stored tag dropped.
-    ['CAFÉ ΣΟΦΟΣ', ['cafe-σοφοσ', 'cafe-σοφος']],
-    ['en:en:ΣΟΦΟΣ', ['en-σοφοσ', 'en-σοφος']],
-  ])(
-    'slugs %j to brandSlug, then the final-ς slug a whole-string lowercase gives',
-    (input, slugs) => {
-      expect(brandTextSlugs(input)).toEqual(slugs);
-      expect(brandTextSlugs(input)[0]).toBe(brandSlug(input));
+describe('brandLiveIds', () => {
+  it.each([['nutella'], ['heinz'], ['nutell'], ['ブルボン']])(
+    'sends %j, a brand that keys to itself, as given alone: the request a brand always sent',
+    (brand) => {
+      expect(brandLiveIds(brand)).toEqual([brand]);
     },
   );
 
+  it.each<[string, string[]]>([
+    // Live 2026-11-24: 16 products as given, 23 with the key beside it.
+    ['Красный Октябрь', ['Красный Октябрь', 'xx:красный-октябрь!']],
+    ['  Nutella  ', ['Nutella', 'xx:nutella!']],
+    ['xx:nutella', ['xx:nutella', 'xx:nutella!']],
+    ['ΌΛΥΜΠΟΣ', ['ΌΛΥΜΠΟΣ', 'xx:όλυμποσ!']],
+  ])('sends %j as given, then its key as an exact stored tag', (input, ids) => {
+    expect(brandLiveIds(input)).toEqual(ids);
+  });
+
+  it.each<[string, string[]]>([
+    ['7-Up', ['7-Up', 'xx:7-up!', 'xx:7up!', 'xx:seven-up!']],
+    ['7 Up', ['7 Up', 'xx:7-up!', 'xx:7up!', 'xx:seven-up!']],
+    ['Seven Up', ['Seven Up', 'xx:seven-up!', 'xx:7up!', 'xx:7-up!']],
+    ['7up', ['7up', 'xx:7-up!', 'xx:seven-up!']],
+    ['Andechser', ['Andechser', 'xx:andechser!', 'xx:andechser-natur!']],
+    ['kelloggs', ['kelloggs', 'xx:kellogg-s!', 'xx:kellogg!']],
+  ])('sends %j as given, then every key of its brand entry that differs from it', (input, ids) => {
+    expect(brandLiveIds(input)).toEqual(ids);
+  });
+
+  it.each([['™'], ['xx:']])('sends %j, which keys to nothing, as given alone', (brand) => {
+    expect(brandLiveIds(brand)).toEqual([brand]);
+  });
+});
+
+describe('brandTextIds', () => {
+  it.each<[string, string[]]>([
+    // Live 2026-11-24: Heinz under `xx:heinz` (3,157) and bare `heinz` (523).
+    ['heinz', ['xx:heinz', 'heinz']],
+    // Live 2026-11-24: 16 under the typed form, 7 under the slug.
+    ['Красный Октябрь', ['xx:Красный Октябрь', 'красный-октябрь', 'xx:красный-октябрь']],
+    ['xx:Красный Октябрь', ['xx:Красный Октябрь', 'красный-октябрь', 'xx:красный-октябрь']],
+    ["en:Ben & Jerry's", ["xx:Ben & Jerry's", 'ben-jerry-s', 'xx:ben-jerry-s']],
+  ])('sends %j as typed under xx:, then its key bare and under xx:', (input, ids) => {
+    expect(brandTextIds(input)).toEqual(ids);
+  });
+
+  it('sends every key of a brand entry, bare and under xx:', () => {
+    expect(brandTextIds('7-Up')).toEqual([
+      'xx:7-Up',
+      '7-up',
+      'xx:7-up',
+      '7up',
+      'xx:7up',
+      'seven-up',
+      'xx:seven-up',
+    ]);
+    expect(brandTextIds('Andechser')).toEqual([
+      'xx:Andechser',
+      'andechser',
+      'xx:andechser',
+      'andechser-natur',
+      'xx:andechser-natur',
+    ]);
+  });
+
+  /**
+   * A key folds sigma, but a stored slug keeps the `ς` of a name typed in lowercase: live
+   * 2026-11-24 the index holds 10 Όλυμπος products under `όλυμπος` and none under `όλυμποσ`.
+   */
+  it.each<[string, string[]]>([
+    ['ΌΛΥΜΠΟΣ', ['xx:ΌΛΥΜΠΟΣ', 'όλυμποσ', 'xx:όλυμποσ', 'όλυμπος', 'xx:όλυμπος']],
+    ['Όλυμπος', ['xx:Όλυμπος', 'όλυμποσ', 'xx:όλυμποσ', 'όλυμπος', 'xx:όλυμπος']],
+    [
+      'xx:ΣΟΦΟΣ ΚΑΦΕΣ',
+      ['xx:ΣΟΦΟΣ ΚΑΦΕΣ', 'σοφοσ-καφεσ', 'xx:σοφοσ-καφεσ', 'σοφος-καφες', 'xx:σοφος-καφες'],
+    ],
+  ])('sends %j also under the final-ς spelling of its key', (input, ids) => {
+    expect(brandTextIds(input)).toEqual(ids);
+  });
+
   it.each([
-    ['Nestlé', 'nestle'],
-    ['Όλυμπος', 'όλυμπος'],
-    ['ολυμποσ', 'ολυμποσ'],
-    // A capital sigma inside a word lowercases to σ either way.
-    ['ΜΑΣΤΙΧΑ', 'μαστιχα'],
-    ["Ben & Jerry's", 'ben-jerry-s'],
-  ])('slugs %j one way when both lowercasings agree', (input, slug) => {
-    expect(brandTextSlugs(input)).toEqual([slug]);
+    // A sigma that opens a word, or sits inside one, is never final.
+    ['ΜΑΣΤΙΧΑ', ['xx:ΜΑΣΤΙΧΑ', 'μαστιχα', 'xx:μαστιχα']],
+    ['Σ', ['xx:Σ', 'σ', 'xx:σ']],
+  ])('sends %j under one spelling of its key when no sigma ends a word', (input, ids) => {
+    expect(brandTextIds(input)).toEqual(ids);
+  });
+
+  it.each([
+    ['™', ['xx:™']],
+    ['xx:', ['xx:']],
+  ])(
+    'sends %j, which keys to nothing, under its typed form alone, never an empty group',
+    (input, ids) => {
+      expect(brandTextIds(input)).toEqual(ids);
+    },
+  );
+
+  it('matches no entry by part of a name: nutell keys to itself alone', () => {
+    expect(brandTextIds('nutell')).toEqual(['xx:nutell', 'nutell']);
   });
 });
 
@@ -1639,13 +1616,20 @@ describe('brand slug timing', () => {
     ['combining marks only', (n: number) => '́'.repeat(n)],
     ['decomposed accents', (n: number) => 'é'.repeat(n / 2)],
     ['repeated language prefixes', (n: number) => 'xx:'.repeat(n / 3)],
+    // Each one is folded to σ in a brand key, and spelled ς again for the text index.
+    ['small final sigmas', (n: number) => 'ος '.repeat(n / 3)],
+    ['small final sigmas between combining marks', (n: number) => 'ος́́ '.repeat(n / 5)],
   ])(
     'slugs %s in linear time',
     (_shape, build) => {
-      /** Every slug a brand is looked up or sent under: the mirror's and the text index's. */
+      /**
+       * Every key and ID a brand is looked up or sent under: its brand keys, synonyms included,
+       * and the IDs the live tag path and the text index match it under.
+       */
       const slugAll = (text: string) => {
-        brandSlugs(text);
-        brandTextSlugs(text);
+        brandKeys(text);
+        brandLiveIds(text);
+        brandTextIds(text);
       };
       const baseline = build(5_000);
       const baselines: number[] = [];

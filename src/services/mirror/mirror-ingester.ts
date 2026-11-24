@@ -110,10 +110,19 @@ const ExportCursorSchema = z.object({
    * cursor written before lines were skipped, when a malformed line still failed the load.
    */
   skipped: z.number().int().nonnegative().default(0),
+  /**
+   * The lowest `MIRROR_RECORD_VERSION` among the builders that stamped this load's rows, which the
+   * completed load records. Absent from a cursor written before cursors carried it; see
+   * {@link resumedRecordVersion} for how that reads.
+   */
+  recordVersion: z.number().int().positive().optional(),
 });
 
 /** A full load's resume position, persisted as the framework sync cursor. */
 export type ExportCursor = z.infer<typeof ExportCursorSchema>;
+
+/** A full load's cursor in flight: its record version always settled. */
+type LoadCursor = ExportCursor & { recordVersion: number };
 
 /**
  * Reads a persisted export cursor. `undefined` for none, and for a value no build of this module
@@ -144,6 +153,26 @@ export interface ExportLoadOptions extends IngestOptions {
   onLoaded(load: MirrorLoad): void;
   /** The checkpoint before this load, kept in place until the load completes. */
   previousCheckpoint: string | undefined;
+  /** The record version of the last completed load, `undefined` before the first completes. */
+  previousRecordVersion: number | undefined;
+}
+
+/**
+ * The record version a resumed load carries on with under a builder at `builderVersion`: the lower
+ * of that and the lowest version that stamped its rows, so a load resumed under a newer builder
+ * records the older one and the next refresh reloads it rather than serving rows the older builder
+ * built. A load that has ingested no export line yet stamped no row, so it is the resuming
+ * builder's alone. A cursor written before cursors carried a version reads as the last completed
+ * load's version, the builds that stamped its rows having run since that load, or as 1, the lowest
+ * any build wrote, when none has completed.
+ */
+function resumedRecordVersion(
+  cursor: ExportCursor,
+  builderVersion: number,
+  previousRecordVersion: number | undefined,
+): number {
+  if (cursor.line === 0) return builderVersion;
+  return Math.min(cursor.recordVersion ?? previousRecordVersion ?? 1, builderVersion);
 }
 
 /**
@@ -152,7 +181,9 @@ export interface ExportLoadOptions extends IngestOptions {
  * count of lines it skipped through it), the sweep from its rowid. While it ingests over a store
  * that already cites an as-of, that as-of is the older of the one the run began with and the newest
  * `last_modified_t` among the rows the load has stamped (see {@link asOfMoves}). The export's own
- * as-of is set on the last page, after the sweep and the sort index builds.
+ * as-of is set on the last page, after the sweep and the sort index builds. The load records the
+ * lowest record version among the builders that stamped its rows (see
+ * {@link resumedRecordVersion}).
  *
  * @throws McpError `ServiceUnavailable` `export_no_products` before the sweep when the load, across
  *   every run it took, stamped no product: the store is left as it was, the download deleted, and
@@ -163,15 +194,27 @@ export async function* exportLoad(
   options: ExportLoadOptions,
 ): AsyncGenerator<SyncPage> {
   const { builder, downloadPath, handle, log, upstream } = options;
-  let cursor: ExportCursor = parseExportCursor(ctx.cursor) ?? {
-    v: 1,
-    generation: options.generation,
-    phase: 'download',
-    line: 0,
-    maxModifiedT: 0,
-    rowid: 0,
-    skipped: 0,
-  };
+  const persisted = parseExportCursor(ctx.cursor);
+  let cursor: LoadCursor =
+    persisted === undefined
+      ? {
+          v: 1,
+          generation: options.generation,
+          phase: 'download',
+          line: 0,
+          maxModifiedT: 0,
+          rowid: 0,
+          skipped: 0,
+          recordVersion: builder.MIRROR_RECORD_VERSION,
+        }
+      : {
+          ...persisted,
+          recordVersion: resumedRecordVersion(
+            persisted,
+            builder.MIRROR_RECORD_VERSION,
+            options.previousRecordVersion,
+          ),
+        };
   const begun = ctx.checkpoint ?? options.previousCheckpoint;
   /**
    * The runner clears the checkpoint when a load starts over a completed store; restoring it keeps
@@ -208,7 +251,8 @@ export async function* exportLoad(
             if (etag !== cursor.etag) {
               /**
                * Rows the abandoned export already stamped carry this load's generation; a new one
-               * leaves every row the new export does not stamp to the sweep.
+               * leaves every row the new export does not stamp to the sweep. Every row the load
+               * keeps is then stamped from here on, so its record version starts over too.
                */
               const generation = cursor.line > 0 ? cursor.generation + 1 : cursor.generation;
               if (cursor.etag !== undefined) {
@@ -226,6 +270,7 @@ export async function* exportLoad(
                 line: 0,
                 maxModifiedT: 0,
                 skipped: 0,
+                recordVersion: builder.MIRROR_RECORD_VERSION,
               };
             } else {
               cursor = { ...cursor, totalBytes };
@@ -398,7 +443,7 @@ export async function* exportLoad(
   const load: MirrorLoad = {
     generation: cursor.generation,
     loadedAt: new Date().toISOString(),
-    recordVersion: builder.MIRROR_RECORD_VERSION,
+    recordVersion: cursor.recordVersion,
     ...(cursor.etag !== undefined && { etag: cursor.etag }),
     skippedLines: cursor.skipped,
   };

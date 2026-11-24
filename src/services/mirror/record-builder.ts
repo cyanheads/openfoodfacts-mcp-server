@@ -34,9 +34,10 @@ import {
   printfSignificant,
 } from '@/services/openfoodfacts/nutrition-sets.js';
 import { BARCODE_PATTERN } from '@/services/openfoodfacts/types.js';
+import { brandKey } from '@/services/taxonomy/brand-keys.js';
 
 /** Bumped whenever the projection or tag set changes; the store re-ingests every row stamped with an older version. */
-export const MIRROR_RECORD_VERSION = 3;
+export const MIRROR_RECORD_VERSION = 4;
 
 /**
  * The record version that added each doc field a version-1 row lacks: 2 added `generic_name` and
@@ -114,18 +115,37 @@ export const MIRROR_TAG_FACETS = [
  */
 export const GREEN_SCORE_RECORD_VERSION = 2;
 
+/**
+ * The record version from which rows key each brand by its slug rather than its stored spelling. A
+ * row built earlier holds a brand typed into a schema 1004 record under that typed text, which no
+ * brand key matches, so a store serves a brand search only once a full load built at this version
+ * or later has completed.
+ */
+export const BRAND_KEY_RECORD_VERSION = 4;
+
 const TAG_FACETS: ReadonlySet<string> = new Set(MIRROR_TAG_FACETS);
 
 /**
  * The one place the tag key format lives. `facet` is the search tool's tag-filter facet name, and
- * `storedTag` the value exactly as the export stores it in `<facet>_tags`, brands included: a
- * schema 1004 record keeps a brand the taxonomy does not know as entered (`xx:Slimfast`), and the
- * key keeps that form. Product Opener's tag search compares the stored value exactly, so live
- * `/api/v2/search?brands_tags=slimfast` (queried as `xx:slimfast`) does not find `0008346800025`,
- * which stores `xx:Slimfast`; keying the stored form makes a mirror search find what live finds.
+ * `storedTag` the value as the export stores it in `<facet>_tags`, except a brand, which is
+ * `brandTag`'s form (`xx:` and its `brandKey`). Product Opener stores a brand the taxonomy does not
+ * know as typed on a schema 1004 record (`xx:Slimfast`, `xx:Красный Октябрь`) and as its slug on an
+ * older one (`xx:красный-октябрь`, or bare `красный-октябрь`), and its tag search compares the
+ * stored text exactly, so live splits one brand across spellings no single query reaches. Keyed by
+ * `brandKey` at ingest and at query, every spelling of a brand finds the same products here.
  */
 export function mirrorTagKey(facet: string, storedTag: string): string {
   return `${facet}:${storedTag}`;
+}
+
+/**
+ * A brand as the mirror stores and matches it, given any spelling (`xx:Красный Октябрь`,
+ * `красный-октябрь`, `en:Nestlé`): `xx:` and its `brandKey`. Empty for a brand that slugs to nothing
+ * (`™`), which the builder indexes under no key and a query therefore never matches.
+ */
+function brandTag(value: string): string {
+  const key = brandKey(value);
+  return key === '' ? '' : `xx:${key}`;
 }
 
 /**
@@ -141,19 +161,19 @@ const NOVA_GROUP_TAGS: ReadonlyMap<string, string> = new Map([
 
 /**
  * Maps a canonical tag value as the taxonomy service confirms it (e.g. `en:nutella`, `4`) to the
- * form the export stores (`xx:nutella`, the NOVA taxonomy id), per facet — the value Product
- * Opener's tag search matches (`add_params_to_query` in `lib/ProductOpener/Display.pm`): brands
- * carry the language-less `xx:` prefix, a NOVA digit is its taxonomy id, and an additive id is cut
- * at its first hyphen. Every other facet stores the canonical id as given. The result is matched
- * against the stored form `mirrorTagKey` indexes, never re-slugged: Product Opener's own search
- * misses a brand stored in another case, and the mirror misses it the same way. Throws for a facet
- * outside `MIRROR_TAG_FACETS`, a programmer error at the query seam.
+ * form the mirror indexes (`xx:nutella`, the NOVA taxonomy id), per facet — for every facet but
+ * brands the value Product Opener's tag search matches (`add_params_to_query` in
+ * `lib/ProductOpener/Display.pm`): a NOVA digit is its taxonomy id, and an additive id is cut at its
+ * first hyphen. A brand, given in any spelling, is `brandTag`'s form, the key the builder indexes
+ * every stored spelling of it under; one that slugs to nothing matches no product. Every other
+ * facet stores the canonical id as given. Throws for a facet outside `MIRROR_TAG_FACETS`, a
+ * programmer error at the query seam.
  */
 export function toStoredTag(facet: string, canonicalValue: string): string {
   if (!TAG_FACETS.has(facet)) throw new Error(`Unknown mirror tag facet: ${facet}`);
   switch (facet) {
     case 'brands':
-      return `xx:${canonicalValue.replace(/^[a-z]{2}:/i, '')}`;
+      return brandTag(canonicalValue);
     case 'nova_groups':
       return NOVA_GROUP_TAGS.get(canonicalValue) ?? canonicalValue;
     case 'additives':
@@ -1208,8 +1228,11 @@ export function buildMirrorRecord(p: unknown): MirrorRecord | null {
   for (const facet of MIRROR_TAG_FACETS) {
     const values = p[`${facet}_tags`];
     if (!Array.isArray(values)) continue;
-    for (const tag of values)
-      if (typeof tag === 'string' && tag !== '') tags.add(mirrorTagKey(facet, tag));
+    for (const tag of values) {
+      if (typeof tag !== 'string') continue;
+      const stored = facet === 'brands' ? brandTag(tag) : tag;
+      if (stored !== '') tags.add(mirrorTagKey(facet, stored));
+    }
   }
 
   return {

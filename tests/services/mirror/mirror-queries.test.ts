@@ -3,9 +3,9 @@
  * path: export lines (the live fixtures under `tests/fixtures/mirror/` and synthetic ones) through
  * the record builder, `TagIds`, and the store's batch upsert. Covers barcode lookup (hit, miss,
  * leading zeros, duplicates) and tag-only search: ANDed includes, any-of lists (driving, sought, and
- * excluded, on both page cuts), exclusions as absence, unknown values, the stored brand and NOVA
- * forms, every sort key with nulls and ties, and paging to and past the last page with the exact
- * total.
+ * excluded, on both page cuts), exclusions as absence, unknown values, brand keys and the stored
+ * NOVA form, every sort key with nulls and ties, and paging to and past the last page with the
+ * exact total; and which tags are held.
  * @module tests/services/mirror/mirror-queries.test
  */
 
@@ -17,8 +17,8 @@ import type { MirrorStore, SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { TagIds } from '@/services/mirror/mirror-ingester.js';
 import {
-  firstHeldTag,
   getByCodes,
+  heldTags,
   type MirrorTagFilter,
   type MirrorTagSearch,
   searchByTags,
@@ -491,6 +491,22 @@ describe('searchByTags on the live fixtures', () => {
       codes: ['0016000289994', '0016000490949'],
       total: 2,
     });
+  });
+
+  it.each(['Florida Crystals', 'florida-crystals', 'xx:FLORIDA CRYSTALS', 'en:Florida crystals'])(
+    'finds a brand typed into a schema 1004 record by any spelling (#98): %j',
+    async (given) => {
+      expect(await search([{ facet: 'brands', value: given }])).toEqual({
+        codes: ['0075779920002'],
+        total: 1,
+      });
+    },
+  );
+
+  it('finds a brand stored prefixed on one record and bare on an older one under one key (#98)', async () => {
+    const found = await search([{ facet: 'brands', value: 'de-nigris' }]);
+    expect(found.total).toBe(2);
+    expect([...found.codes].sort()).toEqual(['0008295661012', '0008295661098']);
   });
 
   it('finds NOVA group 4 by its digit, counting every product stored with it', async () => {
@@ -1358,37 +1374,38 @@ describe('searchByTags cuts', () => {
   );
 });
 
-describe('firstHeldTag (#94)', () => {
+describe('heldTags (#98)', () => {
   /** One product stored under each brand tag given. */
   const brandLine = (code: string, ...brands: string[]) => line(code, { brands_tags: brands });
 
   beforeEach(async () => {
     await write([
-      brandLine('80000001', 'xx:nestle'),
-      brandLine('80000002', 'xx:café-bar'),
-      brandLine('80000003', 'xx:gone'),
-      // A brand stored under both keys, as records written either side of a slug change can be.
-      brandLine('80000004', 'xx:haagen-dazs', 'xx:häagen-dazs'),
+      brandLine('81000001', 'xx:nestle'),
+      brandLine('81000002', 'xx:kellogg-s'),
+      brandLine('81000003', 'xx:gone'),
+      brandLine('81000004', 'xx:7up', 'xx:seven-up'),
+      line('81000005', { labels_tags: ['en:organic'] }),
     ]);
     // The ingester keeps the tags row of a brand whose last product has left the store.
-    await store.applyBatch([], ['80000003']);
+    await store.applyBatch([], ['81000003']);
   });
 
-  it('answers the folded slug when the store holds it', async () => {
-    await expect(firstHeldTag(store, 'brands', ['nestle', 'nestlé'])).resolves.toBe('nestle');
+  it('answers each value some stored product carries, in the order given', async () => {
+    await expect(heldTags(store, 'brands', ['kelloggs', 'kellogg-s', 'nestle'])).resolves.toEqual([
+      'kellogg-s',
+      'nestle',
+    ]);
+    await expect(heldTags(store, 'brands', ['nestle', 'kelloggs', 'kellogg-s'])).resolves.toEqual([
+      'nestle',
+      'kellogg-s',
+    ]);
   });
 
-  it('answers the accent-keeping slug when only it is held', async () => {
-    await expect(firstHeldTag(store, 'brands', ['cafe-bar', 'café-bar'])).resolves.toBe('café-bar');
-  });
-
-  it('answers the first value held when both are, in the order given', async () => {
-    await expect(firstHeldTag(store, 'brands', ['haagen-dazs', 'häagen-dazs'])).resolves.toBe(
-      'haagen-dazs',
-    );
-    await expect(firstHeldTag(store, 'brands', ['häagen-dazs', 'haagen-dazs'])).resolves.toBe(
-      'häagen-dazs',
-    );
+  it('answers every held key of a brand, past the first', async () => {
+    await expect(heldTags(store, 'brands', ['7up', '7-up', 'seven-up'])).resolves.toEqual([
+      '7up',
+      'seven-up',
+    ]);
   });
 
   it('counts a tags row no product carries any more as not held', async () => {
@@ -1397,22 +1414,27 @@ describe('firstHeldTag (#94)', () => {
       handle.prepare<{ id: number }>('SELECT id FROM tags WHERE key = ?').get('brands:xx:gone'),
     ).toBeTruthy();
 
-    await expect(firstHeldTag(store, 'brands', ['gone'])).resolves.toBeUndefined();
-    await expect(firstHeldTag(store, 'brands', ['gone', 'nestle'])).resolves.toBe('nestle');
+    await expect(heldTags(store, 'brands', ['gone'])).resolves.toEqual([]);
+    await expect(heldTags(store, 'brands', ['gone', 'nestle'])).resolves.toEqual(['nestle']);
   });
 
-  it('answers undefined when no value is held, or none is given', async () => {
-    await expect(firstHeldTag(store, 'brands', ['kelloggs', 'kellogg'])).resolves.toBeUndefined();
-    await expect(firstHeldTag(store, 'brands', [])).resolves.toBeUndefined();
+  it('answers no value when none is held, or none is given', async () => {
+    await expect(heldTags(store, 'brands', ['kelloggs', 'kellogg'])).resolves.toEqual([]);
+    await expect(heldTags(store, 'brands', [])).resolves.toEqual([]);
   });
 
   it('matches a value under the facet it is asked for alone', async () => {
-    await expect(firstHeldTag(store, 'labels', ['nestle'])).resolves.toBeUndefined();
+    await expect(heldTags(store, 'labels', ['nestle'])).resolves.toEqual([]);
+    await expect(heldTags(store, 'brands', ['en:organic', 'organic'])).resolves.toEqual([]);
+    await expect(heldTags(store, 'labels', ['en:organic'])).resolves.toEqual(['en:organic']);
   });
 
-  it('seeks the tag and one posting by index, scanning neither table', async () => {
+  it('prepares one statement that seeks the tag and one posting by index, scanning neither table', async () => {
     const { reader, statements } = await recordingReader();
-    await firstHeldTag(reader, 'brands', ['nestle']);
+    await expect(heldTags(reader, 'brands', ['nestle', 'kellogg-s', 'gone'])).resolves.toEqual([
+      'nestle',
+      'kellogg-s',
+    ]);
     const [sql = ''] = statements;
     const handle = await store.raw();
 
@@ -1428,5 +1450,45 @@ describe('firstHeldTag (#94)', () => {
     expect(plan).toContainEqual(
       expect.stringMatching(/^SEARCH product_tags USING PRIMARY KEY \(tag_id=\?\)$/),
     );
+  });
+
+  it('holds a brand under any spelling, the store keying each stored spelling alike', async () => {
+    await write([
+      brandLine('81000011', 'xx:Красный Октябрь'),
+      brandLine('81000012', 'xx:Красный октябрь'),
+      brandLine('81000013', 'xx:красный-октябрь'),
+      brandLine('81000014', 'красный-октябрь'),
+    ]);
+    const spellings = ['Красный Октябрь', 'красный-октябрь', 'Красный октябрь', 'КРАСНЫЙ ОКТЯБРЬ'];
+    await expect(heldTags(store, 'brands', spellings)).resolves.toEqual(spellings);
+    for (const spelling of spellings) {
+      await expect(search([{ facet: 'brands', value: spelling }])).resolves.toEqual({
+        codes: ['81000011', '81000012', '81000013', '81000014'],
+        total: 4,
+      });
+    }
+  });
+
+  it('holds no brand that slugs to nothing, and serves it no product', async () => {
+    await expect(heldTags(store, 'brands', ['™', '  '])).resolves.toEqual([]);
+    await expect(search([{ facet: 'brands', value: '™' }])).resolves.toEqual({
+      codes: [],
+      total: 0,
+    });
+  });
+
+  it('holds a brand the search then serves as one any-of filter over its held keys', async () => {
+    const keys = ['7up', '7-up', 'seven-up'];
+    const held = await heldTags(store, 'brands', keys);
+    expect(held.length).toBeGreaterThan(0);
+    // The product stored under two of the keys counts once.
+    await expect(search([{ facet: 'brands', value: keys }])).resolves.toEqual({
+      codes: ['81000004'],
+      total: 1,
+    });
+    await expect(search([{ facet: 'brands', value: held }])).resolves.toEqual({
+      codes: ['81000004'],
+      total: 1,
+    });
   });
 });

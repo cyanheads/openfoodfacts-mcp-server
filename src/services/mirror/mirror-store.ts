@@ -9,7 +9,7 @@
  * | `products` | `code TEXT PRIMARY KEY` (normalized barcode); `popularity_key`, `unique_scans_n`, `created_t`, `last_modified_t` INTEGER (the `sort_by` keys, null when the record lacks one; the two dates are also the only place reads take a record's dates from, since `doc` never holds them); `generation` INTEGER (full load that last stamped the row); `record_version` INTEGER (`MIRROR_RECORD_VERSION` the row was built with); `tag_ids` TEXT (sorted JSON array of `tags.id`); `doc` TEXT (the builder's projected v2 JSON) | the framework's per-page upsert and tombstone delete |
  * | `tags` | `id INTEGER PRIMARY KEY`, `key TEXT UNIQUE` (a `mirrorTagKey(facet, storedTag)`) | the ingester, before each page |
  * | `product_tags` | `PRIMARY KEY (tag_id, code) WITHOUT ROWID` — one posting per product per tag | triggers on `products` insert, `tag_ids` change, and delete |
- * | `mirror_load` | one row: `generation`, `loaded_at` (ISO), `record_version`, `etag` (the strong ETag of the export it read; null in a row written before migration 2 added it), and `skipped_lines` (export lines it skipped as malformed or past 16 MiB) of the last completed full load | the ingester, after a full load's sweep |
+ * | `mirror_load` | one row: `generation`, `loaded_at` (ISO), `record_version` (the lowest `MIRROR_RECORD_VERSION` that built its rows), `etag` (the strong ETag of the export it read; null in a row written before migration 2 added it), and `skipped_lines` (export lines it skipped as malformed or past 16 MiB) of the last completed full load | the ingester, after a full load's sweep |
  * | `mirror_sync_lock` | one row while a sync runs: holder token, `pid`, `host`, `acquired_at`, `heartbeat_at` (epoch ms) | `mirror-lock.ts` |
  * | `mirror_sync_state`, `schema_version` | the framework's sync state and schema stamp | the framework |
  * | `products_<column>_sort`, one per `SORT_COLUMNS` entry | index `(<column> DESC, code)`: every product in a tag search's order for that sort key | `ensureSortIndexes` in the sync process, then SQLite with `products` |
@@ -41,7 +41,7 @@ import type { MirrorStore, SqliteHandle, SyncState } from '@cyanheads/mcp-ts-cor
 import { sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import { getServerConfig } from '@/config/server-config.js';
 import { type MirrorLockHolder, readMirrorLock } from './mirror-lock.js';
-import { GREEN_SCORE_RECORD_VERSION } from './record-builder.js';
+import { BRAND_KEY_RECORD_VERSION, GREEN_SCORE_RECORD_VERSION } from './record-builder.js';
 
 /** Schema version the store's migrations reach. */
 const STORE_SCHEMA_VERSION = 2;
@@ -269,6 +269,10 @@ export interface MirrorLoad {
   generation: number;
   /** ISO time the load's sweep finished. */
   loadedAt: string;
+  /**
+   * The lowest `MIRROR_RECORD_VERSION` that built a row of the load: a load resumed under a newer
+   * builder records the older one, so the next refresh reloads it.
+   */
   recordVersion: number;
   /** Export lines the load skipped because they were not valid JSON or ran past 16 MiB. */
   skippedLines: number;
@@ -306,6 +310,17 @@ export function readMirrorLoad(handle: SqliteHandle): MirrorLoad | undefined {
 export async function indexesGreenScore(store: MirrorStore): Promise<boolean> {
   const load = readMirrorLoad(await store.raw());
   return load !== undefined && load.recordVersion >= GREEN_SCORE_RECORD_VERSION;
+}
+
+/**
+ * Whether the store serves a search filtering on a brand: its last completed full load was built
+ * at `BRAND_KEY_RECORD_VERSION` or later. Until such a load completes some rows hold a typed brand
+ * under its stored spelling rather than its key (every row of an older load, and the rows a reload
+ * part-way through has not rewritten yet), so a search by brand key would miss products.
+ */
+export async function indexesBrandKeys(store: MirrorStore): Promise<boolean> {
+  const load = readMirrorLoad(await store.raw());
+  return load !== undefined && load.recordVersion >= BRAND_KEY_RECORD_VERSION;
 }
 
 /** What `mirror:status` and `mirror:verify` print. */

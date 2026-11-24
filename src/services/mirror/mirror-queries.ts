@@ -1,5 +1,5 @@
 /**
- * @fileoverview The mirror's read queries — barcode lookup, tag-only search, and whether a tag is
+ * @fileoverview The mirror's read queries — barcode lookup, tag-only search, and which tags are
  * held — over the store
  * `mirror-store.ts` defines. The one module that turns caller values into the store's keys and SQL:
  * a barcode through `normalizeCodeZeroes`, a tag filter through `toStoredTag` and `mirrorTagKey`.
@@ -513,20 +513,22 @@ function countOf(handle: SqliteHandle, sql: string, params: readonly SqlValue[])
 }
 
 /**
- * The first of `values` (canonical, as `MirrorTagFilter.value` is) some stored product carries under
- * `facet`, or `undefined` when none is: per value tried, one `tags` seek and one posting seek. A
- * `tags` row is not enough, since the ingester keeps the row of a tag whose last product has left.
+ * The `values` (canonical, as `MirrorTagFilter.value` is) some stored product carries under
+ * `facet`, in the order given; empty when none is. A brand is held when any of its keys is, and a
+ * search sends the mirror those keys as one any-of filter. Per value, one `tags` seek and one
+ * posting seek: a `tags` row is not enough, since the ingester keeps the row of a tag whose last
+ * product has left.
  */
-export async function firstHeldTag(
+export async function heldTags(
   store: MirrorReader,
   facet: MirrorTagFacet,
   values: readonly string[],
-): Promise<string | undefined> {
+): Promise<string[]> {
   const handle = await store.raw();
   const held = handle.prepare<{ held: number }>(
     'SELECT EXISTS (SELECT 1 FROM product_tags WHERE tag_id = (SELECT id FROM tags WHERE key = ?)) AS held',
   );
-  return values.find(
+  return values.filter(
     (value) => held.get(mirrorTagKey(facet, toStoredTag(facet, value)))?.held === 1,
   );
 }

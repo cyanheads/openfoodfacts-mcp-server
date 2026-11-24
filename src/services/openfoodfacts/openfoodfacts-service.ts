@@ -21,8 +21,8 @@ import {
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import {
-  firstHeldTag,
   getByCodes,
+  heldTags,
   type MirrorDoc,
   type MirrorTagFilter,
   type MirrorTagSearch,
@@ -30,13 +30,13 @@ import {
 } from '@/services/mirror/mirror-queries.js';
 import {
   getMirrorStore,
+  indexesBrandKeys,
   indexesGreenScore,
   isMirrorReady,
   mirrorAsOf,
 } from '@/services/mirror/mirror-store.js';
 import { fieldsNewerThan } from '@/services/mirror/record-builder.js';
 import { untilCancelled } from '@/utils/until-cancelled.js';
-import { ANALYZER_STOP_WORDS, STOP_WORD_LANGS } from './analyzer-stop-words.js';
 import {
   type AsSoldSelection,
   type NutritionInputSet,
@@ -64,7 +64,6 @@ import {
   type SearchResult,
   type SearchRow,
   type TagValue,
-  WHOLE_NUMBER_NUTRIENTS,
 } from './types.js';
 import { USER_AGENT } from './user-agent.js';
 
@@ -194,11 +193,12 @@ function looksLikeHtml(body: string): boolean {
 
 /**
  * Extracts the upstream's own explanation from a captured error body. search-a-licious answers a
- * rejected request with a `detail` naming the exact constraint that was violated — a string on a
- * GET, and on a POST whose JSON body fails validation a list of objects whose `msg` says why (each
- * also echoes the whole request under `input`, which is noise here, so only the messages are
- * kept). Anything else falls back to a short snippet so the caller still learns why the request
- * was refused.
+ * request it refuses before searching with a `detail` naming the exact constraint that was
+ * violated — a string on a GET, and on a POST whose JSON body fails validation a list of objects
+ * whose `msg` says why (each also echoes the whole request under `input`, which is noise here, so
+ * only the messages are kept). A search it refuses or fails while querying (2.x) carries an
+ * `errors` list instead, read by `searchErrorsDetail`. Anything else falls back to a short snippet
+ * so the caller still learns why the request was refused.
  * `error.data.body` is head-truncated by the framework, so this reads whatever survived — and a
  * rendered error page is summarized rather than pasted, since its markup carries no signal.
  *
@@ -211,7 +211,7 @@ function looksLikeHtml(body: string): boolean {
 function upstreamDetail(body: unknown, reason: UpstreamReason): string | undefined {
   if (typeof body !== 'string' || body.trim() === '') return;
   try {
-    const parsed = JSON.parse(body) as { detail?: unknown };
+    const parsed = JSON.parse(body) as { detail?: unknown; errors?: unknown };
     if (typeof parsed.detail === 'string') return plainTextDetail(parsed.detail);
     if (Array.isArray(parsed.detail)) {
       const messages = parsed.detail.flatMap((entry: { msg?: unknown }) =>
@@ -219,6 +219,8 @@ function upstreamDetail(body: unknown, reason: UpstreamReason): string | undefin
       );
       if (messages.length > 0) return plainTextDetail(messages.join('; '));
     }
+    const explained = searchErrorsDetail(parsed.errors);
+    if (explained) return explained;
   } catch {
     /*
      * Not JSON (HTML error page, plain text), or JSON the framework cut short: a validation list
@@ -245,17 +247,36 @@ const PLAIN_TEXT_DETAIL_LIMIT = 200;
  * Reduces a body that is neither JSON nor a recognized HTML document to a bounded plain-text
  * snippet. Markup is dropped rather than truncated into: the message is rendered as Markdown on
  * the text surface, and a body the HTML sniff did not match can still carry angle brackets that
- * would land there as syntax. Returns `undefined` when nothing readable survives.
+ * would land there as syntax. A tag spans no other `<`, which keeps every pass linear in the
+ * body's length, as the text path's larger capture (`TEXT_SEARCH_ERROR_BODY_LIMIT`) needs.
+ * Returns `undefined` when nothing readable survives. Exported for its timing test.
  */
-function plainTextDetail(body: string): string | undefined {
+export function plainTextDetail(body: string): string | undefined {
   const text = body
-    .replace(/<[^>]*>/g, ' ')
+    .replace(/<[^<>]*>/g, ' ')
     .replace(/[<>]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, PLAIN_TEXT_DETAIL_LIMIT)
     .trim();
   return text === '' ? undefined : text;
+}
+
+/**
+ * The explanation a search-a-licious `errors` list carries (`RawTextSearchResponse.errors`): each
+ * entry's `description`, or its `title` when it has none, joined. A `QueryCheckError` lists every
+ * field the query named that the index lacks, one per line. `undefined` for anything that is not
+ * such a list or explains nothing.
+ */
+function searchErrorsDetail(errors: unknown): string | undefined {
+  if (!Array.isArray(errors)) return;
+  const messages = errors.flatMap((entry: { description?: unknown; title?: unknown }) => {
+    const text = [entry?.description, entry?.title].find(
+      (value): value is string => typeof value === 'string' && value.trim() !== '',
+    );
+    return text === undefined ? [] : [text];
+  });
+  return messages.length > 0 ? plainTextDetail(messages.join('; ')) : undefined;
 }
 
 /**
@@ -493,13 +514,15 @@ type MirroredProduct = {
 /**
  * A search as the search tool hands it over. `tags_confirmed` marks a search by tag filters alone
  * whose every value is canonical and confirmed: each tag value is the `value` the taxonomy
- * service's `canonicalizeTag` returned with `resolution: 'vocabulary'`, or a brand slug the mirror
- * holds products under (`mirrorHeldBrand`, matched under `xx:`); exclusions are confirmed
- * before they are sent at all; `nutrition_grade`, `nova_group`, `ecoscore_grade`, and
- * `ingredients_analysis_tag` are closed vocabularies the tool's input schema enforces. Only such a
- * search is served from the mirror, which matches stored tags exactly, and one carrying
- * `ecoscore_grade` only once the mirror indexes Green-Score (`mirrorIndexesGreenScore`). Without it
- * a search by tag filters alone reads `/api/v2/search`, which canonicalizes what it is given.
+ * service's `canonicalizeTag` returned with `resolution: 'vocabulary'`, and a brand is the ones of
+ * its keys (`brandKeys`: its spellings and its Open Food Facts synonyms) the mirror holds products
+ * under (`mirrorHeldBrand`), any of which matches; exclusions are confirmed before they are sent at
+ * all; `nutrition_grade`, `nova_group`, `ecoscore_grade`, and `ingredients_analysis_tag` are closed
+ * vocabularies the tool's input schema enforces. Only such a search is served from the mirror,
+ * which matches stored tags exactly, one carrying `ecoscore_grade` only once the mirror indexes
+ * Green-Score (`mirrorIndexesGreenScore`), and one carrying `brands_tag` only once it keys every
+ * brand (`mirrorIndexesBrandKeys`). Without it a search by tag filters alone reads
+ * `/api/v2/search`, which canonicalizes what it is given.
  */
 export type ProductSearch = SearchParams & { tags_confirmed?: boolean };
 
@@ -617,7 +640,11 @@ const PRODUCT_FIELDS = PRODUCT_FIELD_NAMES.join(',');
  */
 const MIRROR_PRODUCT_FIELDS: ReadonlySet<string> = new Set(PRODUCT_FIELD_NAMES);
 
-/** Fields to request on search results — summary rows for triage. Shared by both search paths. */
+/**
+ * Fields to request on search results — summary rows for triage — as a v2 read names them: the
+ * tag path's `fields`, the mirror's projection, and the keys of every search row. The text path asks
+ * for the same fields under the index's names (`TEXT_SEARCH_RESULT_FIELDS`).
+ */
 const SEARCH_FIELDS = [
   'code',
   'product_name',
@@ -636,18 +663,47 @@ const SEARCH_FIELDS = [
 const SEARCH_FIELD_SET: ReadonlySet<string> = new Set(SEARCH_FIELDS);
 
 /**
- * Text search endpoint — search.openfoodfacts.org uses Elasticsearch and actually filters by the
- * query text. The /api/v2/search endpoint silently ignores search_terms and returns all products.
- * The same host serves the taxonomy autocomplete used to resolve tag IDs.
+ * `SEARCH_FIELDS` as the text index names them, in the same order: `categories` for
+ * `categories_tags` and `environmental_score_grade` for `ecoscore_grade`. The index leaves a field
+ * it does not know out of every hit without an error, so asking under the v2 names returns rows
+ * missing both. `searchProductsByText` maps each hit back to the row keys.
+ */
+const TEXT_SEARCH_RESULT_FIELDS = [
+  'code',
+  'product_name',
+  'brands',
+  'quantity',
+  'nutriscore_grade',
+  'nova_group',
+  'environmental_score_grade',
+  'categories',
+  'completeness',
+  'last_modified_t',
+  'created_t',
+];
+
+/**
+ * Text search endpoint — search.openfoodfacts.org runs search-a-licious 2.x over Elasticsearch and
+ * actually filters by the query text. The /api/v2/search endpoint silently ignores search_terms
+ * and returns all products. The same host serves the taxonomy autocomplete used to resolve tag IDs.
  *
- * Its index is a snapshot that lags the live database, so this path and the tag-only path answer
- * the same filters differently — live-verified with a category filter counting more products on
- * /api/v2/search than here, and a barcode contributed after the cutoff absent from this index
- * entirely. The endpoint publishes no index timestamp (`/health` reports only Redis and
- * Elasticsearch connectivity), so the service dates the lag itself: the newest `last_modified_t`
- * the index holds, read by a cached probe sent beside a text search (`textIndexDate`).
+ * Its index lags the live database (live 2026-11-24: its newest record was 14 hours old and did
+ * not move in 12 minutes), so this path and the tag-only path can answer the same filters
+ * differently, and a product contributed since that record is absent here. Its API names no index
+ * date, so the service dates the lag itself: the newest `last_modified_t` the index holds, read by
+ * a cached probe sent beside a text search (`textIndexDate`).
  */
 const TEXT_SEARCH_BASE_URL = 'https://search.openfoodfacts.org';
+
+/**
+ * Bytes of a failed text search's body kept for its message, against the framework's default
+ * 500. search-a-licious 2.x explains a refused or failed search in an `errors` list that follows a
+ * `debug` object, and a `QueryCheckError` names every field it rejects on a line of its own, so
+ * such a body outgrows the default, whose head-and-tail cut leaves JSON that no longer parses.
+ * 16 KiB is what the framework reads of an error body at most, so any body it reads whole is kept
+ * whole.
+ */
+const TEXT_SEARCH_ERROR_BODY_LIMIT = 16_384;
 
 /**
  * The text index date probe's request: no `q`, which matches the whole index (`q=*` matches
@@ -674,18 +730,15 @@ const TEXT_INDEX_DATE_TTL_MS = 6 * 60 * 60 * 1000;
 const TEXT_INDEX_PROBE_BACKOFF_MS = 15 * 60 * 1000;
 
 /**
- * Every language the text index analyzes, sent as `langs` on each text search. The backend
- * searches `product_name.<lang>` and `generic_name.<lang>` only for the languages it is sent and
- * defaults to English alone, so a product named only in French, Russian, or Portuguese is
- * invisible to a text query that sends nothing (live, 2026-09-22: `шоколад` 359 hits on the
- * default against 870 with the first 30 of these). These are exactly the codes the index has name
- * subfields for — search-a-licious v1.4.0's `ANALYZER_LANG_MAPPING` intersected with the Open Food
- * Facts language list, which drops its `cz` and `pt-BR` entries. Live, 2026-09-23: offered 60 codes,
- * the backend compiled name fields for these 31 and no others, and `melkesjokolade` counts 42
- * without `no` against 52 with it. A code outside them drops every name field and leaves only
- * `brands` searched (`langs=pl` → `chocolate` 1,749 hits, against 10,000+), which is why this is a
- * constant rather than a caller input. Names entered in any other language are stored in fields
- * the query cannot reach at any `langs`.
+ * The languages whose name fields a text query searches, sent as `langs` on each text search.
+ * search-a-licious 2.x searches `product_name.<lang>` and `generic_name.<lang>` only for the
+ * languages it is sent, English alone by default, so a product named only in French, Russian, or
+ * Portuguese is invisible to a query that sends nothing. Its index holds those fields for 181
+ * languages plus `main`, the name in the product's own main language, whatever that is (live
+ * 2026-11-24: `czekolada` 108 on the 31 codes here, 370 with `main` added). The 31 codes are the
+ * languages the 1.x index analyzed, so every name a search reached on that index stays reachable,
+ * and `main` reaches a product by its own name in any other. Each code costs two fields per query
+ * word, so the other 150 stay unsent, and the list is a constant rather than a caller input.
  */
 export const TEXT_SEARCH_LANGS = [
   'en',
@@ -719,46 +772,15 @@ export const TEXT_SEARCH_LANGS = [
   'tr',
   'th',
   'no',
+  'main',
 ] as const;
 
-/** A language code the text index analyzes. */
-export type TextSearchLang = (typeof TEXT_SEARCH_LANGS)[number];
-
 /**
- * The languages among `TEXT_SEARCH_LANGS` the taxonomy fields (`categories`, `labels`) carry
- * translated subfields for — the taxonomies' exported languages. The backend searches
- * `categories.<lang>` and `labels.<lang>` only for these.
- */
-const TAXONOMY_FIELD_LANGS = [
-  'en',
-  'fr',
-  'it',
-  'es',
-  'de',
-  'nl',
-] as const satisfies readonly TextSearchLang[];
-
-/**
- * The fields the backend's own relevance match (`multi_match`) searches for the `langs` sent: the
- * two name fields per analyzed language, the two taxonomy fields per exported language, and
- * `brands`, which is not language-specific — 75 fields, live-verified against the backend's
- * compiled query. The per-word groups span exactly this list: a field it lacked would drop matches
- * the relevance part found, and a field it added could only narrow.
- */
-const TEXT_SEARCH_FIELDS = [
-  ...TEXT_SEARCH_LANGS.map((lang) => `product_name.${lang}`),
-  ...TEXT_SEARCH_LANGS.map((lang) => `generic_name.${lang}`),
-  ...TAXONOMY_FIELD_LANGS.map((lang) => `categories.${lang}`),
-  ...TAXONOMY_FIELD_LANGS.map((lang) => `labels.${lang}`),
-  'brands',
-];
-
-/**
- * Most words a text query may carry. Each word costs one clause per searched field twice over —
- * once in the backend's relevance match and once in its per-word group — against an Elasticsearch
- * ceiling of 4,228 clauses, which the backend reports as an error inside an HTTP 200. Live, 24
- * words answered normally and 45 hit the ceiling; words are counted as runs of letters and digits,
- * the most tokens the analyzers can split a query into, so a hyphenated word counts each part.
+ * Most words a text query may carry: this server's bound on what one query costs the backend, not
+ * the backend's own ceiling. search-a-licious 2.x matches each word against every name field of
+ * every language sent (64 for `TEXT_SEARCH_LANGS`) and its other full-text fields; live
+ * 2026-11-24, 60 words still answered normally. Words are counted as runs of letters and digits,
+ * the most terms the analyzers can split a query into, so a hyphenated word counts each part.
  */
 export const MAX_QUERY_WORDS = 24;
 
@@ -767,73 +789,35 @@ export function countQueryWords(query: string): number {
   return query.match(/[\p{L}\p{N}]+/gu)?.length ?? 0;
 }
 
-/** How a word is compared against the stop lists: lowercased, keeping letters, marks, and digits. */
-function stopWordKey(word: string): string {
-  return word.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]/gu, '');
-}
-
-/**
- * The words exempt from the per-word groups: the stop words of the languages in `STOP_WORD_LANGS`
- * (English, French, Spanish, German, Italian — each holding at least 1% of named products), 949
- * words. Each language subfield (`product_name.fr`, `categories.fr`, …) runs that language's
- * analyzer, which removes its stop words before indexing, so a field can never match one: live, a
- * group for `de` over only `product_name.fr` or `categories.fr` matched no product, while
- * `product_name.en:de` matched 10,000+. A group requiring such a word keeps only products carrying
- * it in some other language's field, which guts ordinary queries (`chocolate with hazelnuts` 84
- * against 5,840, `confiture de fraise` 237 against 3,251). So these words form no group, whichever
- * language the caller meant: a required word fails toward zero, an optional one only toward
- * ranking. The cost is that a content word that is a stop word in one of these languages — `soy`
- * and `sea` (Spanish), `die`, `hat`, and `war` (German) — ranks results but no longer filters them.
- * Stop words of the other 26 languages still form groups; see `STOP_WORD_LANGS` for why.
- */
-const STOP_WORDS = new Set(
-  STOP_WORD_LANGS.flatMap((lang) =>
-    ANALYZER_STOP_WORDS[lang].split(/\s+/).filter(Boolean).map(stopWordKey),
-  ),
-);
-
 /**
  * A word as the backend's analyzers split text: a run of letters, marks, digits, and `_`,
  * continuing across a single `'`, `’`, or `.` between two such characters, or a single `,` between
- * two digits; every other character separates words. Probed live (2026-10-13, Mongolia): one group
- * for `milk<sep>xyzzyqq` matched the 6 `milk` products when `<sep>` was `-`, `/`, `+`, `&`, `,`,
- * or `:` — the analyzer split it and the group ORed the parts — and 0 when it was `'`, `’`, `.`, or
- * `_`, which stay inside one token. A decimal comma stays inside its number (live: `lait 1,5%` with
- * groups for `1` and `5` matched 27 products, only names spelling it `1, 5%`; with one `1,5` group,
- * 324). The scan is linear in the query's length, which nothing bounds before it: the joiners and
- * the word characters are disjoint and a started match always succeeds, so nothing is retried.
+ * two digits; every other character separates words. Probed live: `milk<sep>xyzzyqq` as one term
+ * matched the `milk` products when `<sep>` was `-`, `/`, `+`, `&`, `,`, or `:` — the analyzer split
+ * it — and none when it was `.` or `_`, which stay inside one token (2026-10-13, and on 2.x
+ * 2026-11-24 for `-`, `,`, and `.`). A decimal comma stays inside its number (live: `lait 1,5%`
+ * requiring `1` and `5` matched 27 products, only names spelling it `1, 5%`; requiring `1,5`, 324).
+ * The scan is linear in the query's length, which nothing bounds before it: the joiners and the
+ * word characters are disjoint and a started match always succeeds, so nothing is retried.
  */
 const ANALYZER_WORD = /[\p{L}\p{M}\p{N}_]+(?:(?:['’.]|(?<=\p{N}),(?=\p{N}))[\p{L}\p{M}\p{N}_]+)*/gu;
 
 /**
- * The words of a lowercased query that each get a required group: the words `ANALYZER_WORD`
- * extracts, holding a letter or digit, not an exempt stop word (see `STOP_WORDS`), first
- * occurrence only. A group built from a whole joined token (`milk-chocolate`) would be split by
- * the analyzer and its parts ORed, leaving each part optional, so every word gets its own group.
- * A word with no letter or digit (`_`) analyzes to nothing in every field, and a fielded match on
- * nothing matches no product (live: `milk -` with a group for `-` → 0, without it → 6), so it forms
- * no group. Each word holds at least one of the letter-and-digit runs `countQueryWords` counts, so
- * a query inside `MAX_QUERY_WORDS` never builds more groups than that.
- *
- * A query of fewer than two words gets none: the backend's relevance match already requires at
- * least one of its terms (it sets `minimum_should_match: 1` beside filters, and a should-only query
- * needs one anyway), so a lone word's group selects the same products (live: `milk` 6 with or
- * without it) while costing about 200 ms a search.
+ * The query's part of `q`: its words (`ANALYZER_WORD`), lowercased and space-separated, escaped.
+ * search-a-licious 2.x requires every space-separated bare word, and its analyzers leave stop
+ * words out of that requirement (live 2026-11-24: `confiture de fraise` and `confiture fraise` both
+ * 1,956). A word joined to another by punctuation is one term to it, though, matched by any one of
+ * the parts its analyzers split it into (`coca-cola` 10,000+ against `coca cola` 2,969), so the
+ * words are sent apart, each required. Lowercasing turns a caller's `AND`/`OR`/`NOT`/`TO` into
+ * plain words, since the parser reserves only the uppercase forms, and costs nothing because every
+ * analyzer lowercases. A query holding no word is sent as typed: the backend matches it against no
+ * product (live: `%%%` 0), where sending nothing would match every one. Escaping keeps whatever
+ * reaches `q` from parsing as query syntax (see `LUCENE_RESERVED_CHARS`).
  */
-export function requiredWords(lowercasedQuery: string): string[] {
-  const words = lowercasedQuery.match(ANALYZER_WORD) ?? [];
-  if (words.length < 2) return [];
-  return [
-    ...new Set(
-      words.filter((word) => /[\p{L}\p{N}]/u.test(word) && !STOP_WORDS.has(stopWordKey(word))),
-    ),
-  ];
-}
-
-/** One word required across every searched field: `(field1:word OR field2:word OR …)`. */
-function wordGroup(word: string): string {
-  const escaped = escapeLuceneQueryText(word);
-  return `(${TEXT_SEARCH_FIELDS.map((field) => `${field}:${escaped}`).join(' OR ')})`;
+function textQueryTerms(query: string): string {
+  const lowercased = query.toLowerCase();
+  const words = lowercased.match(ANALYZER_WORD);
+  return escapeLuceneQueryText(words ? words.join(' ') : lowercased);
 }
 
 /**
@@ -873,18 +857,86 @@ const NUTRIENT_RANGE_FORMS: Record<NutrientOperator, (value: number) => string> 
 };
 
 /**
- * The clause a nutrient constraint sends. On a `WHOLE_NUMBER_NUTRIENTS` field the index rounds a
- * fractional lower bound up and stores 3.53 as 3, so `gte 3.5` and `gt 3` both exclude real matches
- * (`sugars gt 3` lost 290 of 938 skyr rows, live 2026-10-30). Those two go out as
- * `[floor(value) TO *]`, which loses none, and `meetsConstraints` removes the rows that widening
- * lets in. `lt` and `lte` already return a superset there, and the other nutrients compare exactly.
+ * The clause a nutrient constraint sends, its bound as given: the index compares every nutrient
+ * as a decimal (see `NUTRIENT_FIELDS`), so the range it answers is the constraint itself.
  */
 function nutrientClause({ nutrient, operator, value }: NutrientFilter): string {
-  const widened = WHOLE_NUMBER_NUTRIENTS.has(nutrient) && (operator === 'gt' || operator === 'gte');
-  const range = widened
-    ? NUTRIENT_RANGE_FORMS.gte(Math.floor(value))
-    : NUTRIENT_RANGE_FORMS[operator](value);
-  return `nutriments.${nutrient}_100g:${range}`;
+  return `nutriments.${nutrient}_100g:${NUTRIENT_RANGE_FORMS[operator](value)}`;
+}
+
+/**
+ * A tag ID as one exact term: double-quoted, any `\` or `"` in it escaped, so the parser reads the
+ * whole value as the term and nothing in it as query syntax (live 2026-11-24:
+ * `brands:"xx:zzq\" OR categories:\"en:hummus"` matched nothing — one term, not two clauses).
+ */
+function quotedTerm(value: string): string {
+  return `"${value.replace(/["\\]/g, '\\$&')}"`;
+}
+
+/**
+ * Build the search-a-licious Lucene `q` from a text query plus tag filters, in this order: tag
+ * clauses, exclusion clauses, nutrient range clauses, then the query's words. Recognized
+ * `field:"value"` facet clauses become hard AND filters — one clause per value, so several labels
+ * or ingredients all apply — and a top-level `-field:"value"` clause excludes (live 2026-11-24:
+ * `allergens:"en:sesame-seeds"` and its exclusion partition the `en:hummus` products exactly). An
+ * exclusion value must be canonical: a value the field does not hold excludes nothing, so the tool
+ * refuses unconfirmed ones before they reach here.
+ *
+ * Field names are search-a-licious 2.x's for Open Food Facts, which differ from /api/v2/search: the
+ * tag facets drop the `_tags` suffix (`categories`, `brands`, `labels`, `allergens`, `traces`,
+ * `additives`, `countries`) while `ingredients_tags` and `ingredients_analysis_tags` keep it,
+ * nutrition grade is `nutriscore_grade`, NOVA `nova_group`, and Green-Score
+ * `environmental_score_grade`, the grade each row shows. 2.x refuses a field it does not know with
+ * HTTP 400. Tag values go as exact terms (`quotedTerm`), otherwise verbatim — the fields are
+ * exact-match keywords, so the caller hands in the forms the index stores (the tool runs each
+ * value through the taxonomy service's canonicalizer first). A grade stays unquoted unless it
+ * carries punctuation (`a-plus`), and several grades of one input form an `(a OR b)` group, since
+ * a product carries one grade (live: `nutriscore_grade:(a OR b)` counts `a` and `b` summed). The
+ * several IDs one tag value can be stored under (`TagValue`) form a quoted group the same way, in
+ * every tag field, and each member of a list that must all apply is its own clause.
+ *
+ * The query's words come last, bare (`textQueryTerms`): 2.x requires each of them and ranks the
+ * results by them. They reach product and generic names only — the category, label, and brand
+ * fields it also searches hold tag IDs no word equals (live 2026-11-24: `hummus` matched 2,643 of
+ * the 4,616 `en:hummus` products) — so that intent goes through the tag filters.
+ *
+ * Nutrient constraints become nested range clauses under the `nutriments.` prefix
+ * (`nutrientClause`). Exported for its timing test.
+ */
+export function buildTextSearchQuery(params: SearchParams): string {
+  const clauses: string[] = [];
+  /** Adds `field:term`, or `field:(a OR b)` for several terms any of which matches; none adds nothing. */
+  const addClause = (field: string, terms: readonly string[]) => {
+    if (terms.length === 0) return;
+    clauses.push(`${field}:${terms.length === 1 ? terms[0] : `(${terms.join(' OR ')})`}`);
+  };
+  /** One tag value's IDs, each an exact term, an empty one left out. */
+  const tagTerms = (value: TagValue | undefined) =>
+    [value ?? []].flat().filter(Boolean).map(quotedTerm);
+  /** One grade input's grades, bare unless punctuated (`a-plus`). */
+  const gradeTerms = (value: string | string[] | undefined) =>
+    [value ?? []].flat().map((grade) => (/^[a-z0-9]+$/.test(grade) ? grade : quotedTerm(grade)));
+  addClause('categories', tagTerms(params.categories_tag));
+  addClause('brands', tagTerms(params.brands_tag));
+  for (const label of [params.labels_tag ?? []].flat()) addClause('labels', tagTerms(label));
+  addClause('allergens', tagTerms(params.allergens_tag));
+  addClause('traces', tagTerms(params.traces_tag));
+  addClause('ingredients_analysis_tags', tagTerms(params.ingredients_analysis_tag));
+  for (const ingredient of [params.ingredients_tag ?? []].flat()) {
+    addClause('ingredients_tags', tagTerms(ingredient));
+  }
+  addClause('additives', tagTerms(params.additives_tag));
+  addClause('nutriscore_grade', gradeTerms(params.nutrition_grade));
+  addClause('nova_group', gradeTerms(params.nova_group));
+  addClause('environmental_score_grade', gradeTerms(params.ecoscore_grade));
+  addClause('countries', tagTerms(params.countries_tag));
+  for (const allergen of params.exclude_allergens ?? []) {
+    clauses.push(`-allergens:${quotedTerm(allergen)}`);
+  }
+  for (const trace of params.exclude_traces ?? []) clauses.push(`-traces:${quotedTerm(trace)}`);
+  clauses.push(...(params.nutrient_filters ?? []).map(nutrientClause));
+  if (params.query) clauses.push(textQueryTerms(params.query));
+  return clauses.join(' ');
 }
 
 /**
@@ -928,9 +980,9 @@ function projectDoc(doc: MirrorDoc, fields: ReadonlySet<string>): Record<string,
 
 /**
  * A search by tag filters alone as the mirror matches it. Every value is canonical
- * (`ProductSearch.tags_confirmed`); the query module turns each into the key the store indexes.
- * Labels are one filter each, all required; a grade input's values, like a tag value's IDs, form
- * one any-of filter.
+ * (`ProductSearch.tags_confirmed`), a brand the keys the mirror holds it under; the query module
+ * turns each into the key the store indexes. Labels are one filter each, all required; a grade
+ * input's values, like a tag value's IDs and a brand's keys, form one any-of filter.
  */
 function mirrorTagSearch(params: SearchParams): MirrorTagSearch {
   const include: MirrorTagFilter[] = [];
@@ -975,9 +1027,11 @@ function mirrorFailure(error: unknown): Record<string, unknown> {
 }
 
 /**
- * The index's value for each constrained nutrient, keyed as `off_get_product` keys it. Only a JSON
+ * The index's value for each constrained nutrient, keyed as `off_get_product` keys it: the 32-bit
+ * float the index stores, widened to a double (`0.20000000298023224` for 0.2), which is the value
+ * the constraint was matched against and can differ from the live record's figure. Only a JSON
  * number is a value: a key the hit lacks, or holds as anything else, is left out rather than
- * zero-filled — every value the live index returned was a number (2026-10-13).
+ * zero-filled.
  */
 function pickIndexedNutriments(
   nutriments: RawNutriments | undefined,
@@ -991,31 +1045,16 @@ function pickIndexedNutriments(
   return picked;
 }
 
-/** The comparison each nutrient operator expresses. */
-const NUTRIENT_COMPARISONS: Record<NutrientOperator, (held: number, bound: number) => boolean> = {
-  lt: (held, bound) => held < bound,
-  lte: (held, bound) => held <= bound,
-  gt: (held, bound) => held > bound,
-  gte: (held, bound) => held >= bound,
-};
-
 /**
- * Whether a row's indexed values meet every constraint. Both sides compare at 32-bit precision, the
- * index's own: its floats reach JSON widened to double, so `salt_100g: 0.10000000149012` equals a
- * caller's `0.1` on the index and exceeds it as a double (`salt lte 0.1` live 577, double 569,
- * `Math.fround` 577, 2026-10-30). A nutrient with no indexed value is no evidence against the row,
- * so it stays.
+ * A text hit's brand tag IDs as a row's `brands`, comma-separated like a v2 read's, each without
+ * the `xx:` prefix Product Opener gives a brand, which belongs to no language
+ * (`["xx:heinz", "xx:Member's Mark"]` → `heinz, Member's Mark`). The index holds no display name,
+ * so a row carries the stored form: a slug, or the brand as a contributor typed it. Hits are not
+ * schema-checked, so anything but a list of strings leaves the row without brands.
  */
-function meetsConstraints(
-  indexed: IndexedNutriments | undefined,
-  filters: readonly NutrientFilter[],
-): boolean {
-  return filters.every(({ nutrient, operator, value }) => {
-    const held = indexed?.[indexedNutrientKey(nutrient)];
-    return (
-      held === undefined || NUTRIENT_COMPARISONS[operator](Math.fround(held), Math.fround(value))
-    );
-  });
+function brandsText(ids: RawTextSearchHit['brands']): string | undefined {
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string')) return;
+  return ids.map((id) => id.replace(/^xx:/, '')).join(', ');
 }
 
 /**
@@ -1219,16 +1258,40 @@ export class OpenFoodFactsService {
   }
 
   /**
-   * The first of a brand's `slugs` (the taxonomy service's `brandSlugs`, in order) that some
-   * product the ready mirror holds carries, which a search by tag filters alone then sends to it.
-   * `undefined` when none is held, with no mirror, a store not ready, or a store error (logged), so
-   * the search reads live, where Product Opener resolves the brand as given. The caller's
-   * cancellation is rethrown.
+   * Whether the local mirror is ready and serves a brand filter: its last completed full load was
+   * built at a record version that keys every brand (`indexesBrandKeys`). Until then some rows hold
+   * a brand under the spelling their record carries rather than its key, so a brand matched there
+   * would count part of its products, and the search tool reads a tag-only search carrying
+   * `brands_tag` live. False with no mirror, a store not ready, or a store error (logged); the
+   * caller's cancellation is rethrown.
    */
-  async mirrorHeldBrand(slugs: readonly string[], ctx: Context): Promise<string | undefined> {
+  async mirrorIndexesBrandKeys(ctx: Context): Promise<boolean> {
+    const indexed = await this.readMirror(
+      'brand-key check',
+      async (store) => ((await indexesBrandKeys(store)) ? true : undefined),
+      ctx,
+    );
+    return indexed !== undefined;
+  }
+
+  /**
+   * The ones of a brand's `keys` (`brandKeys`, in order) that some product the ready mirror holds
+   * carries, which a search by tag filters alone then sends to it as one any-of filter: a brand is
+   * held when any of its keys is. `undefined` when none is held, with no mirror, a store not ready,
+   * or a store error (logged), so the search reads live. Ask only once `mirrorIndexesBrandKeys`
+   * holds, since before it a key's postings are part of its brand's. The caller's cancellation is
+   * rethrown.
+   */
+  async mirrorHeldBrand(
+    keys: readonly string[],
+    ctx: Context,
+  ): Promise<[string, ...string[]] | undefined> {
     const held = await this.readMirror(
       'brand check',
-      (store) => firstHeldTag(store, 'brands', slugs),
+      async (store): Promise<[string, ...string[]] | undefined> => {
+        const [first, ...rest] = await heldTags(store, 'brands', keys);
+        return first === undefined ? undefined : [first, ...rest];
+      },
       ctx,
     );
     return held?.value;
@@ -1576,7 +1639,8 @@ export class OpenFoodFactsService {
   /**
    * Fetch a search endpoint, re-raising every failure as a declared contract failure. Runs inside
    * the caller's retry boundary so the mapped code drives retry classification. A `jsonBody` makes
-   * the request a POST carrying it as JSON; without one it is a GET.
+   * the request a POST carrying it as JSON — the text search, whose failed body is kept to
+   * `TEXT_SEARCH_ERROR_BODY_LIMIT` — and without one it is a GET.
    */
   private async fetchSearch(
     url: string,
@@ -1598,6 +1662,7 @@ export class OpenFoodFactsService {
               method: 'POST',
               headers: { ...REQUEST_HEADERS, 'Content-Type': 'application/json' },
               body: JSON.stringify(jsonBody),
+              errorBodyLimit: TEXT_SEARCH_ERROR_BODY_LIMIT,
             },
       );
     } catch (error) {
@@ -1610,10 +1675,10 @@ export class OpenFoodFactsService {
    * Returns pagination envelope + product summary rows.
    *
    * Routing:
-   * - `query` present (with or without tag filters): search.openfoodfacts.org (search-a-licious).
-   *   Any tag filters are folded into the Lucene `q` alongside the free text, so combined results
-   *   are both text-relevant and filtered. The /api/v2/search endpoint silently ignores free text,
-   *   so it cannot serve a text query.
+   * - `query` present (with or without tag filters): search.openfoodfacts.org (search-a-licious
+   *   2.x). Any tag filters are folded into the Lucene `q` alongside the free text, so combined
+   *   results are both text-relevant and filtered. The /api/v2/search endpoint silently ignores
+   *   free text, so it cannot serve a text query.
    * - `nutrient_filters` present: search.openfoodfacts.org, with or without free text. The
    *   comparisons compile to Lucene range clauses only this backend applies — /api/v2/search
    *   documents the equivalent parameters and ignores them, live-verified returning an identical
@@ -1626,13 +1691,14 @@ export class OpenFoodFactsService {
    *   ready — filters ANDed, a grade input's values as any of them, exclusions as absence, an exact
    *   total, and pages through its first `MIRROR_SEARCH_RESULT_WINDOW` results, a page past them the
    *   `page_out_of_range` outcome with no search run. A search carrying `ecoscore_grade` counts the
-   *   mirror ready only once its last full load indexed Green-Score. With no ready mirror, or on a
+   *   mirror ready only once its last full load indexed Green-Score, and one carrying `brands_tag`
+   *   only once its last full load keyed every brand. With no ready mirror, or on a
    *   store error (logged), it reads /api/v2/search as below, except that a page past
    *   `TAG_SEARCH_MAX_PAGE` is that outcome, with nothing sent.
    * - Tag filters only: /api/v2/search (structured facet filtering).
    *
-   * The backends differ in freshness as well as in envelope: the text index is a snapshot that
-   * lags the live database, dated by `textIndexAsOf` when the service holds its date,
+   * The backends differ in freshness as well as in envelope: the text index lags the live
+   * database, dated by `textIndexAsOf` when the service holds its date,
    * /api/v2/search reads the database directly, and the mirror reflects it as of its `mirrorAsOf`.
    * Every answer carries its `source` so the tool discloses which one answered rather than
    * presenting them as interchangeable.
@@ -1667,8 +1733,10 @@ export class OpenFoodFactsService {
    * is exact on every page, a page past the last included. A page past
    * `MIRROR_SEARCH_RESULT_WINDOW` is refused once the mirror is known to be ready, before the store
    * runs any search; with no ready mirror it is `undefined`, so the live path's own bound applies.
-   * A search filtering on Green-Score treats a mirror whose last full load predates the facet as
-   * not ready, in both places, since rows built before it carry no Green-Score tag.
+   * A search filtering on Green-Score, or on a brand, treats a mirror whose last full load predates
+   * the facet, or brand keys, as not ready, in both places: rows built before Green-Score carry no
+   * Green-Score tag, and rows built before brand keys hold a brand under the spelling their record
+   * carries, so its key matches part of its products.
    */
   private async searchProductsOnMirror(
     params: SearchParams,
@@ -1676,15 +1744,22 @@ export class OpenFoodFactsService {
   ): Promise<SearchOutcome | undefined> {
     const search = mirrorTagSearch(params);
     const greenScore = search.include.some(({ facet }) => facet === 'environmental_score');
+    const brand = search.include.some(({ facet }) => facet === 'brands');
+    /** Whether the store's last full load indexes each facet the search needs a record version for. */
+    const indexes = async (store: MirrorStore) =>
+      (!greenScore || (await indexesGreenScore(store))) &&
+      (!brand || (await indexesBrandKeys(store)));
     if (search.page * search.pageSize > MIRROR_SEARCH_RESULT_WINDOW) {
-      return (await (greenScore ? this.mirrorIndexesGreenScore(ctx) : this.mirrorReady(ctx)))
-        ? { status: 'page_out_of_range', bound: 'mirror_window' }
-        : undefined;
+      const ready = await this.readMirror(
+        'readiness check',
+        async (store) => ((await indexes(store)) ? true : undefined),
+        ctx,
+      );
+      return ready ? { status: 'page_out_of_range', bound: 'mirror_window' } : undefined;
     }
     const served = await this.readMirror(
       'tag search',
-      async (store) =>
-        greenScore && !(await indexesGreenScore(store)) ? undefined : searchByTags(store, search),
+      async (store) => ((await indexes(store)) ? searchByTags(store, search) : undefined),
       ctx,
     );
     if (!served) return;
@@ -1713,21 +1788,18 @@ export class OpenFoodFactsService {
   }
 
   /**
-   * Text search via search.openfoodfacts.org (search-a-licious). Serves every search carrying a
+   * Text search via search.openfoodfacts.org (search-a-licious 2.x). Serves every search carrying a
    * query, nutrient constraints, or an ingredient filter, with or without tag filters: the filters
-   * are ANDed into the Lucene `q` as hard clauses, and the query's words rank the results, each one
-   * `requiredWords` selects also filtering them (see `buildTextSearchQuery`).
+   * are ANDed into the Lucene `q` as hard clauses, and the query's words both filter and rank the
+   * results (see `buildTextSearchQuery`). Every row the index returns is a match, so the page holds
+   * them all and `count`, `count_is_exact`, and paging are the backend's.
    *
-   * Sent as a POST with the parameters in a JSON body. The GET form takes the same parameters and
-   * answers identically (live: the same hits for the same `sort_by`, `page`, `page_size`, and
-   * `fields`), but the per-word groups repeat every searched field for each word, and at 30
-   * languages a 12-word query was already a 23.6 KB URL the host refused with HTTP 414.
+   * Sent as a POST with the parameters in a JSON body, the form search-a-licious offers so a query
+   * stays out of URLs. The GET form takes the same parameters and answers identically (live: the
+   * same hits for the same `sort_by`, `page`, `page_size`, and `fields`).
    *
-   * The index compares some nutrients as whole numbers, so each returned row is checked against
-   * every constraint here, and failing rows leave the page. `count`, `count_is_exact`, and paging
-   * stay the backend's: they describe its whole-number answer, and a page keeps its offset however
-   * many rows it lost. Nothing else can do this upstream: no indexed field holds the fraction, and
-   * `sort_by` on a nutrient answers HTTP 422.
+   * Hits name two fields differently from the rows (`TEXT_SEARCH_RESULT_FIELDS`), and carry brand
+   * tag IDs, which each row shows as text (`brandsText`).
    *
    * The answer carries `textIndexAsOf` when the service holds the index's date or reads it beside
    * this search (`textIndexDate`), asked on the first attempt only: a probe ends within its 3 s of
@@ -1740,9 +1812,8 @@ export class OpenFoodFactsService {
     params: SearchParams,
     ctx: Context,
   ): Promise<SearchResult & { textIndexAsOf?: string }> {
-    const nutrientFilters = params.nutrient_filters ?? [];
     // The nutrients a filter constrains, once each: a range pair names its nutrient twice.
-    const constrained = [...new Set(nutrientFilters.map((f) => f.nutrient))];
+    const constrained = [...new Set((params.nutrient_filters ?? []).map((f) => f.nutrient))];
     const page = params.page ?? 1;
     const pageSize = params.page_size ?? 20;
     const pageData = { page, page_size: pageSize };
@@ -1752,12 +1823,14 @@ export class OpenFoodFactsService {
       async ({ signal }) => {
         this.searchLimiter.check('search');
         const body = {
-          q: this.buildTextSearchQuery(params),
+          q: buildTextSearchQuery(params),
           langs: TEXT_SEARCH_LANGS,
           // A constrained search also asks for the index's nutrient map, so each row can show the
-          // values the constraint matched. The endpoint ignores a dotted `nutriments.<key>` field,
-          // so the whole map is requested and the constrained keys are picked below.
-          fields: constrained.length > 0 ? [...SEARCH_FIELDS, 'nutriments'] : SEARCH_FIELDS,
+          // values the constraint matched; the constrained keys are picked from it below.
+          fields:
+            constrained.length > 0
+              ? [...TEXT_SEARCH_RESULT_FIELDS, 'nutriments']
+              : TEXT_SEARCH_RESULT_FIELDS,
           page,
           page_size: pageSize,
           // search-a-licious sorts on a bare field name ascending and on a `-` prefix descending,
@@ -1788,9 +1861,7 @@ export class OpenFoodFactsService {
         const data = (isRecord(parsed) ? parsed : {}) as RawTextSearchResponse;
 
         if (Array.isArray(data.errors) && data.errors.length > 0) {
-          const detail = plainTextDetail(
-            data.errors.map((error) => error.description ?? error.title ?? '').join('; '),
-          );
+          const detail = searchErrorsDetail(data.errors);
           throw contractError(
             'upstream_error',
             `Open Food Facts text search failed inside its search engine${detail ? `: ${detail}` : '.'}`,
@@ -1815,11 +1886,11 @@ export class OpenFoodFactsService {
           returned: data.hits.length,
         });
 
-        // Normalize text search hits to the row shape (brands is array → join to string).
+        // Normalize text search hits to the row shape, under the row's keys.
         // Use spread of defined-only fields to satisfy exactOptionalPropertyTypes.
         const { hits } = data;
-        const rows: SearchRow[] = withBarcodes(hits, ctx).map((hit) => {
-          const brands = Array.isArray(hit.brands) ? hit.brands.join(', ') : hit.brands;
+        const products: SearchRow[] = withBarcodes(hits, ctx).map((hit) => {
+          const brands = brandsText(hit.brands);
           return {
             code: hit.code,
             ...(hit.product_name !== undefined && { product_name: hit.product_name }),
@@ -1827,8 +1898,10 @@ export class OpenFoodFactsService {
             ...(hit.quantity !== undefined && { quantity: hit.quantity }),
             ...(hit.nutriscore_grade !== undefined && { nutriscore_grade: hit.nutriscore_grade }),
             ...(hit.nova_group !== undefined && { nova_group: hit.nova_group }),
-            ...(hit.ecoscore_grade !== undefined && { ecoscore_grade: hit.ecoscore_grade }),
-            ...(hit.categories_tags !== undefined && { categories_tags: hit.categories_tags }),
+            ...(hit.environmental_score_grade !== undefined && {
+              ecoscore_grade: hit.environmental_score_grade,
+            }),
+            ...(hit.categories !== undefined && { categories_tags: hit.categories }),
             ...(hit.completeness !== undefined && { completeness: hit.completeness }),
             ...(hit.last_modified_t !== undefined && { last_modified_t: hit.last_modified_t }),
             ...(hit.created_t !== undefined && { created_t: hit.created_t }),
@@ -1837,11 +1910,6 @@ export class OpenFoodFactsService {
             }),
           };
         });
-        // After the barcode filter, so `dropped` stays barcode-only and a row that is both
-        // unservable and failing counts once, there.
-        const products = rows.filter((row) =>
-          meetsConstraints(row.indexed_nutriments, nutrientFilters),
-        );
 
         return {
           count: data.count,
@@ -1854,10 +1922,7 @@ export class OpenFoodFactsService {
           page_count: products.length,
           page_size: pageSize,
           products,
-          dropped: hits.length - rows.length,
-          ...(products.length < rows.length && {
-            outside_constraints: rows.length - products.length,
-          }),
+          dropped: hits.length - products.length,
         };
       },
       {
@@ -2067,98 +2132,13 @@ export class OpenFoodFactsService {
   }
 
   /**
-   * Build the search-a-licious Lucene `q` from a text query plus tag filters, in this order: tag
-   * clauses, exclusion clauses, nutrient range clauses, one required group per query word, then
-   * the query's bare words. Recognized `field:"value"` facet clauses become hard AND filters — one
-   * clause per value, so several labels or ingredients all apply — and a top-level
-   * `-field:"value"` clause excludes (live: `-allergens_tags:"en:milk"` and
-   * `allergens_tags:"en:milk"` partition a country's products exactly). An exclusion value must be
-   * canonical: a value the field does not hold excludes nothing, so the tool refuses unconfirmed
-   * ones before they reach here.
-   *
-   * Facet field names differ from /api/v2/search: nutrition grade → `nutriscore_grade`, NOVA →
-   * `nova_group`, Green-Score → `ecoscore_grade` (no `_tags` suffix; `environmental_score_grade` is
-   * not indexed, so a clause on it matches nothing); the tag facets keep their names. Tag values are
-   * quoted so their `:` and spaces aren't parsed as query syntax, and are quoted verbatim — the
-   * `*_tags` fields are exact-match keywords, so the caller hands in canonical values (the tool runs
-   * each through the taxonomy service's canonicalizer first). A grade stays unquoted unless it
-   * carries punctuation (`a-plus`), and several grades of one input form an `(a OR b)` group, since
-   * a product carries one grade (live: `nutriscore_grade:(a OR b)` counts `a` and `b` summed). The
-   * several IDs one tag value can be stored under (`TagValue`) form a quoted group the same way, in
-   * every tag field, and each member of a list that must all apply is its own clause (live
-   * 2026-11-24: `brands_tags:("όλυμποσ" OR "όλυμπος")` counts the 29 that `"όλυμπος"` alone counts
-   * and `"όλυμποσ"` adds none).
-   *
-   * The deployed backend (search-a-licious v1.4.0) joins top-level bare words into one relevance
-   * match that ORs them, so on their own they count products matching any word. Each required
-   * word therefore also gets a parenthesized OR group over the fields that match searches (see
-   * `requiredWords` for which words qualify), and top-level groups are ANDed as filters; the bare
-   * words stay for ranking. Nothing else may sit beside them at top level: an explicit `AND`, a
-   * quoted phrase, or `+word` there moves the words into a filter on field `*` that matches
-   * nothing. So the query is lowercased — which turns a caller's `AND`/`OR`/`NOT`/`TO` into plain
-   * words, since the parser reserves only the uppercase forms, and costs nothing because every
-   * analyzer lowercases — and escaped rather than quoted, so it cannot smuggle in its own
-   * field:value clauses (see LUCENE_RESERVED_CHARS).
-   *
-   * `additives_tag` has no clause here on purpose. The search-a-licious index carries no
-   * `additives_tags` field, so a clause naming it is parsed as a phrase match against a field that
-   * does not exist and returns zero hits with no error — live-verified across several E-numbers
-   * that match hundreds of thousands of products on the tag path. The tool rejects that
-   * combination up front rather than sending a filter that silently empties the result set.
-   *
-   * Nutrient constraints become nested range clauses under the `nutriments.` prefix, which is not
-   * optional: a clause naming a bare `sugars_100g` answers HTTP 200 with zero hits and no error —
-   * the same silent-empty failure `additives_tag` has to be refused for. `nutrientClause` widens the
-   * lower bounds the index would otherwise cut matches from.
-   */
-  private buildTextSearchQuery(params: SearchParams): string {
-    const clauses: string[] = [];
-    /** Adds `field:term`, or `field:(a OR b)` for several terms any of which matches; none adds nothing. */
-    const addClause = (field: string, terms: readonly string[]) => {
-      if (terms.length === 0) return;
-      clauses.push(`${field}:${terms.length === 1 ? terms[0] : `(${terms.join(' OR ')})`}`);
-    };
-    /** One tag value's IDs, each quoted, an empty one left out. */
-    const tagTerms = (value: TagValue | undefined) =>
-      [value ?? []]
-        .flat()
-        .filter(Boolean)
-        .map((id) => `"${id}"`);
-    /** One grade input's grades, bare unless punctuated (`a-plus`). */
-    const gradeTerms = (value: string | string[] | undefined) =>
-      [value ?? []].flat().map((grade) => (/^[a-z0-9]+$/.test(grade) ? grade : `"${grade}"`));
-    addClause('categories_tags', tagTerms(params.categories_tag));
-    addClause('brands_tags', tagTerms(params.brands_tag));
-    for (const label of [params.labels_tag ?? []].flat()) addClause('labels_tags', tagTerms(label));
-    addClause('allergens_tags', tagTerms(params.allergens_tag));
-    addClause('traces_tags', tagTerms(params.traces_tag));
-    addClause('ingredients_analysis_tags', tagTerms(params.ingredients_analysis_tag));
-    for (const ingredient of [params.ingredients_tag ?? []].flat()) {
-      addClause('ingredients_tags', tagTerms(ingredient));
-    }
-    addClause('nutriscore_grade', gradeTerms(params.nutrition_grade));
-    addClause('nova_group', gradeTerms(params.nova_group));
-    addClause('ecoscore_grade', gradeTerms(params.ecoscore_grade));
-    addClause('countries_tags', tagTerms(params.countries_tag));
-    for (const allergen of params.exclude_allergens ?? []) {
-      clauses.push(`-allergens_tags:"${allergen}"`);
-    }
-    for (const trace of params.exclude_traces ?? []) clauses.push(`-traces_tags:"${trace}"`);
-    clauses.push(...(params.nutrient_filters ?? []).map(nutrientClause));
-    if (params.query) {
-      const query = params.query.toLowerCase();
-      clauses.push(...requiredWords(query).map(wordGroup), escapeLuceneQueryText(query));
-    }
-    return clauses.join(' ');
-  }
-
-  /**
    * Build the `/api/v2/search` URL. Product Opener reads a `*_tags` value as a comma-separated AND
    * list in which a `-` prefix negates, and a `|`-separated one as any of its values
    * (`add_params_to_query` in `lib/ProductOpener/Display.pm`), so several labels, an allergen or
    * trace inclusion with its exclusions, several grades, and a tag value's several IDs each travel
-   * as one parameter (live:
-   * `allergens_tags=en:nuts,-en:milk` narrows `en:nuts` to the products without milk). A parameter
+   * as one parameter (live: `allergens_tags=en:nuts,-en:milk` narrows `en:nuts` to the products
+   * without milk). A brand's IDs are the caller's: the brand as given, which Product Opener
+   * canonicalizes, then a key as `xx:<key>!`, which it matches as that exact stored tag. A parameter
    * is set only when a value for it is, so a request without the newer filters is the one this path
    * always sent.
    */

@@ -4,8 +4,9 @@
  * declared error contract carried by every failure (GH issue #12), retry classification and
  * upstream-detail surfacing (GH issue #19), status-decided retryability (GH issue #37), malformed
  * success envelopes (GH issue #54), answers flagged timed_out (GH issue #68), the total retry
- * deadline (GH issue #72), the nutrient row check (GH issue #64), reads and tag-only searches
- * served from the local export mirror (GH issue #79), and User-Agent header verification.
+ * deadline (GH issue #72), the text request against search-a-licious 2.x (GH issue #101), reads
+ * and tag-only searches served from the local export mirror (GH issue #79), and User-Agent header
+ * verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
@@ -53,30 +54,30 @@ import {
   openMirrorStore,
 } from '@/services/mirror/mirror-store.js';
 import {
+  BRAND_KEY_RECORD_VERSION,
   buildMirrorRecord,
   MIRROR_RECORD_VERSION,
   normalizeCodeZeroes,
 } from '@/services/mirror/record-builder.js';
 import {
-  ANALYZER_STOP_WORDS,
-  STOP_WORD_LANGS,
-} from '@/services/openfoodfacts/analyzer-stop-words.js';
-import {
+  buildTextSearchQuery,
   getOpenFoodFactsService,
   initOpenFoodFactsService,
   OpenFoodFactsService,
   type ProductRead,
   type ProductSearch,
-  requiredWords,
+  plainTextDetail,
   type SearchOutcome,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { NUTRIENT_FIELDS } from '@/services/openfoodfacts/types.js';
-import { getTaxonomyService, initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
-import { v2Capture, v35Capture } from '../../fixtures/as-sold-captures.js';
+import { brandKeys } from '@/services/taxonomy/brand-keys.js';
 import {
-  UPSTREAM_MULTI_MATCH_FIELDS,
-  UPSTREAM_TEXT_LANGS,
-} from '../../fixtures/text-search-fields.js';
+  brandLiveIds,
+  brandTextIds,
+  getTaxonomyService,
+  initTaxonomyService,
+} from '@/services/taxonomy/taxonomy-service.js';
+import { v2Capture, v35Capture } from '../../fixtures/as-sold-captures.js';
 import {
   AUTOCOMPLETE_EMPTY,
   AUTOCOMPLETE_HITS,
@@ -113,13 +114,78 @@ const SEARCH_FIELD_LIST = [
 const SEARCH_FIELDS_PARAM = new URLSearchParams({ fields: SEARCH_FIELD_LIST.join(',') }).toString();
 
 /**
- * The per-word group the text path must build: the word, as it will appear in `q`, against every
- * field the backend's own relevance match searches. Built from the captured upstream field list,
- * not from the service's constant, so a derivation error in the service fails here.
+ * The summary fields the text path requests, under search-a-licious 2.x's names (v2.1.0
+ * `data/config/openfoodfacts.yml`): `SEARCH_FIELD_LIST` with `environmental_score_grade` and
+ * `categories` in place of `ecoscore_grade` and `categories_tags`, which 2.x drops without an error.
  */
-function wordGroup(word: string): string {
-  return `(${UPSTREAM_MULTI_MATCH_FIELDS.map((field) => `${field}:${word}`).join(' OR ')})`;
-}
+const TEXT_FIELD_LIST = [
+  'code',
+  'product_name',
+  'brands',
+  'quantity',
+  'nutriscore_grade',
+  'nova_group',
+  'environmental_score_grade',
+  'categories',
+  'completeness',
+  'last_modified_t',
+  'created_t',
+];
+
+/**
+ * The `langs` every text search sends: the 31 languages the 1.x index analyzed, then `main`, each
+ * product's own main language, which 2.x indexes a name field for.
+ */
+const TEXT_LANGS = [
+  'en',
+  'fr',
+  'it',
+  'es',
+  'de',
+  'nl',
+  'ar',
+  'hy',
+  'eu',
+  'bn',
+  'bg',
+  'ca',
+  'da',
+  'et',
+  'fi',
+  'gl',
+  'el',
+  'hi',
+  'hu',
+  'id',
+  'ga',
+  'lv',
+  'lt',
+  'fa',
+  'pt',
+  'ro',
+  'ru',
+  'sv',
+  'tr',
+  'th',
+  'no',
+  'main',
+];
+
+/**
+ * The 400 search-a-licious 2.x answered on 2026-11-24 for a `q` naming eleven fields its index
+ * lacks: an `errors` list after a `debug` object, one line per rejected field.
+ */
+const QUERY_CHECK_ERROR = {
+  debug: { lucene_query: null, es_query: null, aggregations: null },
+  errors: [
+    {
+      title: 'QueryCheckError',
+      description:
+        "Found errors while checking query: \n - Search field 'categories.en' not found in index config\n - Search field 'labels.en' not found in index config\n - Search field 'categories_tags' not found in index config\n - Search field 'labels_tags' not found in index config\n - Search field 'countries_tags' not found in index config\n - Search field 'allergens_tags' not found in index config\n - Search field 'traces_tags' not found in index config\n - Search field 'additives_tags' not found in index config\n - Search field 'brands_tags' not found in index config\n - Search field 'ecoscore_grade' not found in index config\n - Search field 'zz_invented_field' not found in index config",
+      status: 400,
+    },
+  ],
+};
 
 /**
  * The request the stubbed fetch received on a given call, counted beside the text index date probe
@@ -241,6 +307,54 @@ function settle(run: () => Promise<unknown>): Promise<McpErrorish> {
 function served(outcome: SearchOutcome): Extract<SearchOutcome, { status: 'served' }> {
   if (outcome.status !== 'served') throw new Error(`The search was not served: ${outcome.status}`);
   return outcome;
+}
+
+/**
+ * The least CPU time one call of `run` costs this thread, in milliseconds: calls are batched until
+ * a batch has spent 3 ms, so a call shorter than the timer's resolution still measures, and the
+ * least of three batches is kept, since a garbage-collection pause only ever adds time.
+ */
+function cpuMsPerCall(run: () => unknown): number {
+  let least = Number.POSITIVE_INFINITY;
+  for (let batch = 0; batch < 3; batch++) {
+    const start = process.threadCpuUsage();
+    let calls = 0;
+    let spentMs = 0;
+    do {
+      run();
+      calls++;
+      const spent = process.threadCpuUsage(start);
+      spentMs = (spent.user + spent.system) / 1000;
+    } while (spentMs < 3);
+    least = Math.min(least, spentMs / calls);
+  }
+  return least;
+}
+
+/**
+ * Asserts `run` costs CPU time linear in its input's length, from 5,000 characters doubling to
+ * 320,000 (`make` builds the input of a length). At each length the 5,000-character baseline is
+ * timed again beside it, and the least growth over three such pairs stays under four times the
+ * length's growth — 256 across the whole 64× span, where a quadratic reaches 4,096 — and one call
+ * stays under 250 ms. Each length is checked before the next is built, so a super-linear cost
+ * fails at the first length it shows at rather than hanging on the largest.
+ */
+function expectLinearCpu(run: (input: string) => unknown, make: (length: number) => string): void {
+  const baseLength = 5_000;
+  const base = make(baseLength);
+  for (let length = baseLength * 2; length <= 320_000; length *= 2) {
+    const input = make(length);
+    let growth = Number.POSITIVE_INFINITY;
+    let callMs = Number.POSITIVE_INFINITY;
+    for (let pair = 0; pair < 3; pair++) {
+      const baseMs = cpuMsPerCall(() => run(base));
+      const inputMs = cpuMsPerCall(() => run(input));
+      growth = Math.min(growth, inputMs / baseMs);
+      callMs = Math.min(callMs, inputMs);
+    }
+    expect(growth, `growth at ${length} characters`).toBeLessThan((4 * length) / baseLength);
+    expect(callMs, `one call at ${length} characters`).toBeLessThan(250);
+  }
 }
 
 /** A live product read, as the as-sold read takes the read it follows. */
@@ -404,10 +518,8 @@ describe('OpenFoodFactsService', () => {
       // Combined requests never fall back to the text-blind /api/v2/search endpoint.
       expect(fetchCall).not.toContain('api/v2/search');
 
-      const q = sentQ();
-      expect(q).toContain('labels_tags:"en:organic"');
-      expect(q).toContain('countries_tags:"en:france"');
-      expect(q).toContain('chocolate');
+      // search-a-licious 2.x names the tag facets without `_tags` and answers HTTP 400 to the old names.
+      expect(sentQ()).toBe('labels:"en:organic" countries:"en:france" chocolate');
     });
 
     it('maps score and NOVA filters to search-a-licious field names on the combined path', async () => {
@@ -442,12 +554,12 @@ describe('OpenFoodFactsService', () => {
       expect(q).not.toContain('nova_groups_tags');
     });
 
-    it('escapes Lucene-reserved characters in free text so it cannot inject a field filter', async () => {
+    it('keeps Lucene syntax in free text from reaching q as a field filter', async () => {
       // Live-verified against search-a-licious: an unescaped colon in free text is parsed as
       // Lucene field:value syntax — `query: "brands: nutella"` with no brands_tag set returns
       // only Nutella products, and `query: "nutriscore_grade: a"` silently hard-filters to grade
-      // "a" even though nutriscore_grade isn't a facet this tool exposes. Escaping must neutralize
-      // this without breaking ordinary free text (no reserved characters, e.g. "chocolate").
+      // "a" even though nutriscore_grade isn't a facet this tool exposes. The colon separates
+      // words, so only the words reach q.
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
@@ -462,43 +574,96 @@ describe('OpenFoodFactsService', () => {
 
       await svc.searchProducts({ query: 'brands: nutella', page: 1, page_size: 20 }, ctx);
 
-      // The per-word groups name their own fields; strip them, and what remains — the caller's
-      // text — carries no unescaped colon.
-      const q = sentQ();
-      const callerText = q.replace(/\([^()]*\)/g, '').trim();
-      expect(callerText).toBe('brands\\: nutella');
-      expect(callerText).not.toMatch(/(?<!\\):/);
-      // The colon separates words, so it never reaches a group: each group holds a bare word.
-      const groupWords = [...q.matchAll(/\(([^()]*)\)/g)].map(
-        (group) =>
-          new Set(group[1]?.split(' OR ').map((clause) => clause.slice(clause.indexOf(':') + 1))),
-      );
-      expect(groupWords).toEqual([new Set(['brands']), new Set(['nutella'])]);
+      expect(sentQ()).toBe('brands nutella');
     });
 
-    it('normalizes brands array from text search to a comma-joined string', async () => {
-      // search.openfoodfacts.org returns brands as an array; the service must join it to match
-      // the RawProduct.brands string shape that the tool layer expects.
+    it('turns a hit’s brand tag IDs into the row’s comma-joined brands, dropping the xx: prefix', async () => {
+      // search-a-licious 2.x returns brands as the stored tag IDs: a taxonomy brand's `xx:` ID, an
+      // off-taxonomy brand's typed spelling, and a bare slug on records indexed before the prefix.
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
-          count: 1,
+          count: 3,
           is_count_exact: true,
           page: 1,
           page_size: 20,
           page_count: 1,
           hits: [
-            { code: '3017620422003', product_name: 'Nutella', brands: ['Ferrero', 'Nutella'] },
+            {
+              code: '50457366',
+              product_name: 'heinz ketchup',
+              brands: ['xx:heinz', 'xx:Morrisons'],
+            },
+            { code: '0078742351155', brands: ['xx:heinz', "xx:Member's Mark"] },
+            { code: '0013000006057', brands: ['heinz', 'equate'] },
           ],
         }),
       );
 
       const result = served(
-        await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx),
+        await svc.searchProducts({ query: 'ketchup', page: 1, page_size: 20 }, ctx),
       );
 
-      // brands array joined to string
-      expect(result.products[0]?.brands).toBe('Ferrero, Nutella');
+      expect(result.products.map((row) => row.brands)).toEqual([
+        'heinz, Morrisons',
+        "heinz, Member's Mark",
+        'heinz, equate',
+      ]);
+    });
+
+    it('drops only a leading xx: from a brand ID, and leaves a row without brands when a hit has none', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 3,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [
+            { code: '3017620422003', brands: ['xx:xx:odd', 'fr:marque', 'boxx:y'] },
+            { code: '3017620422004', product_name: 'No brand' },
+            { code: '3017620422005', brands: [] },
+          ],
+        }),
+      );
+
+      const result = served(
+        await svc.searchProducts({ query: 'spread', page: 1, page_size: 20 }, ctx),
+      );
+
+      expect(result.products[0]?.brands).toBe('xx:odd, fr:marque, boxx:y');
+      expect(result.products[1]).not.toHaveProperty('brands');
+      expect(result.products[2]?.brands).toBe('');
+    });
+
+    it('leaves only the row whose brand list holds a non-string without brands', async () => {
+      const ctx = createMockContext();
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 2,
+          is_count_exact: true,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          hits: [
+            { code: '50457366', product_name: 'heinz ketchup', brands: ['xx:heinz', 7] },
+            { code: '0013000006057', brands: ['xx:heinz', 'equate'] },
+          ],
+        }),
+      );
+
+      // On fake timers, so a hit that broke the row mapping fails here at once rather than
+      // retrying through real backoff.
+      const result = served(
+        await onFakeTimers(() =>
+          svc.searchProducts({ query: 'ketchup', page: 1, page_size: 20 }, ctx),
+        ),
+      );
+
+      expect(result.products.map((row) => row.code)).toEqual(['50457366', '0013000006057']);
+      expect(result.products[0]).not.toHaveProperty('brands');
+      expect(result.products[1]?.brands).toBe('heinz, equate');
     });
 
     it('includes sort_by in the tag-filter URL when provided', async () => {
@@ -623,7 +788,9 @@ describe('OpenFoodFactsService', () => {
       expect(result.products[0]?.ecoscore_grade).toBe('c');
     });
 
-    it('normalizes ecoscore_grade from text search hits to RawProduct', async () => {
+    it('maps a text hit’s 2.x Green-Score and category fields onto the row keys a v2 read uses', async () => {
+      // search-a-licious 2.x answers `environmental_score_grade` and `categories`; the row keeps
+      // `ecoscore_grade` and `categories_tags`, the keys the tag path and the mirror fill.
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
@@ -632,15 +799,31 @@ describe('OpenFoodFactsService', () => {
           page: 1,
           page_size: 20,
           page_count: 1,
-          hits: [{ code: '3017620422003', product_name: 'Nutella', ecoscore_grade: 'c' }],
+          hits: [
+            {
+              code: '8696362805364',
+              product_name: 'Heinz Ketchup',
+              environmental_score_grade: 'a-plus',
+              categories: ['en:condiments', 'en:sauces', 'en:ketchup'],
+              // The 1.x names, should a hit still carry them, are not read.
+              ecoscore_grade: 'e',
+              categories_tags: ['en:stale'],
+              _score: 22.55,
+            },
+          ],
         }),
       );
 
       const result = served(
-        await svc.searchProducts({ query: 'nutella', page: 1, page_size: 20 }, ctx),
+        await svc.searchProducts({ query: 'heinz ketchup', page: 1, page_size: 20 }, ctx),
       );
 
-      expect(result.products[0]?.ecoscore_grade).toBe('c');
+      expect(result.products[0]).toStrictEqual({
+        code: '8696362805364',
+        product_name: 'Heinz Ketchup',
+        ecoscore_grade: 'a-plus',
+        categories_tags: ['en:condiments', 'en:sauces', 'en:ketchup'],
+      });
     });
 
     it('text search result page_count reflects products-on-page, not total pages', async () => {
@@ -714,37 +897,36 @@ describe('OpenFoodFactsService', () => {
         ctx,
       );
 
-      const q = sentQ();
-      expect(q).toContain('allergens_tags:"en:milk"');
-      expect(q).toContain('chocolate');
+      expect(sentQ()).toBe('allergens:"en:milk" chocolate');
     });
 
-    it('never builds an additives clause for the text backend', async () => {
-      // search-a-licious has no additives_tags field — the clause compiles to a phrase match on a
-      // missing field and returns zero hits for every E-number. Building it would turn a filter
-      // into a silent "no such product". The tool refuses the pairing; this pins the query builder
-      // so a direct service call cannot construct it either.
+    it('sends additives_tag to the text backend as an exact additives clause', async () => {
+      // search-a-licious 2.x indexes `additives` (live 2026-11-24: `additives:"en:e330"` and its
+      // exclusion partition the 4,616 `en:hummus` products, 1,386 + 3,230).
       const ctx = createMockContext();
-      global.fetch = vi.fn().mockResolvedValue(
-        mockResponse({
-          count: 0,
-          is_count_exact: true,
-          page: 1,
-          page_size: 20,
-          page_count: 0,
-          hits: [],
-        }),
-      );
+      global.fetch = vi.fn().mockResolvedValue(textHits([]));
 
       await svc.searchProducts(
         { query: 'chocolate', additives_tag: 'en:e322', page: 1, page_size: 20 },
         ctx,
       );
 
-      const fetchCall = vi.mocked(global.fetch).mock.calls[0]?.[0] as string;
-      expect(fetchCall).toContain('search.openfoodfacts.org');
-      expect(sentQ()).toContain('chocolate');
-      expect(sentQ()).not.toContain('additives_tags');
+      expect(sentRequest().url).toBe(TEXT_SEARCH_URL);
+      expect(sentQ()).toBe('additives:"en:e322" chocolate');
+    });
+
+    it('places the additives clause after the ingredient clauses and before the grade groups', () => {
+      expect(
+        buildTextSearchQuery({
+          nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 5 }],
+          ingredients_tag: ['en:oat', 'en:inulin'],
+          additives_tag: 'en:e330',
+          nutrition_grade: ['a', 'b'],
+          ingredients_analysis_tag: 'en:vegan',
+        }),
+      ).toBe(
+        'ingredients_analysis_tags:"en:vegan" ingredients_tags:"en:oat" ingredients_tags:"en:inulin" additives:"en:e330" nutriscore_grade:(a OR b) nutriments.sugars_100g:{* TO 5}',
+      );
     });
   });
 
@@ -769,49 +951,39 @@ describe('OpenFoodFactsService', () => {
     }
 
     /**
-     * The clause for each bound, on a nutrient the index stores truncated and on one it stores as a
-     * float. Live-verified against search-a-licious: square brackets parse to gte/lte, curly braces
-     * to gt/lt, and `*` is an open bound. On the five truncated nutrients `gt` and `gte` widen to
-     * `[floor(value) TO *]`, since the index rounds a fractional lower bound up (sugars `gte 3.5`
-     * lost 173 of 821 skyr rows) and `gt 3` excludes every row truncated to 3 (lost 290 of 938).
-     * `lt` and `lte` already return a superset. Bounds from the validated table in the #64 evidence.
+     * The clause for each bound, as given: search-a-licious 2.x maps all nine nutrients as floats,
+     * so a fractional bound compares as itself (live 2026-11-24: `sugars [3.25 TO *]` kept
+     * `87206067` at 3.3, and `energy-kcal_100g:{54 TO 55}` matched 1,312 records). Square brackets
+     * parse to gte/lte, curly braces to gt/lt, and `*` is an open bound.
      */
     const RANGE_FORMS = [
-      ['lt', 3, '{* TO 3}', '{* TO 3}'],
-      ['lt', 3.5, '{* TO 3.5}', '{* TO 3.5}'],
-      ['lte', 3, '[* TO 3]', '[* TO 3]'],
-      ['lte', 3.5, '[* TO 3.5]', '[* TO 3.5]'],
-      ['lte', 0, '[* TO 0]', '[* TO 0]'],
-      ['gt', 3, '[3 TO *]', '{3 TO *}'],
-      ['gt', 3.5, '[3 TO *]', '{3.5 TO *}'],
-      ['gt', 0, '[0 TO *]', '{0 TO *}'],
-      ['gte', 3, '[3 TO *]', '[3 TO *]'],
-      ['gte', 3.5, '[3 TO *]', '[3.5 TO *]'],
-      ['gte', 0.5, '[0 TO *]', '[0.5 TO *]'],
+      ['lt', 3, '{* TO 3}'],
+      ['lt', 3.5, '{* TO 3.5}'],
+      ['lte', 3, '[* TO 3]'],
+      ['lte', 3.5, '[* TO 3.5]'],
+      ['lte', 0, '[* TO 0]'],
+      ['gt', 3, '{3 TO *}'],
+      ['gt', 3.5, '{3.5 TO *}'],
+      ['gt', 0, '{0 TO *}'],
+      ['gte', 3, '[3 TO *]'],
+      ['gte', 3.5, '[3.5 TO *]'],
+      ['gte', 0.5, '[0.5 TO *]'],
     ] as const;
 
-    it.each(RANGE_FORMS)(
-      'sends %s %d as %s on the five whole-number nutrients and %s on the rest',
-      async (operator, value, wholeNumberForm, floatForm) => {
-        // A bare `sugars_100g` clause answers HTTP 200 with zero hits and no error, so the exact `q`
-        // pins the `nutriments.` prefix too.
-        for (const nutrient of ['energy-kcal', 'fat', 'saturated-fat', 'carbohydrates', 'sugars']) {
-          const q = await queryFor({ nutrient_filters: [{ nutrient, operator, value }] });
-          expect(q).toBe(`nutriments.${nutrient}_100g:${wholeNumberForm}`);
-        }
-        for (const nutrient of ['fiber', 'proteins', 'salt', 'sodium']) {
-          const q = await queryFor({ nutrient_filters: [{ nutrient, operator, value }] });
-          expect(q).toBe(`nutriments.${nutrient}_100g:${floatForm}`);
-        }
-      },
-    );
+    it.each(RANGE_FORMS)('sends %s %d as %s on every nutrient', async (operator, value, form) => {
+      // The exact `q` pins the `nutriments.` prefix too.
+      for (const nutrient of NUTRIENT_FIELDS) {
+        const q = await queryFor({ nutrient_filters: [{ nutrient, operator, value }] });
+        expect(q).toBe(`nutriments.${nutrient}_100g:${form}`);
+      }
+    });
 
-    it('sends energy-kcal gte 100.5 as [100 TO *]', async () => {
+    it('sends energy-kcal gte 100.5 as [100.5 TO *]', async () => {
       const q = await queryFor({
         nutrient_filters: [{ nutrient: 'energy-kcal', operator: 'gte', value: 100.5 }],
       });
 
-      expect(q).toBe('nutriments.energy-kcal_100g:[100 TO *]');
+      expect(q).toBe('nutriments.energy-kcal_100g:[100.5 TO *]');
     });
 
     it('routes a nutrient-only search to the text backend', async () => {
@@ -854,9 +1026,9 @@ describe('OpenFoodFactsService', () => {
         ],
       });
 
-      expect(q).toContain('nutriments.sugars_100g:{* TO 8}');
-      expect(q).toContain('nutriments.fiber_100g:[6 TO *]');
-      expect(q).toContain('categories_tags:"en:breakfast-cereals"');
+      expect(q).toBe(
+        'categories:"en:breakfast-cereals" nutriments.sugars_100g:{* TO 8} nutriments.fiber_100g:[6 TO *]',
+      );
     });
 
     it('combines a constraint with free text without escaping the clause', async () => {
@@ -866,8 +1038,7 @@ describe('OpenFoodFactsService', () => {
       });
 
       // Hyphenated field names need no escaping on this index — live-verified.
-      expect(q).toContain('nutriments.saturated-fat_100g:[* TO 2]');
-      expect(q).toContain('granola');
+      expect(q).toBe('nutriments.saturated-fat_100g:[* TO 2] granola');
     });
 
     it('combines a constraint with tag filters', async () => {
@@ -877,9 +1048,7 @@ describe('OpenFoodFactsService', () => {
         nutrient_filters: [{ nutrient: 'salt', operator: 'lt', value: 1 }],
       });
 
-      expect(q).toContain('labels_tags:"en:organic"');
-      expect(q).toContain('countries_tags:"en:france"');
-      expect(q).toContain('nutriments.salt_100g:{* TO 1}');
+      expect(q).toBe('labels:"en:organic" countries:"en:france" nutriments.salt_100g:{* TO 1}');
     });
 
     it('carries every supported nutrient under its indexed field name', async () => {
@@ -942,7 +1111,7 @@ describe('OpenFoodFactsService', () => {
       expect(sentRequest().body?.sort_by).toBe('-unique_scans_n');
     });
 
-    describe('the row check (#64)', () => {
+    describe('every row the index returns stays (#101)', () => {
       /** One constrained search whose page holds these hits, at the service seam. */
       async function searchHits(
         nutrient_filters: unknown[],
@@ -973,37 +1142,36 @@ describe('OpenFoodFactsService', () => {
         );
       }
 
-      /** Rows on both sides of every bound below, as the index returns them, full value intact. */
+      /**
+       * Values on both sides of every bound below. The index answers each constraint itself,
+       * comparing every nutrient as a decimal, so whatever it returns is a match, and a value that
+       * looks outside a bound here (a fixture, or a 32-bit float widened to double) stays on the page.
+       */
       const SUGARS = [0, 0.4, 0.5, 0.6, 2.9, 3, 3.4, 3.5, 3.53, 3.6, 3.9, 4];
 
-      const ROW_CHECKS = [
-        ['lte', 3, [0, 0.4, 0.5, 0.6, 2.9, 3], 6],
-        ['lte', 3.5, [0, 0.4, 0.5, 0.6, 2.9, 3, 3.4, 3.5], 4],
-        ['lte', 0, [0], 11],
-        ['lt', 3, [0, 0.4, 0.5, 0.6, 2.9], 7],
-        ['lt', 3.5, [0, 0.4, 0.5, 0.6, 2.9, 3, 3.4], 5],
-        ['gt', 3, [3.4, 3.5, 3.53, 3.6, 3.9, 4], 6],
-        ['gt', 3.5, [3.53, 3.6, 3.9, 4], 8],
-        ['gt', 0, [0.4, 0.5, 0.6, 2.9, 3, 3.4, 3.5, 3.53, 3.6, 3.9, 4], 1],
-        ['gte', 3, [3, 3.4, 3.5, 3.53, 3.6, 3.9, 4], 5],
-        ['gte', 3.5, [3.5, 3.53, 3.6, 3.9, 4], 7],
-        ['gte', 0.5, [0.5, 0.6, 2.9, 3, 3.4, 3.5, 3.53, 3.6, 3.9, 4], 2],
-      ] as const;
+      it.each([
+        ['lte', 3],
+        ['lte', 3.5],
+        ['lte', 0],
+        ['lt', 3],
+        ['lt', 3.5],
+        ['gt', 3],
+        ['gt', 3.5],
+        ['gt', 0],
+        ['gte', 3],
+        ['gte', 3.5],
+        ['gte', 0.5],
+      ] as const)('keeps every row of a sugars %s %d page', async (operator, value) => {
+        const result = await searchHits(
+          [{ nutrient: 'sugars', operator, value }],
+          hitsAt('sugars_100g', SUGARS),
+        );
 
-      it.each(ROW_CHECKS)(
-        'keeps only the rows sugars %s %d passes',
-        async (operator, value, kept, outside) => {
-          const result = await searchHits(
-            [{ nutrient: 'sugars', operator, value }],
-            hitsAt('sugars_100g', SUGARS),
-          );
-
-          expect(keptValues(result, 'sugars_100g')).toEqual(kept);
-          expect(result.outside_constraints).toBe(outside);
-          expect(result.page_count).toBe(kept.length);
-          expect(result.dropped).toBe(0);
-        },
-      );
+        expect(keptValues(result, 'sugars_100g')).toEqual(SUGARS);
+        expect(result).not.toHaveProperty('outside_constraints');
+        expect(result.page_count).toBe(SUGARS.length);
+        expect(result.dropped).toBe(0);
+      });
 
       it.each([
         ['energy-kcal', 'energy-kcal_100g', 'energy_kcal_100g'],
@@ -1015,40 +1183,36 @@ describe('OpenFoodFactsService', () => {
         ['proteins', 'proteins_100g', 'proteins_100g'],
         ['salt', 'salt_100g', 'salt_100g'],
         ['sodium', 'sodium_100g', 'sodium_100g'],
-      ])('checks %s, not only the whole-number nutrients', async (nutrient, rawKey, key) => {
+      ])('keeps every row of a %s page, showing each value', async (nutrient, rawKey, key) => {
         const result = await searchHits(
           [{ nutrient, operator: 'lte', value: 3 }],
           hitsAt(rawKey, [2.5, 3, 3.5]),
         );
 
-        expect(keptValues(result, key)).toEqual([2.5, 3]);
-        expect(result.outside_constraints).toBe(1);
+        expect(keptValues(result, key)).toEqual([2.5, 3, 3.5]);
+        expect(result).not.toHaveProperty('outside_constraints');
       });
 
       it.each([
-        // Floats the index holds widened to double, equal to the bound at its 32-bit precision and
-        // on the wrong side of it as doubles (`salt lte 0.1` live 577, double 569, 2026-10-30).
-        ['salt', 'lte', 0.1, 'salt_100g', 0.10000000149012, true],
-        ['salt', 'gte', 0.1, 'salt_100g', 0.10000000149012, true],
-        ['salt', 'gt', 0.1, 'salt_100g', 0.10000000149012, false],
-        ['salt', 'lt', 0.1, 'salt_100g', 0.10000000149012, false],
-        ['sugars', 'lte', 9.6, 'sugars_100g', 9.60000038146973, true],
-        ['sugars', 'gte', 3.3, 'sugars_100g', 3.29999995231628, true],
-        ['sugars', 'lt', 3.3, 'sugars_100g', 3.29999995231628, false],
-        ['sugars', 'gt', 9.6, 'sugars_100g', 9.60000038146973, false],
-        // A difference 32-bit precision still sees.
-        ['salt', 'lte', 0.1, 'salt_100g', 0.1000001, false],
+        // Floats the index holds widened to double, on one side of the bound at 32-bit precision
+        // and on the other as doubles: the index compared them, so each stays.
+        ['salt', 'lte', 0.1, 'salt_100g', 0.10000000149012],
+        ['salt', 'gt', 0.1, 'salt_100g', 0.10000000149012],
+        ['salt', 'lt', 0.1, 'salt_100g', 0.10000000149012],
+        ['sugars', 'lt', 3.3, 'sugars_100g', 3.29999995231628],
+        ['sugars', 'gt', 9.6, 'sugars_100g', 9.60000038146973],
+        ['salt', 'lte', 0.1, 'salt_100g', 0.1000001],
       ] as const)(
-        'compares %s %s %d at the index precision against a row at %s %d',
-        async (nutrient, operator, value, key, held, stays) => {
+        'keeps a %s %s %d row the index returned at %s %d',
+        async (nutrient, operator, value, key, held) => {
           const result = await searchHits([{ nutrient, operator, value }], hitsAt(key, [held]));
 
-          expect(keptValues(result, key)).toEqual(stays ? [held] : []);
-          expect(result.outside_constraints).toBe(stays ? undefined : 1);
+          expect(keptValues(result, key)).toEqual([held]);
+          expect(result).not.toHaveProperty('outside_constraints');
         },
       );
 
-      it('leaves rows it cannot judge on the page: no key, no map, no number', async () => {
+      it('leaves rows without an indexed value on the page: no key, no map, no number', async () => {
         const result = await searchHits(
           [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
           [
@@ -1070,7 +1234,7 @@ describe('OpenFoodFactsService', () => {
         expect(result).not.toHaveProperty('outside_constraints');
       });
 
-      it('counts a row that is unservable and failing once, in dropped', async () => {
+      it('counts only a row without a servable barcode in dropped, whatever its value', async () => {
         const result = await searchHits(
           [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
           [
@@ -1081,25 +1245,25 @@ describe('OpenFoodFactsService', () => {
         );
 
         expect(result.dropped).toBe(1);
-        expect(result.outside_constraints).toBe(1);
-        expect(result.products.map((row) => row.code)).toEqual(['7771711000483']);
+        expect(result).not.toHaveProperty('outside_constraints');
+        expect(result.products.map((row) => row.code)).toEqual(['3017620422003', '7771711000483']);
       });
 
-      it('holds a range pair inside one whole number to both bounds, sending the wide band', async () => {
+      it('sends a range pair between 3.5 and 3.9 as its two bounds, keeping every row', async () => {
         const result = await searchHits(
           [
             { nutrient: 'sugars', operator: 'gte', value: 3.5 },
             { nutrient: 'sugars', operator: 'lte', value: 3.9 },
           ],
-          hitsAt('sugars_100g', [3, 3.4, 3.5, 3.7, 3.9, 3.95]),
+          hitsAt('sugars_100g', [3.5, 3.7, 3.9]),
         );
 
-        expect(sentQ()).toBe('nutriments.sugars_100g:[3 TO *] nutriments.sugars_100g:[* TO 3.9]');
+        expect(sentQ()).toBe('nutriments.sugars_100g:[3.5 TO *] nutriments.sugars_100g:[* TO 3.9]');
         expect(keptValues(result, 'sugars_100g')).toEqual([3.5, 3.7, 3.9]);
-        expect(result.outside_constraints).toBe(3);
+        expect(result).not.toHaveProperty('outside_constraints');
       });
 
-      it('holds a row to every constraint on two nutrients, counting it once', async () => {
+      it('sends constraints on two nutrients as two clauses, keeping every row', async () => {
         const result = await searchHits(
           [
             { nutrient: 'sugars', operator: 'lte', value: 3 },
@@ -1107,29 +1271,33 @@ describe('OpenFoodFactsService', () => {
           ],
           [
             { code: '1000000000001', nutriments: { sugars_100g: 2, proteins_100g: 6 } },
-            { code: '1000000000002', nutriments: { sugars_100g: 3.5, proteins_100g: 6 } },
-            { code: '1000000000003', nutriments: { sugars_100g: 2, proteins_100g: 4 } },
-            { code: '1000000000004', nutriments: { sugars_100g: 3.5, proteins_100g: 4 } },
+            { code: '1000000000002', nutriments: { sugars_100g: 3.5, proteins_100g: 4 } },
             { code: '1000000000005', nutriments: { sugars_100g: 2 } },
-            { code: '1000000000006', nutriments: { sugars_100g: 3.5 } },
           ],
         );
 
         expect(sentQ()).toBe('nutriments.sugars_100g:[* TO 3] nutriments.proteins_100g:[5 TO *]');
-        expect(result.products.map((row) => row.code)).toEqual(['1000000000001', '1000000000005']);
-        expect(result.outside_constraints).toBe(4);
+        expect(result.products.map((row) => row.code)).toEqual([
+          '1000000000001',
+          '1000000000002',
+          '1000000000005',
+        ]);
+        expect(result.products.map((row) => row.indexed_nutriments)).toEqual([
+          { sugars_100g: 2, proteins_100g: 6 },
+          { sugars_100g: 3.5, proteins_100g: 4 },
+          { sugars_100g: 2 },
+        ]);
       });
 
-      it('applies alongside a tag filter, leaving the tag clause alone', async () => {
+      it('sends a decimal lower bound beside a tag filter as given', async () => {
         const result = await searchHits(
-          [{ nutrient: 'sugars', operator: 'gt', value: 3 }],
-          hitsAt('sugars_100g', [3, 3.2]),
+          [{ nutrient: 'sugars', operator: 'gt', value: 3.5 }],
+          hitsAt('sugars_100g', [3.53, 4.2]),
           { categories_tag: 'en:skyrs' },
         );
 
-        expect(sentQ()).toBe('categories_tags:"en:skyrs" nutriments.sugars_100g:[3 TO *]');
-        expect(keptValues(result, 'sugars_100g')).toEqual([3.2]);
-        expect(result.outside_constraints).toBe(1);
+        expect(sentQ()).toBe('categories:"en:skyrs" nutriments.sugars_100g:{3.5 TO *}');
+        expect(keptValues(result, 'sugars_100g')).toEqual([3.53, 4.2]);
       });
 
       it('keeps the backend count, exactness, and full row values', async () => {
@@ -1160,26 +1328,15 @@ describe('OpenFoodFactsService', () => {
           count_is_exact: false,
           page: 2,
           page_size: 20,
-          page_count: 1,
+          page_count: 2,
           dropped: 0,
-          outside_constraints: 1,
         });
-        // The row shows the value the index holds, not the value the check compared.
-        expect(keptValues(result, 'salt_100g')).toEqual([0.10000000149012]);
+        expect(result).not.toHaveProperty('outside_constraints');
+        // The row shows the value the index holds, widened to double as it arrives.
+        expect(keptValues(result, 'salt_100g')).toEqual([0.10000000149012, 0.2]);
       });
 
-      it('takes every row off a page none passes, keeping dropped at zero', async () => {
-        const result = await searchHits(
-          [{ nutrient: 'sugars', operator: 'gt', value: 3.9 }],
-          hitsAt('sugars_100g', [3, 3.5, 3.9]),
-        );
-
-        expect(result).toMatchObject({ products: [], page_count: 0, dropped: 0 });
-        expect(result.outside_constraints).toBe(3);
-      });
-
-      it('makes no check on a text search without nutrient filters', async () => {
-        // Characterization: the rows a query-only search returned before the check existed.
+      it('asks no nutrient map, and shows none, on a text search without nutrient filters', async () => {
         global.fetch = vi.fn().mockResolvedValue(textHits(hitsAt('sugars_100g', [3, 3.5])));
 
         const result = served(
@@ -1187,8 +1344,9 @@ describe('OpenFoodFactsService', () => {
         );
 
         expect(result.products).toHaveLength(2);
+        expect(result.products.some((row) => 'indexed_nutriments' in row)).toBe(false);
         expect(result).not.toHaveProperty('outside_constraints');
-        expect(sentRequest().body?.fields).toEqual(SEARCH_FIELD_LIST);
+        expect(sentRequest().body?.fields).toEqual(TEXT_FIELD_LIST);
       });
     });
   });
@@ -1417,6 +1575,8 @@ describe('OpenFoodFactsService', () => {
       });
 
       it('sends each grade input to the text index as one OR group, quoting a-plus', async () => {
+        // search-a-licious 2.x indexes Green-Score as `environmental_score_grade` and refuses
+        // `ecoscore_grade` with HTTP 400.
         await expect(
           textQ({
             query: 'muesli',
@@ -1426,13 +1586,13 @@ describe('OpenFoodFactsService', () => {
             countries_tag: 'en:france',
           }),
         ).resolves.toBe(
-          'nutriscore_grade:(a OR b) nova_group:(1 OR 2) ecoscore_grade:(a OR "a-plus") countries_tags:"en:france" muesli',
+          'nutriscore_grade:(a OR b) nova_group:(1 OR 2) environmental_score_grade:(a OR "a-plus") countries:"en:france" muesli',
         );
       });
 
       it.each([
-        ['a', 'ecoscore_grade:a muesli'],
-        ['a-plus', 'ecoscore_grade:"a-plus" muesli'],
+        ['a', 'environmental_score_grade:a muesli'],
+        ['a-plus', 'environmental_score_grade:"a-plus" muesli'],
       ])('sends one Green-Score grade %j to the text index as one clause', async (grade, q) => {
         await expect(textQ({ query: 'muesli', ecoscore_grade: grade })).resolves.toBe(q);
       });
@@ -1445,9 +1605,9 @@ describe('OpenFoodFactsService', () => {
     });
   });
 
-  // ── #94: a brand sent under each slug it can be stored under ─────────────
+  // ── #98: a brand sent under every key it can be stored under ─────────────
 
-  describe('searchProducts — a brand under any of its slugs', () => {
+  describe('searchProducts — a brand under any of its keys', () => {
     /** The live tag search URL `params` sends. */
     async function tagUrl(params: ProductSearch): Promise<URL> {
       global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_EMPTY));
@@ -1462,23 +1622,37 @@ describe('OpenFoodFactsService', () => {
       return sentQ();
     }
 
-    it('sends one slug to the text index as the clause it always sent, and several as an OR group', async () => {
-      await expect(textQ({ query: 'yaourt', brands_tag: 'nestle' })).resolves.toBe(
-        'brands_tags:"nestle" yaourt',
+    it('sends a brand to the text index as one any-of group: typed under xx:, then each key bare and under xx:', async () => {
+      await expect(textQ({ query: 'ketchup', brands_tag: brandTextIds('heinz') })).resolves.toBe(
+        'brands:("xx:heinz" OR "heinz") ketchup',
       );
-      await expect(textQ({ query: 'yaourt', brands_tag: ['όλυμποσ', 'όλυμπος'] })).resolves.toBe(
-        'brands_tags:("όλυμποσ" OR "όλυμπος") yaourt',
+      await expect(
+        textQ({ query: 'конфеты', brands_tag: brandTextIds('Красный Октябрь') }),
+      ).resolves.toBe(
+        'brands:("xx:Красный Октябрь" OR "красный-октябрь" OR "xx:красный-октябрь") конфеты',
+      );
+      await expect(textQ({ query: 'soda', brands_tag: brandTextIds('7-Up') })).resolves.toBe(
+        'brands:("xx:7-Up" OR "7-up" OR "xx:7-up" OR "7up" OR "xx:7up" OR "seven-up" OR "xx:seven-up") soda',
       );
     });
 
-    it('joins several slugs with | on the live tag search, which reads them as any of them', async () => {
-      expect((await tagUrl({ brands_tag: 'nestle' })).searchParams.get('brands_tags')).toBe(
-        'nestle',
-      );
-      expect(
-        (await tagUrl({ brands_tag: ['όλυμποσ', 'όλυμπος'] })).searchParams.get('brands_tags'),
-      ).toBe('όλυμποσ|όλυμπος');
+    it('sends a brand keyed to itself to the live tag search exactly as 0.4.5 did', async () => {
+      const url = await tagUrl({ brands_tag: brandLiveIds('nutella')[0] });
+      expect(url.searchParams.get('brands_tags')).toBe('nutella');
+      expect([...url.searchParams.keys()]).toEqual(['fields', 'brands_tags', 'page', 'page_size']);
     });
+
+    it.each([
+      ['Красный Октябрь', 'Красный Октябрь|xx:красный-октябрь!'],
+      ['7-Up', '7-Up|xx:7-up!|xx:7up!|xx:seven-up!'],
+      ['kelloggs', 'kelloggs|xx:kellogg-s!|xx:kellogg!'],
+    ])(
+      'joins %j and its keys with | on the live tag search, each key an exact stored tag',
+      async (brand, sent) => {
+        const url = await tagUrl({ brands_tag: [...brandLiveIds(brand)] });
+        expect(url.searchParams.get('brands_tags')).toBe(sent);
+      },
+    );
   });
 
   describe('searchProducts — a taxonomy value under any of its IDs', () => {
@@ -1501,7 +1675,7 @@ describe('OpenFoodFactsService', () => {
           countries_tag: ['el:ελλασ', 'el:ελλας'],
         }),
       ).resolves.toBe(
-        'categories_tags:("el:σαλατεσ" OR "el:σαλατες") labels_tags:("el:βιολογικοσ" OR "el:βιολογικος") labels_tags:"en:vegan" allergens_tags:("el:γαλακτοσ" OR "el:γαλακτος") traces_tags:("el:καρυδιασ" OR "el:καρυδιας") ingredients_tags:("el:ζαχαρησ" OR "el:ζαχαρης") countries_tags:("el:ελλασ" OR "el:ελλας") yaourt',
+        'categories:("el:σαλατεσ" OR "el:σαλατες") labels:("el:βιολογικοσ" OR "el:βιολογικος") labels:"en:vegan" allergens:("el:γαλακτοσ" OR "el:γαλακτος") traces:("el:καρυδιασ" OR "el:καρυδιας") ingredients_tags:("el:ζαχαρησ" OR "el:ζαχαρης") countries:("el:ελλασ" OR "el:ελλας") yaourt',
       );
     });
 
@@ -1515,7 +1689,20 @@ describe('OpenFoodFactsService', () => {
           countries_tag: 'en:greece',
         }),
       ).resolves.toBe(
-        'categories_tags:"el:σαλάτες" labels_tags:"en:organic" labels_tags:"en:vegan" ingredients_tags:"en:sugar" countries_tags:"en:greece" yaourt',
+        'categories:"el:σαλάτες" labels:"en:organic" labels:"en:vegan" ingredients_tags:"en:sugar" countries:"en:greece" yaourt',
+      );
+    });
+
+    it('escapes a quote or backslash inside a tag value, so the value stays one term', async () => {
+      // Live 2026-11-24: `brands:"xx:zzq\" OR categories:\"en:hummus"` matched nothing — one term.
+      await expect(
+        textQ({
+          query: 'yaourt',
+          categories_tag: 'en:zzq" OR categories:"en:hummus',
+          labels_tag: 'en:a\\b',
+        }),
+      ).resolves.toBe(
+        'categories:"en:zzq\\" OR categories:\\"en:hummus" labels:"en:a\\\\b" yaourt',
       );
     });
   });
@@ -1567,7 +1754,7 @@ describe('OpenFoodFactsService', () => {
 
       expect(request.url).toBe(TEXT_SEARCH_URL);
       expect(request.body).toMatchObject({
-        q: 'categories_tags:"en:breakfast-cereals" ingredients_tags:"en:inulin"',
+        q: 'categories:"en:breakfast-cereals" ingredients_tags:"en:inulin"',
         page: 11,
         page_size: 20,
       });
@@ -2066,6 +2253,98 @@ describe('OpenFoodFactsService', () => {
       expect(error.message).toContain('Maximum number of returned results is 10 000');
     });
 
+    it('sends a 2.x QueryCheckError 400 once and carries its description, not the JSON around it', async () => {
+      // A real Response, so the framework's error-body capture runs: this body outgrows its
+      // default 500 bytes, whose head-and-tail cut leaves JSON that no longer parses.
+      const body = JSON.stringify(QUERY_CHECK_ERROR);
+      expect(body.length).toBeGreaterThan(500);
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = besideProbe(
+        async () =>
+          new Response(body, { status: 400, headers: { 'content-type': 'application/json' } }),
+      );
+
+      const error = await captureError(
+        svc.searchProducts({ query: 'heavy cream', page: 1, page_size: 20 }, ctx),
+      );
+
+      expect(callsBesideProbe()).toHaveLength(1);
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data).toMatchObject({
+        reason: 'upstream_rejected',
+        status: 400,
+        retryable: false,
+      });
+      expect(error.message).toContain(
+        "Found errors while checking query: - Search field 'categories.en' not found in index config - Search field 'labels.en' not found in index config",
+      );
+      expect(error.message).not.toContain('"debug"');
+      expect(error.message).not.toContain('lucene_query');
+      expect(error.message).not.toContain('QueryCheckError');
+    });
+
+    it('carries an errors entry’s title when it has no description', async () => {
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = besideProbe(
+        async () =>
+          new Response(
+            JSON.stringify({
+              debug: { lucene_query: null },
+              errors: [{ title: 'QueryCheckError' }],
+            }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          ),
+      );
+
+      const error = await captureError(
+        svc.searchProducts({ query: 'heavy cream', page: 1, page_size: 20 }, ctx),
+      );
+
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.message).toContain('QueryCheckError');
+      expect(error.message).not.toContain('"debug"');
+    });
+
+    it('carries every errors entry, in order', async () => {
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = besideProbe(
+        async () =>
+          new Response(
+            JSON.stringify({ errors: [{ description: 'field a' }, { description: 'field b' }] }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          ),
+      );
+
+      const error = await captureError(
+        svc.searchProducts({ query: 'heavy cream', page: 1, page_size: 20 }, ctx),
+      );
+
+      expect(error.data?.reason).toBe('upstream_rejected');
+      expect(error.message).toContain('field a; field b');
+    });
+
+    it('drops markup from a plain-text body, leaving its text', () => {
+      // A tag spans no other `<`, so a stray one before it is dropped as a bare bracket.
+      expect(plainTextDetail('<p>Bad <b>gateway</b></p> <<retry> 5 < 6')).toBe('Bad gateway 5 6');
+      expect(plainTextDetail('<br/><hr>')).toBeUndefined();
+    });
+
+    it.each([
+      ['openers with no closer', (n: number) => '<'.repeat(n)],
+      ['nested openers', (n: number) => '<a'.repeat(n / 4) + '>'.repeat(n / 2)],
+      ['one opener before a long word', (n: number) => `<${'a'.repeat(n)}`],
+      ['one opener before a long digit run', (n: number) => `<${'1'.repeat(n)}`],
+      ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
+      ['breaks throughout', (n: number) => '  \r\n'.repeat(n / 4)],
+    ])(
+      'reduces an error body to plain text in linear time: %s',
+      (_label, make) => {
+        // The text search keeps up to 16 KiB of an error body for this pass.
+        expectLinearCpu(plainTextDetail, make);
+      },
+      0,
+    );
+
     it('does not retry a tag-search 4xx, and summarizes the rendered error page', async () => {
       // Deep tag pages are refused with a 401 whose body is the site's rendered error page. Its
       // markup carries no signal, and — as observed live — it opens with a template comment rather
@@ -2358,8 +2637,46 @@ describe('OpenFoodFactsService', () => {
       it('reads text-search hits and a zero-hit page as counted answers', async () => {
         const ctx = createMockContext();
         answerAll(TEXT_SEARCH_HITS);
-        const hits = await svc.searchProducts({ query: 'nutella', page: 1, page_size: 2 }, ctx);
-        expect(hits).toMatchObject({ count: 631, count_is_exact: true, page_count: 2 });
+        const hits = served(
+          await svc.searchProducts({ query: 'nutella', page: 1, page_size: 2 }, ctx),
+        );
+        expect(hits).toMatchObject({ count: 943, count_is_exact: true, page_count: 2 });
+        // The 2.x hits under the row keys a v2 read uses, brand IDs as text, `_score` left out.
+        expect(hits.products).toEqual([
+          {
+            code: '9416470242016',
+            product_name: 'Pâte à tartiner aux noisettes et au cacao',
+            brands: 'ferrero, nutella',
+            quantity: '750 g',
+            nutriscore_grade: 'unknown',
+            nova_group: 4,
+            ecoscore_grade: 'unknown',
+            completeness: 0.5625,
+            last_modified_t: 1700446560,
+            created_t: 1532452361,
+          },
+          {
+            code: '8000500179864',
+            product_name: 'Nutella',
+            brands: 'Ferrero',
+            quantity: '600g',
+            nutriscore_grade: 'e',
+            nova_group: 4,
+            ecoscore_grade: 'd',
+            categories_tags: [
+              'en:breakfasts',
+              'en:spreads',
+              'en:sweet-spreads',
+              'fr:pates-a-tartiner',
+              'en:hazelnut-spreads',
+              'en:chocolate-spreads',
+              'en:cocoa-and-hazelnuts-spreads',
+            ],
+            completeness: 0.7875,
+            last_modified_t: 1793195422,
+            created_t: 1486386459,
+          },
+        ]);
 
         answerAll(TEXT_SEARCH_EMPTY);
         const empty = await svc.searchProducts({ query: 'zzqxwvplmk', page: 1, page_size: 2 }, ctx);
@@ -2623,7 +2940,7 @@ describe('OpenFoodFactsService', () => {
           svc.searchProducts({ query: 'nutella', page: 1, page_size: 2 }, createMockContext()),
         );
 
-        expect(result).toMatchObject({ count: 631, count_is_exact: true, page_count: 2 });
+        expect(result).toMatchObject({ count: 943, count_is_exact: true, page_count: 2 });
         expect(requestedPaths()).toEqual(['/search', '/search']);
       });
 
@@ -2839,17 +3156,19 @@ describe('OpenFoodFactsService', () => {
       expect(request.method).toBe('POST');
       expect(request.headers['Content-Type']).toBe('application/json');
       expect(request.headers['User-Agent']).toMatch(/^openfoodfacts-mcp-server\//);
+      // The query alone, no per-word group: 2.x requires every bare word itself. The summary
+      // fields go under 2.x's names, and `main` reaches a name in the product's own language.
       expect(request.body).toEqual({
-        q: `${wordGroup('dark')} ${wordGroup('chocolate')} dark chocolate`,
-        langs: [...UPSTREAM_TEXT_LANGS],
-        fields: SEARCH_FIELD_LIST,
+        q: 'dark chocolate',
+        langs: TEXT_LANGS,
+        fields: TEXT_FIELD_LIST,
         page: 2,
         page_size: 5,
         sort_by: '-popularity_key',
       });
     });
 
-    it('sends the 31 analyzed languages on a nutrient-only search too', async () => {
+    it('sends the 31 languages and main on a nutrient-only search too', async () => {
       const ctx = createMockContext();
       global.fetch = vi.fn().mockResolvedValue(textHits([]));
 
@@ -2865,9 +3184,9 @@ describe('OpenFoodFactsService', () => {
       expect(sentRequest().method).toBe('POST');
       expect(sentRequest().body).toEqual({
         q: 'nutriments.sugars_100g:[* TO 5]',
-        langs: [...UPSTREAM_TEXT_LANGS],
+        langs: TEXT_LANGS,
         // A nutrient constraint also asks for the index's nutrient map (#58).
-        fields: [...SEARCH_FIELD_LIST, 'nutriments'],
+        fields: [...TEXT_FIELD_LIST, 'nutriments'],
         page: 1,
         page_size: 20,
       });
@@ -2904,7 +3223,7 @@ describe('OpenFoodFactsService', () => {
                 type: 'value_error',
                 loc: ['body'],
                 msg: 'Value error, Maximum number of returned results is 10 000 (here: page * page_size = 500000)',
-                input: { q: 'chocolate', langs: [...UPSTREAM_TEXT_LANGS], page: 10000 },
+                input: { q: 'chocolate', langs: TEXT_LANGS, page: 10000 },
                 ctx: { error: {} },
               },
             ],
@@ -2933,7 +3252,7 @@ describe('OpenFoodFactsService', () => {
           type: 'value_error',
           loc: ['body'],
           msg: 'Value error, Maximum number of returned results is 10 000 (here: page * page_size = 500000)',
-          input: { q: 'chocolate '.repeat(3_000), langs: [...UPSTREAM_TEXT_LANGS] },
+          input: { q: 'chocolate '.repeat(3_000), langs: TEXT_LANGS },
         },
       ];
       global.fetch = vi.fn(
@@ -2984,6 +3303,20 @@ describe('OpenFoodFactsService', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it('carries every entry of an error envelope served with HTTP 200, in order', async () => {
+      const ctx = createMockContext({ errors: offSearchProductsTool.errors });
+      global.fetch = vi.fn(async () =>
+        mockResponse({ errors: [{ description: 'field a' }, { description: 'field b' }] }),
+      );
+
+      const error = await settle(() =>
+        svc.searchProducts({ query: 'chocolate', page: 1, page_size: 20 }, ctx),
+      );
+
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.message).toContain('failed inside its search engine: field a; field b');
     });
   });
 
@@ -3069,9 +3402,9 @@ describe('OpenFoodFactsService', () => {
     });
   });
 
-  // ── #38: every word of the query constrains the result ───────────────────
+  // ── #38, #101: the query reaches q as its words, each one required ───────
 
-  describe('per-word groups (#38)', () => {
+  describe('the query in q (#38, #101)', () => {
     /** Run a text search with the given parameters and return the `q` it sent. */
     async function qFor(params: Record<string, unknown>): Promise<string> {
       const ctx = createMockContext();
@@ -3080,88 +3413,95 @@ describe('OpenFoodFactsService', () => {
       return sentQ();
     }
 
-    it('groups each word over exactly the fields the backend searches for the 31 languages', async () => {
-      const q = await qFor({ query: 'milk chocolate' });
-
-      expect(q).toBe(`${wordGroup('milk')} ${wordGroup('chocolate')} milk chocolate`);
-      for (const word of ['milk', 'chocolate']) {
-        const fields = [...q.matchAll(new RegExp(`([a-z_]+(?:\\.[a-z]{2})?):${word}\\b`, 'g'))].map(
-          (m) => m[1],
-        );
-        expect(new Set(fields)).toEqual(new Set(UPSTREAM_MULTI_MATCH_FIELDS));
-        expect(fields).toHaveLength(75);
-      }
+    it('sends a multi-word query as its lowercased words alone, with no per-word group', async () => {
+      // search-a-licious 2.x requires every bare word itself, so a group per word would only
+      // repeat the requirement over fields 2.x refuses (`categories.en`) with HTTP 400.
+      await expect(qFor({ query: 'Milk chocolate' })).resolves.toBe('milk chocolate');
     });
 
-    it('sends a one-word query with no group, which the relevance match already requires', async () => {
-      // Live: `milk` in Mongolia matches the same 6 products with or without its group, and the
-      // group costs about 200 ms a search.
+    it('names no 1.x field in q, whatever filters the search carries', async () => {
+      const q = await qFor({
+        query: 'Heavy Cream',
+        categories_tag: 'en:dairies',
+        brands_tag: 'xx:heinz',
+        labels_tag: ['en:organic', 'en:vegan'],
+        allergens_tag: 'en:milk',
+        traces_tag: 'en:nuts',
+        ingredients_analysis_tag: 'en:vegetarian',
+        ingredients_tag: 'en:cream',
+        additives_tag: 'en:e407',
+        nutrition_grade: ['a', 'b'],
+        nova_group: ['3', '4'],
+        ecoscore_grade: ['a-plus', 'a'],
+        countries_tag: 'en:united-states',
+        exclude_allergens: ['en:gluten'],
+        exclude_traces: ['en:peanuts'],
+        nutrient_filters: [{ nutrient: 'fat', operator: 'gt', value: 30.5 }],
+      });
+
+      expect(q).toBe(
+        'categories:"en:dairies" brands:"xx:heinz" labels:"en:organic" labels:"en:vegan" allergens:"en:milk" traces:"en:nuts" ingredients_analysis_tags:"en:vegetarian" ingredients_tags:"en:cream" additives:"en:e407" nutriscore_grade:(a OR b) nova_group:(3 OR 4) environmental_score_grade:("a-plus" OR a) countries:"en:united-states" -allergens:"en:gluten" -traces:"en:peanuts" nutriments.fat_100g:{30.5 TO *} heavy cream',
+      );
+      // The two `_tags` fields 2.x keeps, and nothing else of the 1.x names.
+      expect(new Set(q.match(/[a-z_]+_tags(?=:)/g))).toEqual(
+        new Set(['ingredients_analysis_tags', 'ingredients_tags']),
+      );
+      expect(q).not.toMatch(/\b[a-z_]+\.[a-z]{2,4}:/);
+      expect(q).not.toContain('ecoscore_grade');
+    });
+
+    it('sends a one-word query as that word', async () => {
       await expect(qFor({ query: 'Milk' })).resolves.toBe('milk');
       // One word under the analyzer's grammar, however it is punctuated.
       await expect(qFor({ query: "L'eau", labels_tag: 'en:organic' })).resolves.toBe(
-        'labels_tags:"en:organic" l\'eau',
+        'labels:"en:organic" l\'eau',
       );
-      await expect(qFor({ query: 'milk!' })).resolves.toBe('milk\\!');
+      await expect(qFor({ query: 'milk!' })).resolves.toBe('milk');
     });
 
-    it('groups each part of a hyphen-joined query, which is two words to the analyzer', async () => {
-      // Live, Mongolia: `milk-chocolate` counted 9 (milk OR chocolate) with no group, and 1 — the
-      // intersection — with a group per part, the same as `milk chocolate`.
+    it('sends the parts of a hyphen-joined query apart, each one required', async () => {
+      // Live 2026-11-24: 2.x matches an escaped joined token on any one of its parts
+      // (`coca\-cola` 10,000+, `coca cola` 2,969).
       await expect(qFor({ query: 'dark-chocolate', labels_tag: 'en:organic' })).resolves.toBe(
-        `labels_tags:"en:organic" ${wordGroup('dark')} ${wordGroup('chocolate')} dark\\-chocolate`,
+        'labels:"en:organic" dark chocolate',
       );
     });
 
-    it.each([
-      ['-', '\\-'],
-      ['/', '\\/'],
-      ['+', '\\+'],
-      ['&', '\\&'],
-      [',', ','],
-      [':', '\\:'],
-    ])('requires both words joined by %s, which separates words', async (separator, escaped) => {
-      // Live, Mongolia: a single group for `milk<sep>xyzzyqq` matched the 6 `milk` products, so
-      // the analyzer split it; one group per part matches nothing, as `milk xyzzyqq` does.
-      await expect(qFor({ query: `milk${separator}xyzzyqq` })).resolves.toBe(
-        `${wordGroup('milk')} ${wordGroup('xyzzyqq')} milk${escaped}xyzzyqq`,
-      );
-    });
+    it.each(['-', '/', '+', '&', ',', ':'])(
+      'sends the words joined by %s apart, since it separates words',
+      async (separator) => {
+        await expect(qFor({ query: `milk${separator}xyzzyqq` })).resolves.toBe('milk xyzzyqq');
+      },
+    );
 
     it.each(["'", '’', '.', '_'])(
       'keeps a word joined by %s whole, which the analyzer keeps as one token',
       async (joiner) => {
-        // Live, Mongolia: a group for `milk<joiner>xyzzyqq` matched 0 — one token, not two.
         const word = `milk${joiner}xyzzyqq`;
 
         await expect(qFor({ query: word })).resolves.toBe(word);
-        await expect(qFor({ query: `${word} cocoa` })).resolves.toBe(
-          `${wordGroup(word)} ${wordGroup('cocoa')} ${word} cocoa`,
-        );
+        await expect(qFor({ query: `${word} cocoa` })).resolves.toBe(`${word} cocoa`);
       },
     );
 
     it('joins across only a single apostrophe or period between word characters', async () => {
       // A doubled joiner, or one at a word's edge, separates.
       await expect(qFor({ query: "milk..cocoa 'oat' rice' u.s." })).resolves.toBe(
-        `${wordGroup('milk')} ${wordGroup('cocoa')} ${wordGroup('oat')} ${wordGroup('rice')} ${wordGroup('u.s')} milk..cocoa 'oat' rice' u.s.`,
+        'milk cocoa oat rice u.s',
       );
     });
 
     it('keeps a decimal comma inside its number, and separates at a comma elsewhere', async () => {
-      // Live: `lait 1,5%` with groups for `1` and `5` matched 27 products, only names spelling it
-      // `1, 5%`; one `1,5` group matched 324, the products named `Lait 1,5%`.
-      await expect(qFor({ query: 'lait 1,5%' })).resolves.toBe(
-        `${wordGroup('lait')} ${wordGroup('1,5')} lait 1,5%`,
-      );
-      await expect(qFor({ query: 'milk,cocoa 1,cocoa' })).resolves.toBe(
-        `${wordGroup('milk')} ${wordGroup('cocoa')} ${wordGroup('1')} milk,cocoa 1,cocoa`,
-      );
+      // Live: `lait 1,5%` requiring `1` and `5` matched 27 products, only names spelling it
+      // `1, 5%`; requiring `1,5`, 324, the products named `Lait 1,5%`.
+      await expect(qFor({ query: 'lait 1,5%' })).resolves.toBe('lait 1,5');
+      await expect(qFor({ query: 'milk,cocoa 1,cocoa' })).resolves.toBe('milk cocoa 1 cocoa');
     });
 
     it('keeps accents and combining marks inside a word', async () => {
       const decomposed = 'café';
-      await expect(qFor({ query: `crème-brûlée ${decomposed}` })).resolves.toBe(
-        `${wordGroup('crème')} ${wordGroup('brûlée')} ${wordGroup(decomposed)} crème\\-brûlée ${decomposed}`,
+      await expect(qFor({ query: `Crème-Brûlée ${decomposed}` })).resolves.toBe(
+        `crème brûlée ${decomposed}`,
       );
     });
 
@@ -3172,166 +3512,99 @@ describe('OpenFoodFactsService', () => {
       ['decimal commas between single digits', (n: number) => '1,'.repeat(n / 2)],
       ['separators only', (n: number) => '-/+&,:'.repeat(n / 6)],
       ['combining marks only', (n: number) => '́'.repeat(n)],
+      ['reserved characters only', (n: number) => '*'.repeat(n)],
+      ['a long digit run', (n: number) => '1'.repeat(n)],
+      ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
+      ['breaks throughout', (n: number) => '  \r\n'.repeat(n / 4)],
       [
         'many short distinct words',
         (n: number) => Array.from({ length: n / 6 }, (_, i) => `w${i}`).join(' '),
       ],
-    ])('extracts words in linear time from %s', (_label, make) => {
-      // The query reaches the word scan with no length bound — only its word count is capped.
-      /** Five CPU-time samples; short batches leave room for scheduling within the test deadline. */
-      const cpuMsPerRun = (input: string): number => {
-        let fastest = Number.POSITIVE_INFINITY;
-        for (let sample = 0; sample < 5; sample++) {
-          const start = process.threadCpuUsage();
-          let runs = 0;
-          let usedMs = 0;
-          do {
-            requiredWords(input);
-            runs++;
-            const used = process.threadCpuUsage(start);
-            usedMs = (used.user + used.system) / 1000;
-          } while (usedMs < 5);
-          fastest = Math.min(fastest, usedMs / runs);
-        }
-        return fastest;
-      };
+    ])(
+      'builds q from a query in linear time: %s',
+      (_label, make) => {
+        // The query reaches the word scan and the escaper with no length bound — only its word
+        // count is capped, and that by the tool.
+        expectLinearCpu((query) => buildTextSearchQuery({ query }), make);
+      },
+      0,
+    );
 
-      const small = cpuMsPerRun(make(5_000));
-      const large = cpuMsPerRun(make(320_000));
+    it.each([
+      ['quotes only', (n: number) => '"'.repeat(n)],
+      ['backslashes only', (n: number) => '\\'.repeat(n)],
+      ['a long digit run', (n: number) => '1'.repeat(n)],
+      ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
+      ['breaks throughout', (n: number) => '  \r\n'.repeat(n / 4)],
+    ])(
+      'builds q from a brand value in linear time: %s',
+      (_label, make) => {
+        // A tag value is quoted as one term (`quotedTerm`), every quote and backslash escaped.
+        expectLinearCpu((brand) => buildTextSearchQuery({ brands_tag: brand }), make);
+      },
+      0,
+    );
 
-      // 64× the input: linear stays near 64×, quadratic would reach 4,096×.
-      expect(large / small).toBeLessThan(256);
-      expect(large).toBeLessThan(250);
-    });
-
-    it('dedupes a word repeated inside a joined token, and still requires the new one', async () => {
-      // Live, Mongolia: `milk milk-xyzzyqq` counted 6 with whitespace groups, 0 with these.
-      await expect(qFor({ query: 'milk milk-xyzzyqq' })).resolves.toBe(
-        `${wordGroup('milk')} ${wordGroup('xyzzyqq')} milk milk\\-xyzzyqq`,
+    it('sends every word of the query, a repeated one too', async () => {
+      await expect(qFor({ query: 'milk milk-xyzzyqq' })).resolves.toBe('milk milk xyzzyqq');
+      await expect(qFor({ query: 'dark-chocolate 70% dark-chocolate' })).resolves.toBe(
+        'dark chocolate 70 dark chocolate',
       );
     });
 
-    it('still groups the one required word of a query that also carries a stop word', async () => {
-      await expect(qFor({ query: 'the chocolate' })).resolves.toBe(
-        `${wordGroup('chocolate')} the chocolate`,
+    it('sends stop words with the rest, which the analyzers leave out of the requirement', async () => {
+      // Live 2026-11-24: `confiture de fraise` and `confiture fraise` both counted 1,956.
+      await expect(qFor({ query: 'confiture de fraise' })).resolves.toBe('confiture de fraise');
+      await expect(qFor({ query: 'chocolate with hazelnuts, and the' })).resolves.toBe(
+        'chocolate with hazelnuts and the',
       );
     });
 
-    it('orders tag clauses, nutrient clauses, one group per word, then the bare words', async () => {
+    it('orders tag clauses, nutrient clauses, then the query’s words', async () => {
       const q = await qFor({
         query: 'Milk chocolate',
         countries_tag: 'en:mongolia',
         nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 50 }],
       });
 
-      expect(q).toBe(
-        `countries_tags:"en:mongolia" nutriments.sugars_100g:{* TO 50} ${wordGroup('milk')} ${wordGroup('chocolate')} milk chocolate`,
-      );
+      expect(q).toBe('countries:"en:mongolia" nutriments.sugars_100g:{* TO 50} milk chocolate');
     });
 
-    it('reads uppercase AND, OR and NOT as words, never as operators', async () => {
-      const q = await qFor({ query: 'milk AND chocolate OR NOT cocoa' });
+    it('reads uppercase AND, OR, NOT and TO as words, never as operators', async () => {
+      const q = await qFor({ query: 'milk AND chocolate OR NOT cocoa TO go' });
 
-      expect(q).toBe(
-        `${wordGroup('milk')} ${wordGroup('chocolate')} ${wordGroup('cocoa')} milk and chocolate or not cocoa`,
-      );
-      expect(q).not.toMatch(/\b(AND|NOT)\b/);
-      expect(q.replaceAll(' OR ', ' ')).not.toMatch(/\bOR\b/);
+      expect(q).toBe('milk and chocolate or not cocoa to go');
+      expect(q).not.toMatch(/\b(AND|OR|NOT|TO)\b/);
     });
 
-    it('forms no group for a token with no letter or digit', async () => {
-      // A group over a punctuation-only token analyzes to nothing in every field and matches no
-      // product (live: `milk -` with a group for `-` → 0; without it → 6, Mongolia).
-      const q = await qFor({ query: 'milk - & chocolate' });
-
-      expect(q).toBe(`${wordGroup('milk')} ${wordGroup('chocolate')} milk \\- \\& chocolate`);
-    });
-
-    it('forms no group for a word the English analyzer drops as a stop word', async () => {
-      // `with` never reaches the English name index, so its group could match only through other
-      // fields (live: chocolate with hazelnuts → 84 with a `with` group, 5,840 without).
-      const q = await qFor({ query: 'chocolate with hazelnuts, and the' });
-
-      expect(q).toBe(
-        `${wordGroup('chocolate')} ${wordGroup('hazelnuts')} chocolate with hazelnuts, and the`,
-      );
+    it('leaves out a token with no letter or digit beside the words', async () => {
+      await expect(qFor({ query: 'milk - & chocolate' })).resolves.toBe('milk chocolate');
     });
 
     it.each([
-      // French: `de` is dropped from product_name.fr and categories.fr (live: a group for it over
-      // those fields alone matched 0), so requiring it cut confiture de fraise to 237 from 3,251.
-      ['confiture de fraise', ['confiture', 'fraise']],
-      ['galletas con chocolate', ['galletas', 'chocolate']],
-      ['schokolade mit nüssen', ['schokolade', 'nüssen']],
-      // Portuguese `de` is also a French and Spanish stop word, so it stays optional.
-      ['doce de leite', ['doce', 'leite']],
-      ['latte e cacao', ['latte', 'cacao']],
+      ['%%%', '%%%'],
+      ['*', '\\*'],
+      ['- &', '\\- \\&'],
+      ['"?!', '\\"\\?\\!'],
     ])(
-      'forms no group for a stop word of a language holding 1%+ of named products: %s',
-      async (query, grouped) => {
-        const q = await qFor({ query });
-
-        expect(q).toBe(`${grouped.map(wordGroup).join(' ')} ${query}`);
+      'sends a query holding no word, %j, as typed with its reserved characters escaped',
+      async (query, q) => {
+        // Live: `%%%` matched no product, where an empty `q` would match every one.
+        await expect(qFor({ query })).resolves.toBe(q);
       },
     );
 
-    it.each([
-      // Below the threshold: Portuguese `com` (0.75% of named products), Dutch `met` (0.83%),
-      // Russian `и` (0.38%), Hindi `इसका` (0.004%). Each still forms a group.
-      ['pão com queijo', ['pão', 'com', 'queijo']],
-      ['soep met balletjes', ['soep', 'met', 'balletjes']],
-      ['chleb и масло', ['chleb', 'и', 'масло']],
-      ['इसका चाय', ['इसका', 'चाय']],
-    ])('still groups a stop word of a language below the threshold: %s', async (query, grouped) => {
-      const q = await qFor({ query });
-
-      expect(q).toBe(`${grouped.map(wordGroup).join(' ')} ${query}`);
-    });
-
-    it('exempts the stop words of English, French, Spanish, German, and Italian only, 949 in all', () => {
-      expect([...STOP_WORD_LANGS]).toEqual(['en', 'fr', 'es', 'de', 'it']);
-      const selected = new Set(
-        STOP_WORD_LANGS.flatMap((lang) => ANALYZER_STOP_WORDS[lang].split(/\s+/).filter(Boolean)),
-      );
-      expect(selected.size).toBe(949);
-      expect(selected.has('door')).toBe(false);
-      expect(selected.has('soy')).toBe(true);
-    });
-
-    it('treats a word that is a stop word only in another language as optional too', async () => {
-      // The chosen trade-off: Spanish `soy` ("I am") is a stop word, so `soy milk` requires only
-      // `milk`, and `soy` still ranks the soy milks first through the bare words.
-      await expect(qFor({ query: 'soy milk' })).resolves.toBe(`${wordGroup('milk')} soy milk`);
-    });
-
-    it('keeps a stop list for every indexed language, 5,928 words in all', () => {
-      const lists = Object.entries(ANALYZER_STOP_WORDS).map(
-        ([lang, words]) => [lang, words.split(/\s+/).filter(Boolean)] as const,
-      );
-
-      expect(lists.map(([lang]) => lang)).toEqual([...UPSTREAM_TEXT_LANGS]);
-      for (const [, words] of lists) expect(words.length).toBeGreaterThan(0);
-      expect(new Set(lists.flatMap(([, words]) => words)).size).toBe(5928);
-      const byLang = Object.fromEntries(lists);
-      expect(byLang.fr).toContain('de');
-      expect(byLang.de).toContain('mit');
-      expect(byLang.nl).toContain('door');
-      expect(byLang.en).toHaveLength(33);
-    });
-
     it('keeps a field:value-shaped query as words rather than a field clause', async () => {
-      const q = await qFor({ query: 'brands: nutella' });
-
-      // The colon separates words, so the field name is an ordinary word with its own group.
-      expect(q).toBe(`${wordGroup('brands')} ${wordGroup('nutella')} brands\\: nutella`);
+      // The colon separates words, so `nutriscore_grade` is an ordinary word, not a field.
+      await expect(qFor({ query: 'nutriscore_grade:a' })).resolves.toBe('nutriscore_grade a');
+      await expect(qFor({ query: 'brands: nutella' })).resolves.toBe('brands nutella');
     });
 
-    it('groups the words of joined tokens once each, leaving the escaped bare query for ranking', async () => {
-      const q = await qFor({ query: 'dark-chocolate 70% dark-chocolate' });
-
-      expect(q).toBe(
-        `${wordGroup('dark')} ${wordGroup('chocolate')} ${wordGroup('70')} dark\\-chocolate 70% dark\\-chocolate`,
+    it('leaves an empty tag ID out of its clause, and the clause out when it holds no other', () => {
+      expect(buildTextSearchQuery({ categories_tag: ['en:hummus', ''] })).toBe(
+        'categories:"en:hummus"',
       );
+      expect(buildTextSearchQuery({ categories_tag: '' })).toBe('');
     });
 
     it('sends only the tag clauses when there is no query', async () => {
@@ -3340,7 +3613,63 @@ describe('OpenFoodFactsService', () => {
         nutrient_filters: [{ nutrient: 'salt', operator: 'lt', value: 1 }],
       });
 
-      expect(q).toBe('labels_tags:"en:organic" nutriments.salt_100g:{* TO 1}');
+      expect(q).toBe('labels:"en:organic" nutriments.salt_100g:{* TO 1}');
+    });
+  });
+
+  // ── #101: what the text index move leaves as 0.4.5 sent it ───────────────
+
+  describe('requests outside the text index, as 0.4.5 sent them (#101)', () => {
+    it('sends a tag-only search carrying every tag-path filter the URL 0.4.5 sent', async () => {
+      global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_EMPTY));
+
+      await svc.searchProducts(
+        {
+          categories_tag: 'en:breakfast-cereals',
+          labels_tag: ['en:organic', 'en:fair-trade'],
+          allergens_tag: 'en:nuts',
+          traces_tag: 'en:milk',
+          ingredients_analysis_tag: 'en:vegan',
+          additives_tag: 'en:e330',
+          nutrition_grade: ['a', 'b'],
+          nova_group: '3',
+          ecoscore_grade: ['a-plus', 'a'],
+          countries_tag: 'en:france',
+          exclude_allergens: ['en:gluten'],
+          exclude_traces: ['en:peanuts'],
+          sort_by: 'popularity_key',
+          page: 3,
+          page_size: 25,
+        },
+        createMockContext(),
+      );
+
+      expect(callsBesideProbe()).toHaveLength(1);
+      const request = sentRequest();
+      expect(request.method ?? 'GET').toBe('GET');
+      expect(request.body).toBeUndefined();
+      expect(request.url).toBe(
+        `https://world.openfoodfacts.org/api/v2/search?${SEARCH_FIELDS_PARAM}&categories_tags=en%3Abreakfast-cereals&labels_tags=en%3Aorganic%2Cen%3Afair-trade&allergens_tags=en%3Anuts%2C-en%3Agluten&traces_tags=en%3Amilk%2C-en%3Apeanuts&ingredients_analysis_tags=en%3Avegan&additives_tags=en%3Ae330&nutrition_grades_tags=a%7Cb&nova_groups_tags=3&environmental_score_tags=a-plus%7Ca&countries_tags=en%3Afrance&sort_by=popularity_key&page=3&page_size=25`,
+      );
+    });
+
+    it('refuses a text page past the 10,000-result window through the tool with nothing sent', async () => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+      global.fetch = vi.fn();
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 101,
+        page_size: 100,
+      });
+
+      expect(global.fetch).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: McpErrorish & { data?: { result_window?: number } };
+      };
+      expect(error.data).toMatchObject({ reason: 'page_out_of_range', result_window: 10_000 });
     });
   });
 
@@ -3546,7 +3875,7 @@ describe('OpenFoodFactsService', () => {
       });
     }
 
-    it('quotes the canonical value for a brand, a country synonym, a singular, and a case variant', async () => {
+    it('sends a brand under its keys, and quotes the canonical value for a country synonym, a singular, and a case variant', async () => {
       routeFetch({
         country: [
           { id: 'en:united-states', text: 'US' },
@@ -3570,11 +3899,11 @@ describe('OpenFoodFactsService', () => {
 
       const searchCall = requestLog().indexOf('/search');
       const q = sentQ(searchCall);
-      expect(q).toContain('brands_tags:"nutella"');
-      expect(q).toContain('countries_tags:"en:united-states"');
-      expect(q).toContain('allergens_tags:"en:peanuts"');
-      expect(q).toContain('labels_tags:"en:organic"');
-      // The brand is slugged locally and the label resolves from the offline sample; only the two
+      expect(q).toContain('brands:("xx:Nutella" OR "nutella" OR "xx:nutella")');
+      expect(q).toContain('countries:"en:united-states"');
+      expect(q).toContain('allergens:"en:peanuts"');
+      expect(q).toContain('labels:"en:organic"');
+      // The brand is keyed locally and the label resolves from the offline sample; only the two
       // values the sample cannot confirm cost a live lookup.
       expect(requestLog().sort()).toEqual(
         ['/search', 'autocomplete:allergen:peanut', 'autocomplete:country:US'].sort(),
@@ -3582,14 +3911,23 @@ describe('OpenFoodFactsService', () => {
     });
 
     it.each([
-      // The text index holds this brand's 29 matches under `όλυμπος` and none under `όλυμποσ`, and
-      // answers the OR group with the 29 (live 2026-11-24).
-      ['ΌΛΥΜΠΟΣ', 'brands_tags:("όλυμποσ" OR "όλυμπος") γιαούρτι'],
-      ['ΟΛΥΜΠΟΣ', 'brands_tags:("ολυμποσ" OR "ολυμπος") γιαούρτι'],
-      ['Όλυμπος', 'brands_tags:"όλυμπος" γιαούρτι'],
-      ['Nestlé', 'brands_tags:"nestle" γιαούρτι'],
+      // Live 2026-11-24 the text index holds Όλυμπος under `όλυμπος` (10) and none under
+      // `όλυμποσ`, and under the typed `xx:ΌΛΥΜΠΟΣ` or `xx:Όλυμπος` (36).
+      [
+        'ΌΛΥΜΠΟΣ',
+        'brands:("xx:ΌΛΥΜΠΟΣ" OR "όλυμποσ" OR "xx:όλυμποσ" OR "όλυμπος" OR "xx:όλυμπος") γιαούρτι',
+      ],
+      [
+        'ΟΛΥΜΠΟΣ',
+        'brands:("xx:ΟΛΥΜΠΟΣ" OR "ολυμποσ" OR "xx:ολυμποσ" OR "ολυμπος" OR "xx:ολυμπος") γιαούρτι',
+      ],
+      [
+        'Όλυμπος',
+        'brands:("xx:Όλυμπος" OR "όλυμποσ" OR "xx:όλυμποσ" OR "όλυμπος" OR "xx:όλυμπος") γιαούρτι',
+      ],
+      ['Nestlé', 'brands:("xx:Nestlé" OR "nestle" OR "xx:nestle") γιαούρτι'],
     ])(
-      'sends brand %j to the text index under every slug it can be stored under',
+      'sends brand %j to the text index under every spelling it can be stored under',
       async (brand, q) => {
         routeFetch({});
 
@@ -3616,11 +3954,12 @@ describe('OpenFoodFactsService', () => {
       );
 
       expect(result.total).toBe(0);
-      expect(sentQ(requestLog().indexOf('/search'))).toContain('countries_tags:"en:never-land"');
+      expect(sentQ(requestLog().indexOf('/search'))).toContain('countries:"en:never-land"');
     });
 
-    it('leaves the tag-only request byte-identical and makes no lookup', async () => {
-      // Characterization: Product Opener canonicalizes tag parameters itself.
+    it('makes no lookup on the tag-only path, sending a taxonomy value as given and a brand as given beside its key', async () => {
+      // Characterization: Product Opener canonicalizes tag parameters itself. A brand also goes
+      // under its key as an exact stored tag (#98), which reaches its slugged records.
       global.fetch = vi
         .fn()
         .mockResolvedValue(
@@ -3635,7 +3974,7 @@ describe('OpenFoodFactsService', () => {
       expect(global.fetch).toHaveBeenCalledOnce();
       const url = new URL(sentRequest().url);
       expect(url.pathname).toBe('/api/v2/search');
-      expect(url.searchParams.get('brands_tags')).toBe('Nutella');
+      expect(url.searchParams.get('brands_tags')).toBe('Nutella|xx:nutella!');
       expect(url.searchParams.get('countries_tags')).toBe('US');
     });
   });
@@ -3708,7 +4047,7 @@ describe('OpenFoodFactsService', () => {
       );
     });
 
-    it('orders inclusions, then exclusions, then nutrients, groups, and words on the text path', async () => {
+    it('orders inclusions, then exclusions, then nutrients and words on the text path', async () => {
       const q = await textQFor({
         query: 'milk chocolate',
         countries_tag: 'en:mongolia',
@@ -3722,17 +4061,13 @@ describe('OpenFoodFactsService', () => {
       });
 
       expect(q).toBe(
-        'labels_tags:"en:organic" labels_tags:"en:fair-trade" allergens_tags:"en:nuts" ' +
-          'traces_tags:"en:milk" ingredients_analysis_tags:"en:vegan" countries_tags:"en:mongolia" ' +
-          '-allergens_tags:"en:gluten" -allergens_tags:"en:eggs" -traces_tags:"en:peanuts" ' +
-          `nutriments.sugars_100g:{* TO 50} ${wordGroup('milk')} ${wordGroup('chocolate')} milk chocolate`,
+        'labels:"en:organic" labels:"en:fair-trade" allergens:"en:nuts" traces:"en:milk" ingredients_analysis_tags:"en:vegan" countries:"en:mongolia" -allergens:"en:gluten" -allergens:"en:eggs" -traces:"en:peanuts" nutriments.sugars_100g:{* TO 50} milk chocolate',
       );
     });
 
     it('sends a single-string labels_tag on the text path as one clause', async () => {
-      // Characterization: unchanged from before labels_tag took an array.
       await expect(textQFor({ query: 'chocolate', labels_tag: 'en:organic' })).resolves.toBe(
-        'labels_tags:"en:organic" chocolate',
+        'labels:"en:organic" chocolate',
       );
     });
 
@@ -3843,7 +4178,7 @@ describe('OpenFoodFactsService', () => {
           createMockContext({ errors: offSearchProductsTool.errors }),
         );
         expect(requestLog()).toEqual(['/search']);
-        expect(sentQ()).toBe('-allergens_tags:"en:milk" chocolate');
+        expect(sentQ()).toBe('-allergens:"en:milk" chocolate');
       });
 
       it('resolves trace values against the allergen vocabulary', async () => {
@@ -3861,7 +4196,7 @@ describe('OpenFoodFactsService', () => {
         );
 
         expect(requestLog()).toEqual(['autocomplete:allergen:peanut', '/search']);
-        expect(sentQ(1)).toBe('traces_tags:"en:peanuts" -traces_tags:"en:milk" butter');
+        expect(sentQ(1)).toBe('traces:"en:peanuts" -traces:"en:milk" butter');
       });
 
       it('accepts a singular exclusion whose plural is the tag (live response for "nut")', async () => {
@@ -3893,7 +4228,7 @@ describe('OpenFoodFactsService', () => {
         );
 
         expect(requestLog()).toEqual(['autocomplete:allergen:peanut', '/search']);
-        expect(sentQ(1)).toBe('traces_tags:"en:peanuts" -allergens_tags:"en:peanuts" butter');
+        expect(sentQ(1)).toBe('traces:"en:peanuts" -allergens:"en:peanuts" butter');
       });
 
       it('passes tag-path inclusions through untouched, labels array included', async () => {
@@ -4023,7 +4358,7 @@ describe('OpenFoodFactsService', () => {
             '/search',
           ]);
           expect(sentQ(2)).toBe(
-            'categories_tags:"en:breakfast-cereals" ingredients_tags:"en:inulin" ingredients_tags:"en:oat" nutriscore_grade:(a OR b)',
+            'categories:"en:breakfast-cereals" ingredients_tags:"en:inulin" ingredients_tags:"en:oat" nutriscore_grade:(a OR b)',
           );
         });
 
@@ -4075,8 +4410,7 @@ describe('OpenFoodFactsService', () => {
       return (result.content ?? []).map((block) => block.text ?? '').join('\n');
     }
 
-    it('leaves a search without nutrient filters exactly as it was, even when hits carry nutriments', async () => {
-      // Characterization: the request body and the rows a query-only search produced before #58.
+    it('asks no nutrient map on a search without nutrient filters, even when hits carry nutriments', async () => {
       global.fetch = vi
         .fn()
         .mockResolvedValue(
@@ -4088,9 +4422,9 @@ describe('OpenFoodFactsService', () => {
       expect(callsBesideProbe()).toHaveLength(1);
       expect(JSON.stringify(sentRequest().body)).toBe(
         JSON.stringify({
-          q: `${wordGroup('dark')} ${wordGroup('chocolate')} dark chocolate`,
-          langs: [...UPSTREAM_TEXT_LANGS],
-          fields: SEARCH_FIELD_LIST,
+          q: 'dark chocolate',
+          langs: TEXT_LANGS,
+          fields: TEXT_FIELD_LIST,
           page: 1,
           page_size: 20,
         }),
@@ -4135,7 +4469,7 @@ describe('OpenFoodFactsService', () => {
       });
 
       expect(callsBesideProbe()).toHaveLength(1);
-      expect(sentRequest().body?.fields).toEqual([...SEARCH_FIELD_LIST, 'nutriments']);
+      expect(sentRequest().body?.fields).toEqual([...TEXT_FIELD_LIST, 'nutriments']);
     });
 
     it('carries exactly the constrained keys each hit holds, omitting the rest, on both surfaces', async () => {
@@ -4258,7 +4592,7 @@ describe('OpenFoodFactsService', () => {
         notice?: string;
       };
       const sentence =
-        'The nutrient constraints (sugars < 8, proteins >= 5) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.';
+        "The nutrient constraints (sugars < 8, proteins >= 5) were compared as given against this index's values, shown on each row as indexed_nutriments, so they reach only products whose index entry carries each constrained nutrient, which many entries do not; off_get_product returns the current record, whose values can differ.";
       expect(structured.text_index_snapshot).toContain(sentence);
       expect(allText(result)).toContain(sentence);
       expect(structured.notice ?? '').not.toContain('indexed_nutriments');
@@ -4350,8 +4684,12 @@ describe('OpenFoodFactsService', () => {
       expect(global.fetch).not.toHaveBeenCalled();
     });
 
-    describe('rows outside the constraints, through the tool (#64)', () => {
-      /** Hits from one live capture, as `[code, sugars_100g]`. */
+    describe('every row of a constrained search, through the tool (#64, #101)', () => {
+      /**
+       * Hits from one live capture, as `[code, sugars_100g]`. The captures predate search-a-licious
+       * 2.x, whose 1.x index compared sugars as whole numbers and so returned rows a decimal bound
+       * excludes; the server keeps every row the index returns, so they stay on the page here.
+       */
       function sugarHits(rows: readonly (readonly [string, number])[]): Record<string, unknown>[] {
         return rows.map(([code, sugars_100g]) => ({ code, nutriments: { sugars_100g } }));
       }
@@ -4422,7 +4760,6 @@ describe('OpenFoodFactsService', () => {
         last_page?: number;
         page_count: number;
         omitted?: number;
-        outside_constraints?: number;
         products: { barcode: string; indexed_nutriments?: { sugars_100g?: number } }[];
         notice?: string;
         text_index_snapshot?: string;
@@ -4434,7 +4771,7 @@ describe('OpenFoodFactsService', () => {
         return output.products.map((row) => row.indexed_nutriments?.sugars_100g);
       }
 
-      it('filed repro 3: no row above 3, the rows at exactly 3 kept, and the rest counted', async () => {
+      it('lists every row the index returned, with the backend’s count, on both surfaces', async () => {
         global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits(YOGURT_LTE_3), 5126));
 
         const result = await runToolContract(offSearchProductsTool, {
@@ -4445,25 +4782,26 @@ describe('OpenFoodFactsService', () => {
 
         expect(result.isError).toBeFalsy();
         const output = result.structuredContent as SearchOutput;
-        expect(listedSugars(output).every((value) => value !== undefined && value <= 3)).toBe(true);
         expect(output.products.map((row) => row.barcode)).toEqual(
-          expect.arrayContaining(['5201054015124', '5201054015452', '5201054016503']),
+          YOGURT_LTE_3.map(([code]) => code),
         );
-        expect(output.products.map((row) => row.barcode)).not.toContain('0894700010137');
         expect(output).toMatchObject({
           total: 5126,
           total_is_lower_bound: false,
           last_page: 171,
-          page_count: 13,
-          outside_constraints: 17,
+          page_count: 30,
         });
+        expect(output).not.toHaveProperty('outside_constraints');
         expect(output).not.toHaveProperty('omitted');
-        expect(allText(result)).toContain('17 rows on this page were left off');
-        // The row keeps the value the index holds, unrounded.
-        expect(allText(result)).toContain('sugars_100g 2.86 g');
+        const text = allText(result);
+        expect(text).not.toMatch(/left off|whole-number|outside_constraints/);
+        expect(text).toContain('**5126 total products**');
+        // Each row keeps the value the index holds, unrounded.
+        expect(text).toContain('sugars_100g 2.86 g');
+        expect(text).toContain('sugars_100g 3.53 g');
       });
 
-      it('filed repro 2: a band the old clause emptied now returns its rows', async () => {
+      it('sends a decimal range pair as its two bounds and lists the band the index returned', async () => {
         global.fetch = vi.fn().mockResolvedValue(clippedBand(1, sugarHits(SUGARS_3_TO_4)));
 
         const result = await runToolContract(offSearchProductsTool, {
@@ -4474,69 +4812,26 @@ describe('OpenFoodFactsService', () => {
           page_size: 10,
         });
 
-        expect(sentQ()).toBe('nutriments.sugars_100g:[3 TO *] nutriments.sugars_100g:[* TO 3.9]');
+        expect(sentQ()).toBe('nutriments.sugars_100g:[3.5 TO *] nutriments.sugars_100g:[* TO 3.9]');
         const output = result.structuredContent as SearchOutput;
-        expect(listedSugars(output)).toEqual([3.7, 3.6, 3.9, 3.9, 3.9, 3.5]);
-        expect(output).toMatchObject({ total: 10_000, outside_constraints: 4 });
-        expect(allText(result)).not.toContain('At least 10000 products match');
+        expect(listedSugars(output)).toEqual(SUGARS_3_TO_4.map(([, sugars]) => sugars));
+        expect(output).toMatchObject({ total: 10_000, total_is_lower_bound: true, page_count: 10 });
+        expect(output).not.toHaveProperty('outside_constraints');
+        expect(allText(result)).toContain('At least 10000 products match');
       });
 
-      it('sugars gt 3 returns the 3.x rows above 3 and none at or below it', async () => {
+      it('sends sugars gt 3 as an open range above 3, not widened to [3 TO *]', async () => {
         global.fetch = vi.fn().mockResolvedValue(clippedBand(1, sugarHits(SUGARS_3_TO_4)));
 
-        const result = await runToolContract(offSearchProductsTool, {
+        await runToolContract(offSearchProductsTool, {
           nutrient_filters: [{ nutrient: 'sugars', operator: 'gt', value: 3 }],
           page_size: 10,
         });
 
-        expect(sentQ()).toBe('nutriments.sugars_100g:[3 TO *]');
-        expect(listedSugars(result.structuredContent as SearchOutput)).toEqual([
-          3.7, 3.6, 3.1, 3.9, 3.9, 3.9, 3.2, 3.4, 3.5,
-        ]);
+        expect(sentQ()).toBe('nutriments.sugars_100g:{3 TO *}');
       });
 
-      it('agrees on outside_constraints across both surfaces on a partly failing page', async () => {
-        global.fetch = vi.fn().mockResolvedValue(
-          textHits(
-            sugarHits([
-              ['3338310018864', 3.7],
-              ['3171939907825', 3],
-            ]),
-            40,
-          ),
-        );
-
-        const result = await runToolContract(offSearchProductsTool, {
-          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
-        });
-
-        const output = result.structuredContent as SearchOutput;
-        expect(output.outside_constraints).toBe(1);
-        expect(allText(result)).toContain('1 row on this page was left off');
-        expect(listedSugars(output)).toEqual([3]);
-      });
-
-      it('agrees on outside_constraints across both surfaces on an all-fail page', async () => {
-        global.fetch = vi.fn().mockResolvedValue(clippedBand(1, sugarHits(SUGARS_3_TO_4)));
-
-        const result = await runToolContract(offSearchProductsTool, {
-          nutrient_filters: [
-            { nutrient: 'sugars', operator: 'gt', value: 3.9 },
-            { nutrient: 'sugars', operator: 'lt', value: 4 },
-          ],
-          page_size: 10,
-        });
-
-        const output = result.structuredContent as SearchOutput;
-        expect(output).toMatchObject({ products: [], page_count: 0, outside_constraints: 10 });
-        const text = allText(result);
-        expect(text).toContain('**Page 1 lists no products**');
-        expect(text).toContain('10 rows on this page were left off');
-        expect(output.notice).toContain('Request page 2');
-        expect(text).not.toMatch(/No products found|past the end/);
-      });
-
-      it('pages contiguously past a page that lost rows, keeping offset and total', async () => {
+      it('pages contiguously, each page holding the rows the index returned for it', async () => {
         const page = (number: number, rows: readonly (readonly [string, number])[]) =>
           mockResponse({
             count: 40,
@@ -4573,15 +4868,16 @@ describe('OpenFoodFactsService', () => {
         expect([sentRequest(0).body?.page_size, sentRequest(1).body?.page_size]).toEqual([20, 20]);
         const outputs = [first, second].map(({ structuredContent }) => structuredContent);
         expect(outputs).toMatchObject([
-          { total: 40, last_page: 2, outside_constraints: 1, truncated: true },
-          { total: 40, last_page: 2, outside_constraints: 1 },
+          { total: 40, last_page: 2, page_count: 2, truncated: true },
+          { total: 40, last_page: 2, page_count: 2 },
         ]);
+        for (const output of outputs) expect(output).not.toHaveProperty('outside_constraints');
         expect(outputs[1]).not.toHaveProperty('truncated');
-        expect(listedSugars(outputs[0] as SearchOutput)).toEqual([3]);
-        expect(listedSugars(outputs[1] as SearchOutput)).toEqual([2]);
+        expect(listedSugars(outputs[0] as SearchOutput)).toEqual([3.7, 3]);
+        expect(listedSugars(outputs[1] as SearchOutput)).toEqual([2, 3.1]);
       });
 
-      it('fills a capped 100-row page from an over-cap page_size, then reports what it lost', async () => {
+      it('fills a capped 100-row page from an over-cap page_size with every row returned', async () => {
         const hits = Array.from({ length: 100 }, (_, i) => ({
           code: String(3_017_620_422_003 + i),
           nutriments: { sugars_100g: i % 2 === 0 ? 2 : 3.5 },
@@ -4596,17 +4892,13 @@ describe('OpenFoodFactsService', () => {
         expect(sentRequest().body?.page_size).toBe(100);
         expect(result.structuredContent).toMatchObject({
           page_size: 100,
-          page_count: 50,
-          outside_constraints: 50,
+          page_count: 100,
           last_page: 19,
-          truncated: true,
-          shown: 50,
-          cap: 100,
         });
+        expect(result.structuredContent).not.toHaveProperty('outside_constraints');
         expect((result.structuredContent as { page_size_capped?: string }).page_size_capped).toBe(
           'page_size 150 is above the 100 results one call returns; this page was served at page_size 100. Pages are counted at that size: request page 2 for results 101–200.',
         );
-        expect(allText(result)).toContain('showing 50)');
       });
 
       it('sends page 100 at page_size 100 to the text backend, the last page inside its window', async () => {
@@ -4623,117 +4915,31 @@ describe('OpenFoodFactsService', () => {
         expect(result.structuredContent).not.toHaveProperty('page_size_capped');
       });
 
-      it('adds neither the field nor its line on a clean constrained page', async () => {
-        global.fetch = vi.fn().mockResolvedValue(
-          textHits(
-            sugarHits([
-              ['3338310018864', 2.7],
-              ['3171939907825', 3],
-            ]),
-            2,
-          ),
-        );
-
-        const result = await runToolContract(offSearchProductsTool, {
-          nutrient_filters: [{ nutrient: 'sugars', operator: 'lte', value: 3 }],
-        });
-
-        const output = result.structuredContent as SearchOutput;
-        expect(output).not.toHaveProperty('outside_constraints');
-        expect(listedSugars(output)).toEqual([2.7, 3]);
-        const text = allText(result);
-        expect(text).not.toMatch(/on this page (was|were) left off/);
-        expect(text).toContain('**2 whole-number matches**');
-        expect(text).not.toContain('total products');
-      });
-
-      /** A clipped page of one row at 2, under `nutrient`'s upstream key. */
-      function cleanClippedPage(nutrient: string): Response {
-        return clippedBand(1, [{ code: '3338310018864', nutriments: { [`${nutrient}_100g`]: 2 } }]);
-      }
-
-      it.each(['energy-kcal', 'fat', 'saturated-fat', 'carbohydrates', 'sugars'] as const)(
-        'reads a clean page constrained on %s as the whole-number answer',
+      it.each(NUTRIENT_FIELDS)(
+        'reads a clipped page constrained on %s as the product count, never a whole-number answer',
         async (nutrient) => {
-          global.fetch = vi.fn().mockResolvedValue(cleanClippedPage(nutrient));
+          global.fetch = vi
+            .fn()
+            .mockResolvedValue(
+              clippedBand(1, [
+                { code: '3338310018864', nutriments: { [`${nutrient}_100g`]: 2.5 } },
+              ]),
+            );
 
           const result = await runToolContract(offSearchProductsTool, {
             nutrient_filters: [{ nutrient, operator: 'lte', value: 3 }],
           });
 
-          expect(result.structuredContent).not.toHaveProperty('outside_constraints');
-          const text = allText(result);
-          expect(text).toContain('**10000+ whole-number matches**');
-          expect(text).toContain(
-            '*Open Food Facts stops counting its whole-number answer at 10000',
-          );
-          expect(text).not.toContain('At least 10000 products match');
-        },
-      );
-
-      it.each(['fiber', 'proteins', 'salt', 'sodium'] as const)(
-        'keeps the product count on a clean page constrained only on %s',
-        async (nutrient) => {
-          global.fetch = vi.fn().mockResolvedValue(cleanClippedPage(nutrient));
-
-          const result = await runToolContract(offSearchProductsTool, {
-            nutrient_filters: [{ nutrient, operator: 'lte', value: 3 }],
-          });
-
+          const output = result.structuredContent as SearchOutput;
+          expect(output).not.toHaveProperty('outside_constraints');
           const text = allText(result);
           expect(text).toContain('**10000+ total products**');
           expect(text).toContain('*At least 10000 products match');
-          expect(text).not.toContain('whole-number');
+          expect(`${text} ${output.text_index_snapshot}`).not.toMatch(/whole[- ]number/);
         },
       );
 
-      it('reads a page constrained on both kinds of nutrient as the whole-number answer', async () => {
-        global.fetch = vi
-          .fn()
-          .mockResolvedValue(
-            textHits(
-              [{ code: '3338310018864', nutriments: { salt_100g: 0.1, sugars_100g: 2 } }],
-              7,
-            ),
-          );
-
-        const result = await runToolContract(offSearchProductsTool, {
-          nutrient_filters: [
-            { nutrient: 'salt', operator: 'lte', value: 1 },
-            { nutrient: 'sugars', operator: 'lte', value: 3 },
-          ],
-        });
-
-        expect(allText(result)).toContain('**7 whole-number matches**');
-      });
-
-      it('keeps the product count on an unconstrained page', async () => {
-        global.fetch = vi.fn().mockResolvedValue(textHits([{ code: '3338310018864' }], 7));
-
-        const result = await runToolContract(offSearchProductsTool, { query: 'yogurt' });
-
-        const text = allText(result);
-        expect(text).toContain('**7 total products**');
-        expect(text).not.toContain('whole-number');
-      });
-
-      it('states what the totals describe in the snapshot note, naming the nutrients once', async () => {
-        global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits(SUGARS_3_TO_4), 40));
-
-        const result = await runToolContract(offSearchProductsTool, {
-          nutrient_filters: [
-            { nutrient: 'sugars', operator: 'gte', value: 3.5 },
-            { nutrient: 'sugars', operator: 'lte', value: 3.9 },
-          ],
-        });
-
-        const sentence =
-          'The index compares sugars as whole numbers, so total, total_is_lower_bound, and last_page describe its whole-number answer, and rows of that answer outside these constraints are left off each page and counted in outside_constraints.';
-        expect((result.structuredContent as SearchOutput).text_index_snapshot).toContain(sentence);
-        expect(allText(result)).toContain(sentence);
-      });
-
-      it('names each whole-number nutrient in the snapshot note, and skips the float ones', async () => {
+      it('names no whole numbers and no outside_constraints in the snapshot note', async () => {
         global.fetch = vi.fn().mockResolvedValue(textHits([], 0));
 
         const result = await runToolContract(offSearchProductsTool, {
@@ -4744,33 +4950,23 @@ describe('OpenFoodFactsService', () => {
           ],
         });
 
-        expect((result.structuredContent as SearchOutput).text_index_snapshot).toContain(
-          'The index compares fat, sugars as whole numbers,',
-        );
+        const output = result.structuredContent as SearchOutput;
+        expect(output.text_index_snapshot).toContain('(fat >= 1, sugars < 8, fiber >= 6)');
+        for (const surface of [String(output.text_index_snapshot), allText(result)]) {
+          expect(surface).not.toMatch(/whole[- ]number|outside_constraints|left off/);
+        }
       });
 
-      it('says nothing of whole numbers on a search constraining only float nutrients', async () => {
-        global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits([['3338310018864', 7]]), 1));
-
-        const result = await runToolContract(offSearchProductsTool, {
-          nutrient_filters: [{ nutrient: 'fiber', operator: 'gte', value: 6 }],
-        });
-
-        expect((result.structuredContent as SearchOutput).text_index_snapshot).not.toContain(
-          'whole numbers',
-        );
-      });
-
-      it('sends what it always sent, and adds nothing, on a search without nutrient filters', async () => {
+      it('asks no nutrient map, and adds nothing, on a search without nutrient filters', async () => {
         global.fetch = vi.fn().mockResolvedValue(textHits(sugarHits(SUGARS_3_TO_4), 10));
 
         const result = await runToolContract(offSearchProductsTool, { query: 'skyr' });
 
         const output = result.structuredContent as SearchOutput;
-        expect(sentRequest().body?.fields).toEqual(SEARCH_FIELD_LIST);
+        expect(sentRequest().body?.fields).toEqual(TEXT_FIELD_LIST);
         expect(output.products).toHaveLength(10);
         expect(output).not.toHaveProperty('outside_constraints');
-        expect(output.text_index_snapshot).not.toContain('whole numbers');
+        expect(output.text_index_snapshot).not.toMatch(/whole[- ]number|nutrient constraints/);
       });
     });
   });
@@ -6632,8 +6828,11 @@ describe('OpenFoodFactsService', () => {
 
     const LIVE_SOURCE = '**Source:** off_api (Open Food Facts)';
     const MIRROR_LABEL = `off_mirror (this server's local copy of the Open Food Facts export, as of ${AS_OF})`;
-    const PRODUCT_NOTE = `This product comes from this server's local copy of the Open Food Facts export, current as of ${AS_OF}, not the live database, so an edit made to it since then is not reflected.`;
-    const ROWS_NOTE = `The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, current as of ${AS_OF}, not the live database, so an edit made to them since then is not reflected.`;
+    /** What the mirror notes say of values Open Food Facts computes and of removed products. */
+    const COMPUTED_LAG =
+      "computed values (Nutri-Score, NOVA group, Green-Score, nutrient levels, estimated nutrients, parsed ingredients and their analysis, additives, allergens and traces, completeness, data-quality tags) are as of the record's last edit or the copy's last full reload (about every 30 days), whichever is later; and a product removed since that reload can still be shown.";
+    const PRODUCT_NOTE = `This product comes from this server's local copy of the Open Food Facts export, not the live database: the copy reflects contributor edits through ${AS_OF}, so a later one is not; ${COMPUTED_LAG}`;
+    const ROWS_NOTE = `The rows whose source is off_mirror come from this server's local copy of the Open Food Facts export, not the live database: the copy reflects contributor edits through ${AS_OF}, so a later one is not; ${COMPUTED_LAG}`;
 
     /** Where an off_get_product answer read live, and then from the mirror, says it was read. */
     const PRODUCT_PROVENANCE = {
@@ -6804,16 +7003,18 @@ describe('OpenFoodFactsService', () => {
             const result = await runToolContract(offGetProductTool, { barcode: OATS });
 
             expect(synced).toBe(true);
+            const throughCited = `the copy reflects contributor edits through ${cited}, so a later one is not;`;
             expect(result.structuredContent).toMatchObject({
               product: { product_name: 'Synced oats' },
               source: 'off_mirror',
               mirror_as_of: cited,
+              mirror_snapshot: expect.stringContaining(throughCited),
             });
             const text = JSON.stringify(result.content);
             expect(text).toContain(
               `**Source:** off_mirror (this server's local copy of the Open Food Facts export, as of ${cited})`,
             );
-            expect(text).toContain(`current as of ${cited}, not the live database`);
+            expect(text).toContain(throughCited);
           } finally {
             spy.mockRestore();
             await writer.close();
@@ -7344,6 +7545,59 @@ describe('OpenFoodFactsService', () => {
         expect(none).toMatchObject({ count: 0, count_is_exact: true, page: 1, products: [] });
       });
 
+      it('asks the store the tag search 0.4.5 asked it, every tag-path filter set (#101)', async () => {
+        vi.mocked(searchByTags).mockClear();
+
+        const outcome = served(
+          await svc.searchProducts(
+            {
+              categories_tag: 'en:breakfast-cereals',
+              labels_tag: ['en:organic', 'en:fair-trade'],
+              allergens_tag: 'en:nuts',
+              traces_tag: 'en:milk',
+              ingredients_analysis_tag: 'en:vegan',
+              additives_tag: 'en:e330',
+              nutrition_grade: ['a', 'b'],
+              nova_group: '3',
+              countries_tag: 'en:france',
+              exclude_allergens: ['en:gluten'],
+              exclude_traces: ['en:peanuts'],
+              sort_by: 'popularity_key',
+              page: 2,
+              page_size: 5,
+              tags_confirmed: true,
+            },
+            createMockContext(),
+          ),
+        );
+
+        expect(outcome.source).toBe('off_mirror');
+        expect(global.fetch).not.toHaveBeenCalled();
+        expect(vi.mocked(searchByTags).mock.calls.map(([, search]) => search)).toEqual([
+          {
+            include: [
+              { facet: 'categories', value: 'en:breakfast-cereals' },
+              { facet: 'labels', value: 'en:organic' },
+              { facet: 'labels', value: 'en:fair-trade' },
+              { facet: 'allergens', value: 'en:nuts' },
+              { facet: 'traces', value: 'en:milk' },
+              { facet: 'ingredients_analysis', value: 'en:vegan' },
+              { facet: 'additives', value: 'en:e330' },
+              { facet: 'nutrition_grades', value: ['a', 'b'] },
+              { facet: 'nova_groups', value: '3' },
+              { facet: 'countries', value: 'en:france' },
+            ],
+            exclude: [
+              { facet: 'allergens', value: 'en:gluten' },
+              { facet: 'traces', value: 'en:peanuts' },
+            ],
+            page: 2,
+            pageSize: 5,
+            sortBy: 'popularity_key',
+          },
+        ]);
+      });
+
       describe('the result window', () => {
         beforeEach(() => {
           vi.mocked(searchByTags).mockClear();
@@ -7429,19 +7683,21 @@ describe('OpenFoodFactsService', () => {
         expect(global.fetch).not.toHaveBeenCalled();
       });
 
-      it('finds a brand by the value off_search_products canonicalizes "Nutella" to', async () => {
-        initTaxonomyService();
-        const brand = await getTaxonomyService().canonicalizeTag(
-          'brands',
-          'Nutella',
-          createMockContext(),
-        );
+      it('finds a brand under the keys off_search_products sends for "Nutella", once a full load keyed brands', async () => {
+        await writeMirror(CORPUS, {
+          sql: [
+            `INSERT INTO mirror_load(id, generation, loaded_at, record_version) VALUES (1, 1, '2026-11-01T06:00:00.000Z', ${BRAND_KEY_RECORD_VERSION})`,
+          ],
+        });
+        const ctx = createMockContext();
+        const keys = await svc.mirrorHeldBrand(brandKeys('Nutella'), ctx);
 
         const outcome = await svc.searchProducts(
-          { brands_tag: brand.value, tags_confirmed: true },
-          createMockContext(),
+          { brands_tag: keys ?? [], tags_confirmed: true },
+          ctx,
         );
 
+        expect(keys).toEqual(['nutella']);
         expect(codes(outcome)).toEqual(['30000001', '20000011', '20000012']);
       });
     });
@@ -8120,7 +8376,7 @@ describe('OpenFoodFactsService', () => {
             expect(requests).toEqual([`/api/v2/product/${OATS}.json`]);
             const { product, ...rest } = result.structuredContent as Degraded;
             expect(product).toEqual(stored);
-            const note = `${VERSION_1_UNREAD} found no product under this barcode, which Open Food Facts may have removed since ${AS_OF}.`;
+            const note = `${VERSION_1_UNREAD} found no product under this barcode, which Open Food Facts may have removed at any time since the copy's last full reload (about every 30 days): only a full reload brings a removal, so the copy's edits through ${AS_OF} do not bound it.`;
             expect(rest).toMatchObject({
               source: 'off_mirror',
               mirror_as_of: AS_OF,
@@ -8286,7 +8542,7 @@ describe('OpenFoodFactsService', () => {
           [
             'HTTP 404',
             async () => mockResponse(PRODUCT_NOT_FOUND_404, 404),
-            `${VERSION_2_UNREAD} found no product under this barcode, which Open Food Facts may have removed since ${AS_OF}.`,
+            `${VERSION_2_UNREAD} found no product under this barcode, which Open Food Facts may have removed at any time since the copy's last full reload (about every 30 days): only a full reload brings a removal, so the copy's edits through ${AS_OF} do not bound it.`,
           ],
         ])(
           'answers from the row, the six fields named unread, when the live read answers %s',
@@ -8462,7 +8718,7 @@ describe('OpenFoodFactsService', () => {
       });
     });
 
-    describe('the brand check (#94)', () => {
+    describe('the brand check and the brand-key gate (#94, #98)', () => {
       /** A synthetic schema 1004 export line of one product stored under `brandTag`. */
       const branded = (code: string, brandTag: string): Line => ({
         code,
@@ -8471,19 +8727,212 @@ describe('OpenFoodFactsService', () => {
         product_name: `Product ${code}`,
         brands_tags: [brandTag],
       });
-      const BRANDS: Line[] = [branded('90000001', 'xx:nestle'), branded('90000002', 'xx:café-bar')];
+      /**
+       * One brand under its typed and slugged spellings (90000003–5), a synonym held only under
+       * one of its group's keys (90000006), a group held under all three (90000007–9), and a brand
+       * beside the synonym it shares an entry with (90000010–11).
+       */
+      const BRANDS: Line[] = [
+        branded('90000001', 'xx:nestle'),
+        branded('90000002', 'xx:café-bar'),
+        branded('90000003', 'xx:Красный Октябрь'),
+        branded('90000004', 'xx:красный-октябрь'),
+        branded('90000005', 'xx:Красный октябрь'),
+        branded('90000006', 'xx:kellogg-s'),
+        branded('90000007', 'xx:7up'),
+        branded('90000008', 'xx:7-up'),
+        branded('90000009', 'xx:seven-up'),
+        branded('90000010', 'xx:andechser'),
+        branded('90000011', 'xx:andechser-natur'),
+        branded('90000012', 'xx:nutella'),
+      ];
 
-      it.each([
-        ['the folded slug, when held', ['nestle', 'nestlé'], 'nestle'],
-        ['the accent-keeping slug, when only it is held', ['cafe-bar', 'café-bar'], 'café-bar'],
-        ['nothing, when no slug is held', ['kelloggs'], undefined],
-      ])('answers %s, sending nothing and logging nothing', async (_label, slugs, held) => {
-        await writeMirror(BRANDS);
+      /** Records a completed full load built at record version `version`. */
+      const loadAt = (version: number) =>
+        `INSERT INTO mirror_load(id, generation, loaded_at, record_version) VALUES (1, 1, '2026-11-01T06:00:00.000Z', ${version})`;
+      /** A store whose last full load keyed every brand. */
+      const KEYED = { sql: [loadAt(BRAND_KEY_RECORD_VERSION)] };
+      const BEFORE_KEYS = BRAND_KEY_RECORD_VERSION - 1;
+
+      /** The stores whose last completed full load did not key every brand. */
+      const UNKEYED_LOADS: [string, Parameters<typeof writeMirror>[1]][] = [
+        ['no full load recorded', {}],
+        [
+          `a load built at record version ${BEFORE_KEYS}`,
+          { sql: [loadAt(BEFORE_KEYS)], recordVersion: BEFORE_KEYS },
+        ],
+        [
+          `a version-${BEFORE_KEYS} load whose rows a reload has rewritten part-way`,
+          { sql: [loadAt(BEFORE_KEYS)], recordVersion: BRAND_KEY_RECORD_VERSION },
+        ],
+      ];
+
+      /** The keys of `brand` the store holds, as off_search_products asks for them. */
+      const held = (brand: string) => svc.mirrorHeldBrand(brandKeys(brand), createMockContext());
+      const codes = (outcome: SearchOutcome) => served(outcome).products.map((row) => row.code);
+
+      beforeEach(() => {
+        vi.mocked(searchByTags).mockClear();
+      });
+
+      it.each<[string, string, string[] | undefined]>([
+        ['its key, when held', 'Nestlé', ['nestle']],
+        ['the key every spelling of a brand shares', 'КРАСНЫЙ ОКТЯБРЬ', ['красный-октябрь']],
+        ['the accent-folded key the typed spelling keys to', 'Café Bar', ['cafe-bar']],
+        ['the one key of its group it holds, past the first', 'kelloggs', ['kellogg-s']],
+        ['every key of its group it holds', '7 Up', ['7-up', '7up', 'seven-up']],
+        [
+          'nothing, when no key is held, matching no brand by part of its name',
+          'nutell',
+          undefined,
+        ],
+        ['nothing, for a brand that keys to nothing', '™', undefined],
+      ])('answers %s (%j), sending nothing and logging nothing', async (_label, brand, keys) => {
+        await writeMirror(BRANDS, KEYED);
         forbidFetch();
         const ctx = createMockContext();
 
-        await expect(svc.mirrorHeldBrand(slugs, ctx)).resolves.toBe(held);
+        await expect(svc.mirrorHeldBrand(brandKeys(brand), ctx)).resolves.toEqual(keys);
         expect(warnings(ctx)).toEqual([]);
+      });
+
+      it.each<[string, () => Promise<void>, boolean]>([
+        ['no mirror configured', async () => undefined, false],
+        ...UNKEYED_LOADS.map(([label, options]): [string, () => Promise<void>, boolean] => [
+          label,
+          () => writeMirror(BRANDS, options),
+          false,
+        ]),
+        [
+          `a version-${BRAND_KEY_RECORD_VERSION} load on a store not ready to serve`,
+          () => writeMirror(BRANDS, { ...KEYED, firstLoadRunning: true }),
+          false,
+        ],
+        [
+          `a load built at record version ${BRAND_KEY_RECORD_VERSION}`,
+          () => writeMirror(BRANDS, KEYED),
+          true,
+        ],
+      ])('answers mirrorIndexesBrandKeys for %s', async (_label, build, expected) => {
+        await build();
+        forbidFetch();
+
+        await expect(svc.mirrorIndexesBrandKeys(createMockContext())).resolves.toBe(expected);
+      });
+
+      it.each([['Красный Октябрь'], ['красный-октябрь'], ['Красный октябрь'], ['КРАСНЫЙ ОКТЯБРЬ']])(
+        'serves %j with the one total every spelling of the brand shares',
+        async (brand) => {
+          await writeMirror(BRANDS, KEYED);
+          forbidFetch();
+          const keys = await held(brand);
+
+          const outcome = served(
+            await svc.searchProducts(
+              { brands_tag: keys ?? [], tags_confirmed: true },
+              createMockContext(),
+            ),
+          );
+
+          expect(outcome).toMatchObject({ count: 3, count_is_exact: true, source: 'off_mirror' });
+          expect(codes(outcome).sort()).toEqual(['90000003', '90000004', '90000005']);
+        },
+      );
+
+      it.each([['7-Up'], ['7 Up'], ['Seven Up'], ['7up']])(
+        'sends the store the keys 7up, 7-up, and seven-up for %j, and serves one total',
+        async (brand) => {
+          await writeMirror(BRANDS, KEYED);
+          forbidFetch();
+          const keys = await held(brand);
+
+          const outcome = served(
+            await svc.searchProducts(
+              { brands_tag: keys ?? [], tags_confirmed: true },
+              createMockContext(),
+            ),
+          );
+
+          expect([...(keys ?? [])].sort()).toEqual(['7-up', '7up', 'seven-up']);
+          expect(outcome.count).toBe(3);
+          expect(codes(outcome).sort()).toEqual(['90000007', '90000008', '90000009']);
+        },
+      );
+
+      it('serves Andechser as the union with andechser-natur, never fewer than andechser alone', async () => {
+        await writeMirror(BRANDS, KEYED);
+        forbidFetch();
+        const ctx = createMockContext();
+        const search = async (brandsTag: string | string[]) =>
+          served(await svc.searchProducts({ brands_tag: brandsTag, tags_confirmed: true }, ctx));
+
+        const alone = await search('andechser');
+        const union = await search(await held('Andechser').then((keys) => [...(keys ?? [])]));
+
+        expect(alone.count).toBe(1);
+        expect(union.count).toBe(2);
+        expect(codes(union).sort()).toEqual(['90000010', '90000011']);
+      });
+
+      it.each(UNKEYED_LOADS)(
+        'reads a brand search live, running no store search, with %s',
+        async (_label, options) => {
+          await writeMirror(BRANDS, options);
+          global.fetch = vi.fn().mockResolvedValue(mockResponse(TAG_SEARCH_HITS));
+          const ctx = createMockContext();
+
+          const outcome = served(
+            await svc.searchProducts(
+              { brands_tag: ['kellogg-s'], page: 3, tags_confirmed: true },
+              ctx,
+            ),
+          );
+
+          expect(outcome.source).toBe('off_api');
+          expect(searchByTags).not.toHaveBeenCalled();
+          expect(global.fetch).toHaveBeenCalledOnce();
+          expect(new URL(sentRequest().url).pathname).toBe('/api/v2/search');
+          expect(warnings(ctx)).toEqual([]);
+        },
+      );
+
+      it.each(UNKEYED_LOADS)(
+        'refuses a brand page past 10, and past the window, by the live bound with %s',
+        async (_label, options) => {
+          await writeMirror(BRANDS, options);
+          forbidFetch();
+          const ctx = createMockContext();
+
+          for (const paging of [{ page: 11 }, { page: 201, page_size: 50 }]) {
+            await expect(
+              svc.searchProducts({ brands_tag: ['nestle'], ...paging, tags_confirmed: true }, ctx),
+            ).resolves.toEqual({ status: 'page_out_of_range', bound: 'live_max_page' });
+          }
+          expect(searchByTags).not.toHaveBeenCalled();
+          expect(warnings(ctx)).toEqual([]);
+        },
+      );
+
+      it('refuses a brand page past the window by the window once the store keys every brand', async () => {
+        await writeMirror(BRANDS, KEYED);
+        forbidFetch();
+
+        await expect(
+          svc.searchProducts(
+            { brands_tag: ['nestle'], page: 201, page_size: 50, tags_confirmed: true },
+            createMockContext(),
+          ),
+        ).resolves.toEqual({ status: 'page_out_of_range', bound: 'mirror_window' });
+        expect(searchByTags).not.toHaveBeenCalled();
+      });
+
+      it('serves a search without a brand from a store whose last load predates brand keys, as before', async () => {
+        await writeMirror(BRANDS, { sql: [loadAt(BEFORE_KEYS)], recordVersion: BEFORE_KEYS });
+        forbidFetch();
+
+        await expect(
+          svc.searchProducts({ nutrition_grade: 'a', tags_confirmed: true }, createMockContext()),
+        ).resolves.toMatchObject({ status: 'served', source: 'off_mirror' });
       });
 
       it('answers nothing, opening no store, with OFF_MIRROR_PATH unset', async () => {
@@ -8719,7 +9168,7 @@ describe('text index date (#95)', () => {
     const undated = served(await service().searchProducts(TEXT, createMockContext()));
     expect(undated).not.toHaveProperty('textIndexAsOf');
     expect({ ...dated, textIndexAsOf: undefined }).toEqual(undated);
-    expect(dated).toMatchObject({ count: 631, page_count: 2 });
+    expect(dated).toMatchObject({ count: 943, page_count: 2 });
   });
 
   it('reuses the date for a later text search, sending no second probe', async () => {
@@ -8745,7 +9194,7 @@ describe('text index date (#95)', () => {
 
     await vi.advanceTimersByTimeAsync(1);
     expect(call).toMatchObject({ settled: true, afterMs: 3_000 });
-    expect(call.value).toMatchObject({ status: 'served', count: 631 });
+    expect(call.value).toMatchObject({ status: 'served', count: 943 });
     expect(call.value).not.toHaveProperty('textIndexAsOf');
     expect(probes[0]?.signal?.aborted).toBe(true);
   });
@@ -8837,7 +9286,7 @@ describe('text index date (#95)', () => {
     const first = track(svc.searchProducts(TEXT, createMockContext()));
     await vi.advanceTimersByTimeAsync(3_000);
 
-    expect(first.value).toMatchObject({ status: 'served', count: 631, page_count: 2 });
+    expect(first.value).toMatchObject({ status: 'served', count: 943, page_count: 2 });
     expect(first.value).not.toHaveProperty('textIndexAsOf');
     expect(probes).toHaveLength(1);
 
@@ -8920,7 +9369,7 @@ describe('text index date (#95)', () => {
     await vi.advanceTimersByTimeAsync(10_000);
 
     expect(searches).toBe(2);
-    expect(call.value).toMatchObject({ status: 'served', count: 631 });
+    expect(call.value).toMatchObject({ status: 'served', count: 943 });
     expect(call.value).not.toHaveProperty('textIndexAsOf');
     expect(probes).toHaveLength(0);
   });

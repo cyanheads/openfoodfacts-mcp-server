@@ -6,8 +6,8 @@
  * the doc a mirror read returns for the built record (written to a store and read back by
  * `getByCodes`, dates included) and once the live read, and must answer the same on both surfaces;
  * the accepted divergences of pre-1004 records are reconciled by named assertions first. Unit cases
- * pin the record key, the tag index, the projections of single fields, the serving re-parse, and
- * the tag-value mapping the query layer uses.
+ * pin the record key, the tag index (brands by key), the projections of single fields, the serving
+ * re-parse, and the tag-value mapping the query layer uses.
  * @module tests/services/mirror/record-builder.test
  */
 
@@ -503,12 +503,40 @@ describe('buildMirrorRecord against live v2 reads', () => {
     expect(structured(docRun).barcode).toBe('030000010402');
   });
 
-  it('indexes a brand under the stored form live search matches', () => {
-    const { tags } = record(fixture('0008346800025').line);
-    // Live: brands_tags=xx:Slimfast finds 0008346800025, brands_tags=slimfast does not.
-    expect(tags).toContain(mirrorTagKey('brands', toStoredTag('brands', 'xx:Slimfast')));
-    expect(tags).not.toContain(mirrorTagKey('brands', toStoredTag('brands', 'en:slimfast')));
-    expect(tags).toContain('brands:xx:Slimfast');
+  it('indexes a brand typed into a schema 1004 record under its key, never its typed spelling (#98)', () => {
+    const f = fixture('0008346800025');
+    expect(f.line.brands_tags).toEqual(['xx:Slimfast']);
+    const { tags } = record(f.line);
+    expect(tags.filter((key) => key.startsWith('brands:'))).toEqual(['brands:xx:slimfast']);
+    // Every spelling a caller gives keys alike, the typed one and the slug.
+    for (const given of ['xx:Slimfast', 'en:slimfast', 'slimfast', 'SlimFast']) {
+      expect(tags).toContain(mirrorTagKey('brands', toStoredTag('brands', given)));
+    }
+  });
+
+  it.each<[string, string[]]>([
+    ['0075779920002', ['brands:xx:florida-crystals']],
+    ['0009800007639', ['brands:xx:tic-tac', 'brands:xx:ferrero']],
+    ['0008017310112', ['brands:xx:morita']],
+    ['7613035530799', ['brands:xx:societe-des-produits-nestle-s-a']],
+    ['0008295661098', ['brands:xx:de-nigris']],
+    // A record saved before brands carried a prefix: its bare slugs key as the prefixed ones do.
+    ['0008295661012', ['brands:xx:acetificio-marcello-denigris', 'brands:xx:de-nigris']],
+  ])('indexes the stored brands of %s by key', (code, keys) => {
+    expect(record(fixture(code).line).tags.filter((key) => key.startsWith('brands:'))).toEqual(
+      keys,
+    );
+  });
+
+  it('writes no raw typed brand key for any live fixture: every brand key is a lowercase xx: slug', () => {
+    const brandKeys = FIXTURES.flatMap((f) =>
+      record(f.line).tags.filter((key) => key.startsWith('brands:')),
+    );
+    expect(brandKeys.length).toBeGreaterThan(20);
+    for (const key of brandKeys) {
+      expect(key).toMatch(/^brands:xx:[^\s:A-Z]+$/u);
+      expect(key).toBe(key.toLowerCase());
+    }
   });
 });
 
@@ -598,7 +626,8 @@ describe('buildMirrorRecord', () => {
     const { tags } = record({
       code: '3017620422003',
       categories_tags: ['en:spreads', 'en:spreads', '', 7, 'en:cocoa-spreads'],
-      brands_tags: ['xx:Slimfast', 'xx:Slimfast'],
+      // Two spellings of one brand share its key (#98).
+      brands_tags: ['xx:Slimfast', 'xx:Slimfast', 'xx:slimfast', '', 7],
       labels_tags: 'en:organic',
       traces_tags: ['en:spreads'],
       nova_groups_tags: ['en:4-ultra-processed-food-and-drink-products'],
@@ -610,7 +639,7 @@ describe('buildMirrorRecord', () => {
       [
         'categories:en:spreads',
         'categories:en:cocoa-spreads',
-        'brands:xx:Slimfast',
+        'brands:xx:slimfast',
         'traces:en:spreads',
         'nova_groups:en:4-ultra-processed-food-and-drink-products',
       ].sort(),
@@ -762,12 +791,14 @@ describe('main language, ingredient texts, label photos, and score points (#91, 
   const IMAGES = 'https://images.openfoodfacts.org/images/products/301/762/042/2003';
   const doc = (fields: Json) => record({ code: CODE, schema_version: 1004, ...fields }).doc;
 
-  it('builds at record version 3, the version that added the six fields, through the seam the sync reads', () => {
+  it('builds at record version 4 through the seam the sync reads, past 3, the version that added the six fields', () => {
     // The sync reloads a store whose last load is older than the builder it is handed
-    // (mirror-sync.test.ts); the production builder is this module, at 3 since #91 and #93.
+    // (mirror-sync.test.ts); the production builder is this module, at 3 since #91 and #93 and at
+    // 4 since #98 keyed brands.
     const builder: MirrorBuilder = recordBuilder;
-    expect(builder.MIRROR_RECORD_VERSION).toBe(3);
-    expect(MIRROR_RECORD_VERSION).toBe(3);
+    expect(builder.MIRROR_RECORD_VERSION).toBe(4);
+    expect(MIRROR_RECORD_VERSION).toBe(4);
+    expect(fieldsNewerThan(3, ['lang', 'nutriscore_score', 'image_nutrition_url'])).toEqual([]);
   });
 
   it.each<[string, Json, string]>([
@@ -1099,7 +1130,7 @@ describe('normalizeCodeZeroes', () => {
 
 describe('mirrorTagKey and toStoredTag', () => {
   it('keys a tag by facet and stored value', () => {
-    expect(mirrorTagKey('brands', 'xx:Slimfast')).toBe('brands:xx:Slimfast');
+    expect(mirrorTagKey('brands', 'xx:slimfast')).toBe('brands:xx:slimfast');
     expect(mirrorTagKey('nova_groups', 'en:4-ultra-processed-food-and-drink-products')).toBe(
       'nova_groups:en:4-ultra-processed-food-and-drink-products',
     );
@@ -1123,9 +1154,15 @@ describe('mirrorTagKey and toStoredTag', () => {
 
   it.each([
     ['brands', 'en:nutella', 'xx:nutella'],
-    ['brands', 'xx:Slimfast', 'xx:Slimfast'],
+    ['brands', 'xx:Slimfast', 'xx:slimfast'],
     ['brands', 'nutella', 'xx:nutella'],
-    ['brands', 'FR:Nutella', 'xx:Nutella'],
+    ['brands', 'FR:Nutella', 'xx:nutella'],
+    ['brands', 'xx:Красный Октябрь', 'xx:красный-октябрь'],
+    ['brands', 'КРАСНЫЙ ОКТЯБРЬ', 'xx:красный-октябрь'],
+    ['brands', 'Nestlé', 'xx:nestle'],
+    ['brands', 'όλυμπος', 'xx:όλυμποσ'],
+    // One key, never the synonyms of its brands.txt entry: the caller sends those as a list.
+    ['brands', '7-Up', 'xx:7-up'],
     ['nova_groups', '1', 'en:1-unprocessed-or-minimally-processed-foods'],
     ['nova_groups', '2', 'en:2-processed-culinary-ingredients'],
     ['nova_groups', '3', 'en:3-processed-foods'],
@@ -1196,6 +1233,66 @@ describe('the Green-Score facet', () => {
   it('starts at record version 2, at or below the version the builder writes', () => {
     expect(recordBuilder.GREEN_SCORE_RECORD_VERSION).toBe(2);
     expect(recordBuilder.GREEN_SCORE_RECORD_VERSION).toBeLessThanOrEqual(MIRROR_RECORD_VERSION);
+  });
+});
+
+describe('brand keys (#98)', () => {
+  const brandKeysOf = (brands: unknown) =>
+    record({
+      code: '6000000000014',
+      schema_version: 1004,
+      lc: 'en',
+      brands_tags: brands,
+    }).tags.filter((key) => key.startsWith('brands:'));
+  const SPELLINGS = [
+    'xx:Красный Октябрь',
+    'xx:Красный октябрь',
+    'xx:красный-октябрь',
+    'красный-октябрь',
+  ];
+
+  it.each(SPELLINGS)('indexes %j as brands:xx:красный-октябрь alone', (stored) => {
+    expect(brandKeysOf([stored])).toEqual(['brands:xx:красный-октябрь']);
+  });
+
+  it('indexes a record carrying every spelling of one brand under its one key', () => {
+    expect(brandKeysOf(SPELLINGS)).toEqual(['brands:xx:красный-октябрь']);
+  });
+
+  it.each<[string, string]>([
+    ['xx:Nestlé', 'brands:xx:nestle'],
+    ['xx:Meßmer', 'brands:xx:messmer'],
+    ['xx:Løgismose', 'brands:xx:løgismose'],
+    ['xx:ブルボン', 'brands:xx:ブルボン'],
+    ['xx:ΌΛΥΜΠΟΣ', 'brands:xx:όλυμποσ'],
+    ['xx:όλυμπος', 'brands:xx:όλυμποσ'],
+    ['xx:Ben & Jerry’s', 'brands:xx:ben-jerry-s'],
+  ])('keys %j by #94’s slug rule as %j', (stored, key) => {
+    expect(brandKeysOf([stored])).toEqual([key]);
+  });
+
+  it('indexes no key for a brand that slugs to nothing, and keeps the other brands of the record', () => {
+    expect(brandKeysOf(['xx:™', 'xx:', '  ', 'xx:Morita'])).toEqual(['brands:xx:morita']);
+    expect(brandKeysOf(['™'])).toEqual([]);
+  });
+
+  it('keys only brands: every other facet keeps the form the export stores', () => {
+    const { tags } = record({
+      code: '6000000000014',
+      schema_version: 1004,
+      lc: 'en',
+      brands_tags: ['xx:Morita'],
+      labels_tags: ['en:Some Label'],
+      categories_tags: ['fr:Pâtes à Tartiner'],
+    });
+    expect(tags).toContain('labels:en:Some Label');
+    expect(tags).toContain('categories:fr:Pâtes à Tartiner');
+    expect(tags).toContain('brands:xx:morita');
+  });
+
+  it('starts at record version 4, at or below the version the builder writes', () => {
+    expect(recordBuilder.BRAND_KEY_RECORD_VERSION).toBe(4);
+    expect(recordBuilder.BRAND_KEY_RECORD_VERSION).toBeLessThanOrEqual(MIRROR_RECORD_VERSION);
   });
 });
 

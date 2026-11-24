@@ -16,6 +16,8 @@ import {
   TAXONOMY_RETRY_DEADLINE_MS,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { untilCancelled } from '@/utils/until-cancelled.js';
+import { brandKeys } from './brand-keys.js';
+import { LANGUAGE_PREFIX, tagIdOf } from './tag-id.js';
 
 export type TaxonomyEntry = {
   id: string;
@@ -330,8 +332,8 @@ const LIVE_TAXONOMY_NAME = {
   ingredients: 'ingredient',
 } as const satisfies Partial<Record<Facet, string>>;
 
-/** A facet the live autocomplete serves. */
-type LiveFacet = keyof typeof LIVE_TAXONOMY_NAME;
+/** A facet the live autocomplete serves, and so one whose values `canonicalizeTag` confirms. */
+export type LiveFacet = keyof typeof LIVE_TAXONOMY_NAME;
 
 function isLiveFacet(facet: Facet): facet is LiveFacet {
   return facet in LIVE_TAXONOMY_NAME;
@@ -403,12 +405,6 @@ function confirmedFirst(
 /* -------------------------------------------------------------------------- */
 
 /**
- * A facet whose values are tag strings a search filters on, each quoted into an exact clause: the
- * facets the live autocomplete serves, plus brands, whose tags are slugs with no vocabulary.
- */
-export type TagFacet = LiveFacet | 'brands';
-
-/**
  * Why a live lookup settled nothing, and the wait in whole seconds when one is known.
  *
  * - `budget_spent` — this server's own taxonomy budget refused the lookup, so nothing was sent;
@@ -429,14 +425,14 @@ export type LookupFailure =
  * - `vocabulary` — an Open Food Facts tag has exactly this ID: the offline sample or the live
  *   autocomplete confirmed it.
  * - `normalized` — only local normalization was applied, and `reason` says why nothing confirmed
- *   it: the facet has no vocabulary to check (`no_vocabulary`, brands), the vocabulary answered
- *   with no exact entry (`no_match`), or it could not be consulted (`lookup_failed`, with its
- *   `LookupFailure`). A caller that must not send an unconfirmed value (an exclusion, which a
- *   wrong value turns into a silent no-op) refuses anything but `vocabulary`.
+ *   it: the vocabulary answered with no exact entry (`no_match`), or it could not be consulted
+ *   (`lookup_failed`, with its `LookupFailure`). A caller that must not send an unconfirmed value
+ *   (an exclusion, which a wrong value turns into a silent no-op) refuses anything but
+ *   `vocabulary`.
  */
 export type CanonicalTag =
   | { value: string; resolution: 'vocabulary' }
-  | { value: string; resolution: 'normalized'; reason: 'no_vocabulary' | 'no_match' }
+  | { value: string; resolution: 'normalized'; reason: 'no_match' }
   | ({ value: string; resolution: 'normalized'; reason: 'lookup_failed' } & LookupFailure);
 
 /**
@@ -485,65 +481,6 @@ function fallbackNotice(
 }
 
 /**
- * Characters Product Opener turns into `-` when it builds a tag ID from text
- * (`get_string_id_for_lang` in `lib/ProductOpener/Store.pm`): whitespace, control characters, the
- * zero-width space, ASCII punctuation, and a list of typographic symbols. Letters in every script
- * pass through.
- */
-const TAG_ID_SEPARATORS =
-  /[\s\p{Cc}​!"#$%&'()*+,/:;<=>?@[\\\]^_`{|}~¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼⅓½⅔¾¿×ˆ˜–—‘’‚“”„†‡•…‰‹›€™]/gu;
-
-/**
- * The letters `get_string_id_for_lang` folds under the normalization it gives the language-less
- * `xx` (unaccent on), each to what it becomes, and no others: `ø`, `ł`, `đ`, `ĩ`, `ả`, Cyrillic
- * `ё`, and Greek `έ` keep their marks. A `Map`, since the text it is read for comes from the caller.
- */
-const XX_LETTER_FOLDS: ReadonlyMap<string, string> = new Map([
-  ...[...'àáâãäå'].map((letter): [string, string] => [letter, 'a']),
-  ['ç', 'c'],
-  ...[...'èéêë'].map((letter): [string, string] => [letter, 'e']),
-  ...[...'ìíîï'].map((letter): [string, string] => [letter, 'i']),
-  ['ñ', 'n'],
-  ...[...'òóôõö'].map((letter): [string, string] => [letter, 'o']),
-  ...[...'ùúûü'].map((letter): [string, string] => [letter, 'u']),
-  ['ý', 'y'],
-  ['ÿ', 'y'],
-  // Romanian, comma-below and the legacy cedilla forms.
-  ['ă', 'a'],
-  ['ș', 's'],
-  ['ț', 't'],
-  ['ş', 's'],
-  ['ţ', 't'],
-  ['œ', 'oe'],
-  ['æ', 'ae'],
-  ['ß', 'ss'],
-]);
-
-/** Any letter `XX_LETTER_FOLDS` folds. */
-const XX_FOLDED_LETTER = new RegExp(`[${[...XX_LETTER_FOLDS.keys()].join('')}]`, 'g');
-
-/**
- * A tag ID as `get_string_id_for_lang` builds one from text: Unicode NFC, then lowercase one
- * character at a time as Perl's `lc` does, so a final capital sigma becomes `σ` rather than the
- * `ς` a whole-string `toLowerCase()` gives it (`ΟΛΥΜΠΟΣ` → `ολυμποσ`); `.` to `-`; under `xx` the
- * letters `XX_LETTER_FOLDS` names folded; then every separator to `-`, dash runs collapsed, and
- * leading and trailing dashes dropped.
- */
-function tagIdOf(text: string, foldLetters: boolean): string {
-  const lowered = Array.from(text.normalize('NFC'), (char) => char.toLowerCase())
-    .join('')
-    .replace(/\./g, '-');
-  return (
-    foldLetters
-      ? lowered.replace(XX_FOLDED_LETTER, (letter) => XX_LETTER_FOLDS.get(letter) ?? letter)
-      : lowered
-  )
-    .replace(TAG_ID_SEPARATORS, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
-
-/**
  * Slugs text the way Product Opener builds a tag ID from it under its default normalization, which
  * keeps accents (`ÉPICERIE Fine` → `épicerie-fine`): the slug of a taxonomy value it cannot match.
  */
@@ -551,39 +488,18 @@ export function slugTagValue(text: string): string {
   return tagIdOf(text, false);
 }
 
-/** A language prefix on a taxonomy value: `en:`, `FR:`. */
-const LANGUAGE_PREFIX = /^([a-z]{2}):/i;
-
 /**
- * A brand as Product Opener stores it in `brands_tags`, with any language prefix dropped: the slug
- * of the brand name under the `xx` normalization, which folds the letters `XX_LETTER_FOLDS` names
- * (`Nestlé` → `nestle`, `Meßmer` → `messmer`, `Ben & Jerry's` → `ben-jerry-s`) and keeps every
- * other letter as written (`Løgismose` → `løgismose`, `ブルボン`). Product Opener matches
- * `brands_tags=xx:nutella` and `=en:nutella` as it matches `=nutella`, and slugging the prefix
- * would turn its colon into part of the slug (`xx-nutella`), which no brand carries.
+ * The IDs `/api/v2/search` matches a brand under, any of which matches: the brand as given, which
+ * Product Opener canonicalizes (a brand outside its taxonomy to that spelling under `xx:`, as newer
+ * records store it), then, as `xx:<key>!`, each of the brand's keys (`brandKeys`) that spells it
+ * differently, which it matches as that exact stored tag: the slug older records store a brand
+ * under, and the keys of the other names its `taxonomies/brands.txt` entry lists. Live 2026-11-24
+ * `Красный Октябрь` matched 16 products as given and 23 with `|xx:красный-октябрь!`. A brand that
+ * keys to itself goes as given alone, the request a brand search always sent.
  */
-export function brandSlug(value: string): string {
-  return tagIdOf(value.trim().replace(LANGUAGE_PREFIX, ''), true);
-}
-
-/**
- * The slugs a brand can be stored under, in the order a lookup tries them: `brandSlug`, then the
- * accent-keeping slug of the default normalization when it differs, under which some records store
- * a brand (`xx:café-bar`), then that slug after a whole-string lowercase, which turns a word-final
- * capital sigma into `ς`: the key a brand typed in lowercase keeps (`xx:όλυμπος`), which an
- * all-caps `ΌΛΥΜΠΟΣ` matched before brands were lowercased one character at a time. Like
- * `brandSlug`, it drops one language prefix (`en:en:foo` → `en-foo`). An empty slug names no brand,
- * so it is left out.
- */
-export function brandSlugs(value: string): string[] {
-  const unprefixed = value.trim().replace(LANGUAGE_PREFIX, '');
-  return [
-    ...new Set([
-      tagIdOf(unprefixed, true),
-      slugTagValue(unprefixed),
-      slugTagValue(unprefixed.normalize('NFC').toLowerCase()),
-    ]),
-  ].filter((slug) => slug !== '');
+export function brandLiveIds(value: string): [string, ...string[]] {
+  const given = value.trim();
+  return [given, ...brandKeys(given).flatMap((key) => (key === given ? [] : [`xx:${key}!`]))];
 }
 
 /**
@@ -599,16 +515,25 @@ function withFinalSigma(text: string, toId: (text: string) => string): [string] 
 }
 
 /**
- * The slugs the text index can hold a brand under, any of which a text search matches: `brandSlug`,
- * then, when a whole-string lowercase spells it differently, the same folded slug of that
- * lowercase. Each record's slug comes from the brand text it carries, so an all-caps name ending in
- * a capital sigma slugs with `σ` (`ΌΛΥΜΠΟΣ` → `όλυμποσ`) while one typed in lowercase keeps `ς`
- * (`όλυμπος`). Live 2026-11-24 the index holds that brand only under `όλυμπος`, so the second slug
- * is the one that matches it. Every input without a word-final capital sigma has one slug. Like
- * `brandSlug`, it drops one language prefix.
+ * The IDs the text index can hold a brand under, any of which a text search matches: the brand as
+ * given under `xx:` (one language prefix dropped), as newer records store a brand outside the
+ * taxonomy, then each of its keys (`brandKeys`) bare, as records indexed before the prefix carry
+ * a slug, and under `xx:`. A key folds sigma (`όλυμποσ`), but a stored slug keeps the `ς` of a name
+ * typed in lowercase, so a key with a word-final `σ` also goes with `ς`, which a whole-string
+ * lowercase places by Unicode's final-sigma rule. Live 2026-11-24 the index holds Όλυμπος under
+ * `όλυμπος` (10 products), none under `όλυμποσ`, and 36 under `xx:ΌΛΥΜΠΟΣ` or `xx:Όλυμπος`; and Heinz
+ * under `xx:heinz` (3,157) and `heinz` (523). A brand that keys to nothing goes under its `xx:` form
+ * alone, which matches nothing rather than dropping the filter.
  */
-export function brandTextSlugs(value: string): [string] | [string, string] {
-  return withFinalSigma(value.trim().replace(LANGUAGE_PREFIX, ''), (text) => tagIdOf(text, true));
+export function brandTextIds(value: string): [string, ...string[]] {
+  const typed = `xx:${value.trim().replace(LANGUAGE_PREFIX, '')}`;
+  const keyed = brandKeys(value).flatMap((key) =>
+    [...new Set([key, key.replace(/σ/g, 'Σ').toLowerCase()])].flatMap((spelling) => [
+      spelling,
+      `xx:${spelling}`,
+    ]),
+  );
+  return [typed, ...new Set(keyed.filter((id) => id !== typed))];
 }
 
 /**
@@ -755,14 +680,14 @@ export class TaxonomyService {
   constructor(private readonly off: OpenFoodFactsService) {}
 
   /**
-   * Canonicalize one tag value before it is quoted into an exact tag clause. A brand becomes its
-   * `brandSlug`, the form Product Opener stores it under; no vocabulary confirms it, and its
-   * synonyms resolve only on Product Opener's own tag search. A taxonomy value is confirmed by the
-   * accept rule (`confirmedTag`) against the offline sample first, then the live autocomplete; an
-   * `ingredients` value, which has no sample, always takes the lookup. So a synonym (`US` →
+   * Canonicalize one taxonomy value before it is quoted into an exact tag clause. It is confirmed by
+   * the accept rule (`confirmedTag`) against the offline sample first, then the live autocomplete;
+   * an `ingredients` value, which has no sample, always takes the lookup. So a synonym (`US` →
    * `en:united-states`, `eggs` → `en:egg`) or singular (`en:peanut` → `en:peanuts`, `en:nut` →
    * `en:nuts`) resolves, and a prefix or partial match never does (`nutell` is not `nutella`, `US`
-   * is not `USSR`).
+   * is not `USSR`). A brand has no vocabulary to confirm it and never comes here: its keys
+   * (`brandKeys`) and the IDs each backend matches it under (`brandLiveIds`, `brandTextIds`) are
+   * computed locally.
    *
    * Throws only when the caller cancels (`ctx.signal` aborted), so a cancellation ends the call
    * rather than reading as a failed lookup. Anything nothing confirms comes back normalized the way
@@ -774,12 +699,9 @@ export class TaxonomyService {
    * `TAXONOMY_RETRY_DEADLINE_MS` of the call, a restarted one included. A live lookup spends the
    * taxonomy budget, not the search budget.
    */
-  async canonicalizeTag(facet: TagFacet, value: string, ctx: Context): Promise<CanonicalTag> {
+  async canonicalizeTag(facet: LiveFacet, value: string, ctx: Context): Promise<CanonicalTag> {
     const deadlineAt = Date.now() + TAXONOMY_RETRY_DEADLINE_MS;
     const trimmed = value.trim();
-    if (facet === 'brands') {
-      return { value: brandSlug(trimmed), resolution: 'normalized', reason: 'no_vocabulary' };
-    }
 
     const key = acceptKey(trimmed);
     const offline = confirmedTag(key, sampleOf(facet));
