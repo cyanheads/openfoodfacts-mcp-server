@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-11-24
+
+off_get_product returns the ingredients text in every language with the label photos, score points, and record dates; off_search_products rows add quantity, completeness, and dates and the text index is dated; brand names with accents match; total carbohydrates are reported as their own nutrient.
+
 ## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-11-08
 
 Grade filters take one value or a list and gain a Green-Score filter, off_search_products filters by ingredient, off_get_product returns generic_name and nutrient_levels, pages hold up to 100 results, and off_browse_taxonomy lists the tag a term names first.
