@@ -38,6 +38,7 @@
     "mirror:refresh": "bun run scripts/mirror-refresh.ts",
     "mirror:status": "bun run scripts/mirror-status.ts",
     "mirror:verify": "bun run scripts/mirror-status.ts --verify",
+    "brands:sync": "bun run scripts/brands-sync.ts",
     "bundle": "bun run build && npx -y @anthropic-ai/mcpb pack . dist/openfoodfacts-mcp-server.mcpb && bun run scripts/clean-mcpb.ts dist/openfoodfacts-mcp-server.mcpb",
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",

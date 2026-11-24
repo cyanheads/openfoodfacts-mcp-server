@@ -1,0 +1,30 @@
+# A small brands taxonomy laid out as Product Opener's taxonomies/brands.txt is.
+# All brands in the brands taxonomy are language less and use the xx: prefix
+
+xx: 7UP, 7-Up, Seven Up
+wikidata:en: Q270059
+
+xx: Andechser Natur, Andechser
+comment:en: Organic line of the Andechser dairy
+
+xx: Nutella
+#web:en: https://www.nutella.com/
+
+xx: Bio
+
+xx: Bio+
+
+xx: EAGLOBE, 鷹球牌
+zh: 鷹球牌
+
+xx: Pilsner 1,5, Pilsner Light
+
+xx: Salt\, Pepper & Co, Salt Pepper
+
+xx: Vin(IV), Vin Quatre
+
+xx: Όλυμπος, ΌΛΥΜΠΟΣ
+
+wikidata:en: Q629009
+
+xx: Kellogg's, Kelloggs, Kellogg
