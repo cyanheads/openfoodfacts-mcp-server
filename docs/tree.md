@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-11-24 11:11:29
+Generated on: 2026-11-24 23:02:19
 
 ```text
 openfoodfacts-mcp-server/
@@ -28,6 +28,7 @@ openfoodfacts-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -123,6 +124,7 @@ openfoodfacts-mcp-server/
 │       └── SKILL.md
 ├── scripts/
 │   ├── _mirror-context.ts
+│   ├── brands-sync.ts
 │   ├── build-changelog.ts
 │   ├── build.ts
 │   ├── check-dependency-specifiers.ts
@@ -175,12 +177,14 @@ openfoodfacts-mcp-server/
 │   │   │   ├── mirror-sync.ts
 │   │   │   └── record-builder.ts
 │   │   ├── openfoodfacts/
-│   │   │   ├── analyzer-stop-words.ts
 │   │   │   ├── nutrition-sets.ts
 │   │   │   ├── openfoodfacts-service.ts
 │   │   │   ├── types.ts
 │   │   │   └── user-agent.ts
 │   │   └── taxonomy/
+│   │       ├── brand-keys.ts
+│   │       ├── brand-synonyms.ts
+│   │       ├── tag-id.ts
 │   │       └── taxonomy-service.ts
 │   ├── utils/
 │   │   ├── markdown.ts
@@ -202,6 +206,8 @@ openfoodfacts-mcp-server/
 │   │   │   ├── v35-7613035530799.json
 │   │   │   ├── v35-8445290133403.json
 │   │   │   └── v35-99999999999994.json
+│   │   ├── brands/
+│   │   │   └── brands.txt
 │   │   ├── ingredients/
 │   │   │   ├── product-0028400157827.json
 │   │   │   ├── product-3017620422003.json
@@ -240,7 +246,6 @@ openfoodfacts-mcp-server/
 │   │   ├── as-sold-captures.ts
 │   │   ├── barcode-cases.ts
 │   │   ├── canonical-tag-ids.ts
-│   │   ├── text-search-fields.ts
 │   │   └── upstream-envelopes.ts
 │   ├── mcp-server/
 │   │   └── tools/
@@ -252,6 +257,8 @@ openfoodfacts-mcp-server/
 │   │       └── record-metadata.test.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── brands-sync.test.ts
 │   ├── services/
 │   │   ├── mirror/
 │   │   │   ├── mirror-feeds.test.ts
@@ -265,6 +272,7 @@ openfoodfacts-mcp-server/
 │   │   │   ├── nutrition-sets.test.ts
 │   │   │   └── openfoodfacts-service.test.ts
 │   │   └── taxonomy/
+│   │       ├── brand-keys.test.ts
 │   │       └── taxonomy-service.test.ts
 │   ├── tools/
 │   └── utils/

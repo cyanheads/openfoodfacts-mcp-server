@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-11-24 · ⚠️ Breaking
+
+off_search_products text searches work again on search-a-licious 2.x; brand spellings and Open Food Facts brand synonyms match on the mirror, live, and text paths; mirror freshness notes bound computed values and removals. outside_constraints is removed.
+
 ## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-11-24
 
 off_get_product returns the ingredients text in every language with the label photos, score points, and record dates; off_search_products rows add quantity, completeness, and dates and the text index is dated; brand names with accents match; total carbohydrates are reported as their own nutrient.
